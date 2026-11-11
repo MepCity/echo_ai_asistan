@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHash, createHmac } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { beforeEach, describe, it } from 'node:test';
 import { normalizeConfig } from '../src/config.js';
 import { createEcho } from '../src/core.js';
@@ -62,17 +66,59 @@ const contentVersion = (post) =>
 
 /**
  * A fake TryPost API with the endpoints Echo uses. Like TryPost, it adds
- * `content_version` to the post resource and refuses (409) an approve/reject
- * whose `expected_version` is not the current one.
+ * `content_version` to the post resource, refuses (409) an approve/reject
+ * whose `expected_version` is not the current one, and records the approver
+ * (the API token's user) and time.
+ *
+ * `crashOn(call, { when, mode })` makes the next matching call (e.g.
+ * "POST /posts/p1/approve") never answer ("hang": Echo's process died during
+ * it) or fail with a network error ("network": the answer was lost), either
+ * before TryPost applied it or after. It returns a promise that resolves when
+ * that call is made.
  */
-function fakeTryPost() {
+function fakeTryPost(clock) {
     const posts = new Map();
     const notes = [];
     const calls = [];
     const requests = [];
     const hooks = { afterGet: null };
     let down = false;
+    let crash = null;
     const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+    const stamp = () => new Date(clock.t).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+
+    function handle(method, path, body) {
+        if (typeof down === 'number') return json(down, { message: 'error' });
+        if (down) return json(503, { message: 'down' });
+        const match = path.match(/^\/posts\/([^/]+)(?:\/(\w+))?$/);
+        const post = match && posts.get(match[1]);
+        if (!post) return json(404, { message: 'not found' });
+        if (method === 'GET') {
+            const response = json(200, { data: toApi(post) });
+            // Lets a test change the post right after Echo read it (before Echo's next call).
+            if (hooks.afterGet) {
+                const hook = hooks.afterGet;
+                hooks.afterGet = null;
+                hook(post);
+            }
+            return response;
+        }
+        if (match[2] === 'notes') {
+            notes.push({ postId: post.id, body: body.body });
+            return json(201, { data: {} });
+        }
+        if (match[2] === 'approve' || match[2] === 'reject') {
+            if (body?.expected_version && body.expected_version !== contentVersion(post)) {
+                return json(409, { message: 'content changed', content_version: contentVersion(post) });
+            }
+            if (post.status !== 'pending_approval') return json(422, { message: 'not pending' });
+            post.status = match[2] === 'approve' ? 'scheduled' : 'draft';
+            if (match[2] === 'approve') Object.assign(post, { approved_by: { id: 'u-echo', name: 'Echo' }, approved_at: stamp() });
+            return json(200, { data: toApi(post) });
+        }
+        return json(404, {});
+    }
+
     return {
         posts,
         notes,
@@ -80,40 +126,24 @@ function fakeTryPost() {
         requests,
         hooks,
         setDown: (value) => (down = value),
+        crashOn(call, { when = 'before', mode = 'hang' } = {}) {
+            return new Promise((resolve) => (crash = { call, when, mode, resolve }));
+        },
         fetch: async (url, init) => {
             const path = new URL(url).pathname.replace(/^\/api/, '');
             calls.push(`${init.method} ${path}`);
             const body = init.body ? JSON.parse(init.body) : null;
             requests.push({ method: init.method, path, body });
+            if (crash && crash.call === `${init.method} ${path}`) {
+                const { when, mode, resolve } = crash;
+                crash = null;
+                if (when === 'after') handle(init.method, path, body);
+                resolve();
+                if (mode === 'network') throw new TypeError('fetch failed');
+                return new Promise(() => {});
+            }
             if (down === 'network') throw new TypeError('fetch failed');
-            if (typeof down === 'number') return json(down, { message: 'error' });
-            if (down) return json(503, { message: 'down' });
-            const match = path.match(/^\/posts\/([^/]+)(?:\/(\w+))?$/);
-            const post = match && posts.get(match[1]);
-            if (!post) return json(404, { message: 'not found' });
-            if (init.method === 'GET') {
-                const response = json(200, { data: toApi(post) });
-                // Lets a test change the post right after Echo read it (before Echo's next call).
-                if (hooks.afterGet) {
-                    const hook = hooks.afterGet;
-                    hooks.afterGet = null;
-                    hook(post);
-                }
-                return response;
-            }
-            if (match[2] === 'notes') {
-                notes.push({ postId: post.id, body: body.body });
-                return json(201, { data: {} });
-            }
-            if (match[2] === 'approve' || match[2] === 'reject') {
-                if (body?.expected_version && body.expected_version !== contentVersion(post)) {
-                    return json(409, { message: 'content changed', content_version: contentVersion(post) });
-                }
-                if (post.status !== 'pending_approval') return json(422, { message: 'not pending' });
-                post.status = match[2] === 'approve' ? 'scheduled' : 'draft';
-                return json(200, { data: toApi(post) });
-            }
-            return json(404, {});
+            return handle(init.method, path, body);
         },
     };
 }
@@ -130,26 +160,36 @@ function setup() {
     const config = baseConfig();
     const store = createStore(openDatabase(':memory:'), () => clock.t);
     const whatsapp = fakeWhatsApp();
-    const trypost = fakeTryPost();
+    const trypost = fakeTryPost(clock);
     const logs = [];
-    const echo = createEcho({ config, store, whatsapp, log: (...parts) => logs.push(parts) });
-    echo.register('marmara', createTryPostProject(config.projects[0], { fetchImpl: trypost.fetch }));
+    const t = { clock, config, store, whatsapp, trypost, logs };
+    t.echo = boot(t);
 
     let inbound = 1;
-    const user = {
+    t.user = {
         /** The person writes to us first, opening their 24-hour window. */
         async hello(phone) {
-            await echo.handleWebhook({ messages: [{ id: `in.${inbound++}`, from: phone, type: 'text', text: 'merhaba' }], statuses: [] });
+            await t.echo.handleWebhook({ messages: [{ id: `in.${inbound++}`, from: phone, type: 'text', text: 'merhaba' }], statuses: [] });
         },
         async tap(phone, buttonId, id = `in.${inbound++}`) {
-            await echo.handleWebhook({ messages: [{ id, from: phone, type: 'interactive', buttonId }], statuses: [] });
+            await t.echo.handleWebhook({ messages: [{ id, from: phone, type: 'interactive', buttonId }], statuses: [] });
         },
-        async say(phone, text, contextId = null) {
-            await echo.handleWebhook({ messages: [{ id: `in.${inbound++}`, from: phone, type: 'text', text, contextId }], statuses: [] });
+        async say(phone, text, contextId = null, id = `in.${inbound++}`) {
+            await t.echo.handleWebhook({ messages: [{ id, from: phone, type: 'text', text, contextId }], statuses: [] });
         },
     };
-    return { clock, config, store, whatsapp, trypost, echo, user, logs };
+    return t;
 }
+
+/** A new Echo process over the given state (database, WhatsApp, TryPost). */
+function boot(t) {
+    const echo = createEcho({ config: t.config, store: t.store, whatsapp: t.whatsapp, log: (...parts) => t.logs.push(parts) });
+    echo.register('marmara', createTryPostProject(t.config.projects[0], { fetchImpl: t.trypost.fetch }));
+    return echo;
+}
+
+/** The process died: the old Echo is left hanging, a new one starts over the same database. */
+const restart = (t) => (t.echo = boot(t));
 
 const post = (overrides = {}) => ({
     id: 'p1',
@@ -213,6 +253,7 @@ describe('approval requests', () => {
         assert.equal(t.trypost.posts.get('p1').status, 'scheduled');
         assert.equal(t.trypost.calls.filter((call) => call.endsWith('/approve')).length, 1);
         assert.ok(t.trypost.notes.some((note) => note.body.includes('Yasir onayladı')));
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /cevabını zaten aldım/);
     });
 
     it('ignores a retried WhatsApp webhook for the same message', async () => {
@@ -619,6 +660,190 @@ describe('delivery', () => {
     });
 });
 
+describe('crash between a decision and TryPost', () => {
+    let t;
+    beforeEach(async () => {
+        t = setup();
+        t.trypost.posts.set('p1', post());
+        await t.user.hello(PHONES.yasir);
+        await t.echo.handleProjectEvent('marmara', approvalEvent(post()));
+    });
+    const approvals = () => t.trypost.notes.filter((note) => note.body.includes('Yasir onayladı'));
+
+    it('approves after a crash right after the decision was recorded', async () => {
+        const [approve] = buttonsOf(t.whatsapp.last(PHONES.yasir));
+        const crashed = t.trypost.crashOn('POST /posts/p1/approve', { when: 'before' });
+        t.user.tap(PHONES.yasir, approve, 'tap-1'); // the process dies inside the approve call
+        await crashed;
+        const request = t.store.outboxByWaId(t.whatsapp.last(PHONES.yasir).id);
+        assert.equal(t.store.decision(request.id, PHONES.yasir).state, 'started');
+        restart(t);
+        await later(t, 6 * 60_000);
+
+        assert.equal(t.trypost.posts.get('p1').status, 'scheduled');
+        assert.equal(t.store.inbox('tap-1').status, 'done');
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /Onaylandı/);
+        assert.equal(textsTo(t, PHONES.yasir, /zaten aldım/).length, 0);
+        assert.equal(approvals().length, 1);
+    });
+
+    it('recognises its own approval when Echo crashed after TryPost applied it', async () => {
+        const [approve] = buttonsOf(t.whatsapp.last(PHONES.yasir));
+        const crashed = t.trypost.crashOn('POST /posts/p1/approve', { when: 'after' });
+        t.user.tap(PHONES.yasir, approve, 'tap-1');
+        await crashed;
+        restart(t);
+        await later(t, 6 * 60_000);
+
+        assert.equal(t.trypost.calls.filter((call) => call.endsWith('/approve')).length, 1);
+        assert.equal(textsTo(t, PHONES.yasir, /Onaylandı/).length, 1);
+        assert.equal(textsTo(t, PHONES.yasir, /zaten aldım|artık onay beklemiyor/).length, 0);
+        assert.equal(approvals().length, 1);
+        // A later tap on the same button is a double tap.
+        await t.user.tap(PHONES.yasir, approve);
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /cevabını zaten aldım/);
+    });
+
+    it('says "Onaylandı" when TryPost approved but its answer was lost', async () => {
+        const [approve] = buttonsOf(t.whatsapp.last(PHONES.yasir));
+        t.trypost.crashOn('POST /posts/p1/approve', { when: 'after', mode: 'network' });
+        await t.user.tap(PHONES.yasir, approve, 'tap-1');
+        assert.equal(t.store.inbox('tap-1').status, 'pending'); // kept for a retry
+        await later(t, 31_000);
+
+        assert.equal(t.store.inbox('tap-1').status, 'done');
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /Onaylandı/);
+        assert.equal(textsTo(t, PHONES.yasir, /artık onay beklemiyor/).length, 0);
+        assert.equal(t.trypost.calls.filter((call) => call.endsWith('/approve')).length, 1);
+    });
+
+    it('lets a new tap finish a decision whose message gave up after its approval got through', async () => {
+        const [approve] = buttonsOf(t.whatsapp.last(PHONES.yasir));
+        t.trypost.crashOn('POST /posts/p1/approve', { when: 'after', mode: 'network' });
+        await t.user.tap(PHONES.yasir, approve, 'tap-1');
+        t.trypost.setDown(true);
+        for (let i = 0; i < 6; i++) await later(t, 3 * 60 * 60_000);
+        assert.equal(t.store.inbox('tap-1').status, 'failed');
+
+        t.trypost.setDown(false);
+        await t.user.tap(PHONES.yasir, approve, 'tap-2');
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /Onaylandı/);
+        assert.equal(t.trypost.posts.get('p1').status, 'scheduled');
+    });
+
+    it('does not claim someone else\'s earlier approval as its own', async () => {
+        const [approve] = buttonsOf(t.whatsapp.last(PHONES.yasir));
+        t.trypost.crashOn('POST /posts/p1/approve', { when: 'before', mode: 'network' });
+        await t.user.tap(PHONES.yasir, approve, 'tap-1');
+        // Approved in the panel, long before this decision started.
+        Object.assign(t.trypost.posts.get('p1'), { status: 'scheduled', approved_by: { id: 'u-echo' }, approved_at: '2026-11-11 10:00:00' });
+        await later(t, 31_000);
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /artık onay beklemiyor/);
+        const request = t.store.outboxByWaId(t.whatsapp.to(PHONES.yasir).find((m) => m.type === 'interactive').id);
+        assert.equal(t.store.decision(request.id, PHONES.yasir), null);
+    });
+
+    it('sends the post back and adds the note after a crash right after the reject', async () => {
+        await t.user.tap(PHONES.yasir, buttonsOf(t.whatsapp.last(PHONES.yasir))[1]); // Düzeltme iste
+        const crashed = t.trypost.crashOn('POST /posts/p1/reject', { when: 'after' });
+        t.user.say(PHONES.yasir, 'Saat 19:00 olacak', null, 'note-1');
+        await crashed;
+        restart(t);
+        await later(t, 6 * 60_000);
+
+        assert.equal(t.trypost.posts.get('p1').status, 'draft');
+        const notes = t.trypost.notes.map((note) => note.body);
+        assert.deepEqual(notes.filter((body) => body.includes('19:00')).length, 1);
+        assert.match(notes[0], /düzeltme istedi.*19:00/);
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /gönderi düzeltme için geri gönderildi/);
+        assert.equal(textsTo(t, PHONES.yasir, /kararını zaten aldım/).length, 0);
+    });
+
+    it('adds the "Uygun" note after a crash right after the decision was recorded', async () => {
+        t.trypost.posts.set('p2', post({ id: 'p2', status: 'draft' }));
+        await t.user.hello(PHONES.mehmet);
+        await t.echo.handleProjectEvent('marmara', {
+            id: 'f1',
+            type: 'post.feedback_requested',
+            data: { ...post({ id: 'p2', status: 'draft' }), feedback: { requested_by: { id: 'u-yasir' }, recipients: [{ id: 'u-mehmet' }] } },
+        });
+        const [ok] = buttonsOf(t.whatsapp.last(PHONES.mehmet));
+        const crashed = t.trypost.crashOn('POST /posts/p2/notes', { when: 'before' });
+        t.user.tap(PHONES.mehmet, ok, 'ok-1');
+        await crashed;
+        restart(t);
+        await later(t, 6 * 60_000);
+
+        assert.equal(t.trypost.notes.filter((note) => note.body.includes('Mehmet: Uygun')).length, 1);
+        assert.match(t.whatsapp.last(PHONES.mehmet).text.body, /görüşün eklendi/);
+        assert.equal(textsTo(t, PHONES.mehmet, /zaten aldım/).length, 0);
+    });
+});
+
+describe('decisions table migration', () => {
+    it('adds the new columns to an existing database and counts old decisions as applied', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'echo-'));
+        try {
+            const old = new DatabaseSync(join(dir, 'echo.db'));
+            old.exec(`
+                CREATE TABLE decisions (outbox_id INTEGER NOT NULL, phone TEXT NOT NULL, action TEXT NOT NULL, decided_at INTEGER NOT NULL, PRIMARY KEY (outbox_id, phone));
+                INSERT INTO decisions VALUES (7, '905550000001', 'approve', 1);
+                CREATE TABLE outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, item_id TEXT, kind TEXT NOT NULL, recipient TEXT NOT NULL,
+                    message_json TEXT NOT NULL, template_json TEXT, fingerprint TEXT, dedupe_key TEXT UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0, last_error TEXT, wa_message_id TEXT UNIQUE,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                INSERT INTO outbox (project, item_id, kind, recipient, message_json, status, created_at, updated_at)
+                    VALUES ('marmara', 'p1', 'approval', '905550000001', '{}', 'failed', 1, 1);
+            `);
+            old.close();
+
+            const db = openDatabase(dir);
+            const store = createStore(db);
+            assert.deepEqual({ ...store.decision(7, '905550000001') }, { outbox_id: 7, phone: '905550000001', action: 'approve', decided_at: 1, state: 'applied', wa_message_id: null });
+            assert.equal(store.unreportedFailures().length, 0); // already reported by the old version
+            db.close();
+            openDatabase(dir).close(); // a second open finds the columns and changes nothing
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('failed statuses', () => {
+    it('reports a failure stored just before a crash', async () => {
+        const t = setup();
+        t.trypost.posts.set('p1', post());
+        await t.user.hello(PHONES.yasir);
+        await t.echo.handleProjectEvent('marmara', approvalEvent(post()));
+        const request = t.whatsapp.last(PHONES.yasir);
+
+        t.echo.ingest({ messages: [], statuses: [{ id: request.id, status: 'failed', error: '131049: ecosystem' }] }); // then the process dies
+        restart(t);
+        await t.echo.tick();
+        await t.echo.tick();
+        assert.equal(t.trypost.notes.filter((note) => note.body.includes('iletilemedi') && note.body.includes('131049')).length, 1);
+    });
+
+    it('retries the failure report while TryPost is down', async () => {
+        const t = setup();
+        t.trypost.posts.set('p1', post());
+        await t.user.hello(PHONES.yasir);
+        await t.echo.handleProjectEvent('marmara', approvalEvent(post()));
+        const request = t.whatsapp.last(PHONES.yasir);
+
+        t.trypost.setDown(true);
+        await t.echo.handleWebhook({ messages: [], statuses: [{ id: request.id, status: 'failed', error: '131049: ecosystem' }] });
+        assert.equal(t.trypost.notes.length, 0);
+        t.trypost.setDown(false);
+        await later(t, 5 * 60_000 + 1_000);
+        await later(t, 5 * 60_000 + 1_000);
+        assert.equal(t.trypost.notes.filter((note) => note.body.includes('iletilemedi')).length, 1);
+        // A late "read" does not undo the failure.
+        await t.echo.handleWebhook({ messages: [], statuses: [{ id: request.id, status: 'read' }] });
+        assert.equal(t.store.outboxByWaId(request.id).status, 'failed');
+    });
+});
+
 describe('http', () => {
     const start = async (t) => {
         const server = createHttpServer({ config: t.config, echo: t.echo });
@@ -626,6 +851,13 @@ describe('http', () => {
         return { server, base: `http://127.0.0.1:${server.address().port}` };
     };
     const sign = (secret, body) => createHmac('sha256', secret).update(body).digest('hex');
+    const until = async (check) => {
+        for (let i = 0; i < 100 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+        assert.ok(check());
+    };
+    const waBody = (message) => JSON.stringify({ entry: [{ changes: [{ value: { messages: [message] } }] }] });
+    const postWa = (base, body, secret = 'app-secret') =>
+        fetch(`${base}/whatsapp`, { method: 'POST', body, headers: { 'X-Hub-Signature-256': `sha256=${sign(secret, body)}` } });
 
     it('verifies the Meta webhook subscription', async () => {
         const t = setup();
@@ -655,7 +887,10 @@ describe('http', () => {
                 headers: { 'X-Webhook-Signature': sign('hook-secret', body) },
             });
             assert.equal(signed.status, 200);
-            assert.equal(t.whatsapp.to(PHONES.yasir).filter((m) => m.type === 'interactive').length, 1);
+            // Queued before the answer, delivered after it.
+            await until(() => t.whatsapp.to(PHONES.yasir).filter((m) => m.type === 'interactive').length === 1);
+            const bad = await fetch(`${base}/projects/marmara/webhook`, { method: 'POST', body: '{nope', headers: { 'X-Webhook-Signature': sign('hook-secret', '{nope') } });
+            assert.equal(bad.status, 400);
         } finally {
             server.close();
         }
@@ -678,6 +913,68 @@ describe('http', () => {
             assert.equal(good.status, 200);
             await new Promise((resolve) => setTimeout(resolve, 20));
             assert.match(t.whatsapp.last(PHONES.yasir).text.body, /Merhaba/);
+        } finally {
+            server.close();
+        }
+    });
+
+    it('answers Meta 200 only after the message is stored, and 500 when it could not be', async () => {
+        const t = setup();
+        const { server, base } = await start(t);
+        const receive = t.store.receive;
+        try {
+            t.store.receive = () => {
+                throw new Error('database is locked');
+            };
+            const body = waBody({ id: 'w1', from: PHONES.yasir, type: 'text', text: { body: 'selam' }, timestamp: '1' });
+            const failed = await postWa(base, body);
+            assert.equal(failed.status, 500); // Meta will send it again
+            assert.equal(t.store.inbox('w1'), null);
+
+            t.store.receive = receive;
+            const retried = await postWa(base, body);
+            assert.equal(retried.status, 200);
+            assert.ok(t.store.inbox('w1')); // stored before the answer
+            await until(() => t.store.inbox('w1').status === 'done');
+            assert.equal(textsTo(t, PHONES.yasir, /Merhaba/).length, 1);
+        } finally {
+            server.close();
+        }
+    });
+
+    it('rolls back a partly stored webhook so the retry stores all of it', async () => {
+        const t = setup();
+        const { server, base } = await start(t);
+        const touch = t.store.touchWindow;
+        try {
+            t.store.touchWindow = () => {
+                throw new Error('disk I/O error');
+            };
+            const body = waBody({ id: 'w2', from: PHONES.yasir, type: 'text', text: { body: 'selam' }, timestamp: '1' });
+            assert.equal((await postWa(base, body)).status, 500);
+            assert.equal(t.store.inbox('w2'), null);
+            t.store.touchWindow = touch;
+            assert.equal((await postWa(base, body)).status, 200);
+            assert.ok(t.store.windowOpen(PHONES.yasir));
+        } finally {
+            server.close();
+        }
+    });
+
+    it('stores a failed status before answering, and answers bad JSON with 400', async () => {
+        const t = setup();
+        t.trypost.posts.set('p1', post());
+        await t.user.hello(PHONES.yasir);
+        await t.echo.handleProjectEvent('marmara', approvalEvent(post()));
+        const request = t.whatsapp.last(PHONES.yasir);
+        const { server, base } = await start(t);
+        try {
+            const body = JSON.stringify({ entry: [{ changes: [{ value: { statuses: [{ id: request.id, status: 'failed', errors: [{ code: 131049, title: 'ecosystem' }] }] } }] }] });
+            assert.equal((await postWa(base, body)).status, 200);
+            assert.equal(t.store.outboxByWaId(request.id).status, 'failed');
+            await until(() => t.trypost.notes.some((note) => note.body.includes('iletilemedi')));
+
+            assert.equal((await postWa(base, '{not json')).status, 400);
         } finally {
             server.close();
         }

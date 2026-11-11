@@ -64,6 +64,31 @@ export function sameVersion(stored, post) {
     return !tp; // only a TryPost version was stored and TryPost no longer sends one: cannot tell, treat as changed
 }
 
+/** Parses both date formats (webhook ISO 8601, API "Y-m-d H:i:s" in UTC). */
+const toTime = (value) => {
+    if (!value) return NaN;
+    return Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(value) ? value : `${value.replace(' ', 'T')}Z`);
+};
+
+// Clock difference tolerated between Echo and TryPost when comparing approved_at to a decision's start.
+const CLOCK_SKEW_MS = 5 * 60_000;
+const APPLIED_STATUSES = { approve: ['scheduled', 'publishing', 'published'], reject: ['draft', 'rejected'] };
+
+/**
+ * Whether the post shows `verb` as already done, the way an earlier attempt of
+ * a decision started at `startedAt` would have left it (approved, but the
+ * answer was lost or Echo crashed before recording it). Only asked for a
+ * decision Echo already started. approved_by is the API token's user (Echo
+ * itself), so it cannot say who tapped; approved_at rules out an approval
+ * made before the decision started.
+ */
+export function showsApplied(post, verb, startedAt) {
+    if (!post || !APPLIED_STATUSES[verb].includes(post.status)) return false;
+    if (verb === 'reject') return true;
+    const at = toTime(post.approved_at);
+    return Boolean(post.approved_by) && !Number.isNaN(at) && at >= startedAt - CLOCK_SKEW_MS;
+}
+
 export function createTryPostProject(project, { fetchImpl = globalThis.fetch, timeZone = 'Europe/Istanbul' } = {}) {
     const members = project.members;
     const memberByUserId = (id) => members.find((member) => member.userId && member.userId === id) ?? null;
@@ -117,8 +142,7 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
 
     const when = (iso) => {
         if (!iso) return 'Zaman seçilmedi (sıraya eklenecek)';
-        const value = /[zZ]|[+-]\d\d:?\d\d$/.test(iso) ? iso : `${iso.replace(' ', 'T')}Z`;
-        return new Intl.DateTimeFormat('tr-TR', { timeZone, dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
+        return new Intl.DateTimeFormat('tr-TR', { timeZone, dateStyle: 'medium', timeStyle: 'short' }).format(new Date(toTime(iso)));
     };
     const channel = (post) => {
         const account = post.social_account ?? {};
@@ -210,8 +234,11 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
     }
 
     /** Re-reads the post. Returns it when the reply still applies, otherwise answers and returns null. */
-    async function checkCurrent(echo, person, row, messageId, { decision = true } = {}) {
-        const post = await currentPost(row.item_id);
+    async function checkCurrent(echo, person, row, messageId, options) {
+        return checkPost(echo, person, row, messageId, await currentPost(row.item_id), options);
+    }
+
+    function checkPost(echo, person, row, messageId, post, { decision = true } = {}) {
         if (!post) {
             echo.reply(person, 'Bu gönderi silinmiş, işlem yapılmadı.', messageId, project.id, row.id);
             return null;
@@ -228,20 +255,80 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
     }
 
     /**
-     * Approve / reject with the version the person saw. TryPost checks it in the
-     * same transaction and answers 409 when the content changed in between.
-     * Returns false (after telling the person and sending the new version) on 409.
+     * Where this inbound message stands on the person's decision for a request:
+     * - fresh:   no decision yet
+     * - resumed: this message started it on an earlier attempt (crash, lost
+     *            answer, outage) and TryPost may or may not have it
+     * - done:    this message applied it; only the answer to the person is left
+     * - taken:   another message applied it
+     * - busy:    another message started it and is still queued
+     * A decision started by a message that will never finish (it failed or gave
+     * up) is taken over by this message and resumed.
      */
-    async function decideOnPost(echo, person, row, messageId, post, verb) {
+    function decisionState(echo, row, person, messageId) {
+        const decision = echo.store.decision(row.id, person.phone);
+        if (!decision) return { state: 'fresh', decision: null };
+        if (decision.wa_message_id === messageId) return { state: decision.state === 'applied' ? 'done' : 'resumed', decision };
+        if (decision.state === 'applied') return { state: 'taken', decision };
+        const owner = decision.wa_message_id ? echo.store.inbox(decision.wa_message_id) : null;
+        if (owner && ['pending', 'processing'].includes(owner.status)) return { state: 'busy', decision };
+        echo.store.adoptDecision(row.id, person.phone, messageId);
+        return { state: 'resumed', decision };
+    }
+
+    /**
+     * Approves or rejects (verb) for the decision this message owns. A fresh
+     * decision is checked against the current post and then started; a resumed
+     * one is first reconciled with the post: when TryPost already shows it done
+     * (an earlier attempt got through but its answer was lost), it counts as
+     * applied. The call carries the version the person saw; TryPost checks it in
+     * the same transaction and answers 409 when the content changed in between.
+     *
+     * Returns true once TryPost has it, and marks the decision applied. Otherwise
+     * tells the person why, removes the decision and returns false. Other errors
+     * are thrown (the caller keeps a started decision only for a retry).
+     */
+    async function settle(echo, person, row, messageId, verb, action, { state, decision }) {
+        const store = echo.store;
+        const drop = () => {
+            store.undecide(row.id, person.phone, messageId);
+            return false;
+        };
+        const applied = () => {
+            store.applyDecision(row.id, person.phone);
+            return true;
+        };
+        let post;
+        if (state === 'resumed') {
+            post = await currentPost(row.item_id);
+            if (showsApplied(post, verb, decision.decided_at)) return applied();
+            if (!checkPost(echo, person, row, messageId, post)) return drop();
+        } else {
+            post = await checkCurrent(echo, person, row, messageId);
+            if (!post) return false;
+            if (!store.startDecision(row.id, person.phone, action, messageId)) {
+                echo.reply(person, 'Bu içerik için cevabını zaten aldım.', messageId, project.id, row.id);
+                return false;
+            }
+            decision = store.decision(row.id, person.phone);
+        }
         const expected = parseVersion(row.fingerprint).tp;
         try {
             await api('POST', `/posts/${post.id}/${verb}`, expected ? { expected_version: expected } : {});
-            return true;
         } catch (error) {
-            if (error.status !== 409) throw error;
-            refresh(echo, person, row, messageId, await currentPost(post.id).catch(() => null));
-            return false;
+            if (error.status === 409) {
+                refresh(echo, person, row, messageId, await currentPost(post.id).catch(() => null));
+                return drop();
+            }
+            if (error.status !== 422) throw error;
+            // No longer pending. On a resumed decision that may be our own earlier attempt.
+            const now = state === 'resumed' ? await currentPost(post.id) : null;
+            if (!showsApplied(now, verb, decision.decided_at)) {
+                echo.reply(person, 'Bu gönderi artık onay beklemiyor; başka biri karar vermiş ya da gönderi değişmiş.', messageId, project.id, row.id);
+                return drop();
+            }
         }
+        return applied();
     }
 
     const explain = (error) => {
@@ -325,6 +412,48 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
                 return;
             }
 
+            if (action === 'approve' || action === 'ok') {
+                // The answer is keyed by the inbound message: a retry after a crash does not send it twice.
+                const answer = () =>
+                    echo.reply(
+                        person,
+                        action === 'approve' ? '✅ Onaylandı. Gönderi planlanan zamanda yayınlanacak.' : '👍 Teşekkürler, görüşün eklendi.',
+                        messageId,
+                        project.id,
+                        row.id,
+                        `${project.id}:answer:${messageId}`,
+                    );
+                // A double tap acts once; a retry of the same message finishes what it started.
+                const current = decisionState(echo, row, person, messageId);
+                if (current.state === 'taken') return reply('Bu içerik için cevabını zaten aldım.');
+                if (current.state === 'busy') return reply('Bu içerik için cevabını zaten aldım, işleniyor.');
+                if (current.state === 'done') return answer();
+                try {
+                    if (action === 'approve') {
+                        if (!(await settle(echo, person, row, messageId, 'approve', action, current))) return;
+                        await addNote(row.item_id, `✅ ${person.name} onayladı (WhatsApp).`).catch(() => {});
+                    } else {
+                        const post = await checkCurrent(echo, person, row, messageId);
+                        if (!post) {
+                            echo.store.undecide(row.id, person.phone, messageId);
+                            return;
+                        }
+                        if (current.state === 'fresh') echo.store.startDecision(row.id, person.phone, action, messageId);
+                        // The note is the decision. A crash between a successful POST and marking it applied
+                        // adds the note again on the retry: a duplicate note is harmless, a lost one is not.
+                        await addNote(post.id, `👍 ${person.name}: Uygun (WhatsApp).`);
+                        echo.store.applyDecision(row.id, person.phone);
+                    }
+                    answer();
+                } catch (error) {
+                    // A temporary error keeps the started decision for the retry; a final one removes it.
+                    if (!error.retryable) echo.store.undecide(row.id, person.phone, messageId);
+                    echo.log('error', 'trypost action failed', error.message);
+                    throw giveUp(error);
+                }
+                return;
+            }
+
             let post;
             try {
                 post = await checkCurrent(echo, person, row, messageId, { decision: action !== 'comment' });
@@ -332,32 +461,6 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
                 throw giveUp(error);
             }
             if (!post) return;
-
-            if (action === 'approve' || action === 'ok') {
-                // A double tap (or a retried webhook) acts once.
-                if (!echo.store.decide(row.id, person.phone, action)) {
-                    reply('Bu içerik için cevabını zaten aldım.');
-                    return;
-                }
-                try {
-                    if (action === 'approve') {
-                        if (!(await decideOnPost(echo, person, row, messageId, post, 'approve'))) {
-                            echo.store.undecide(row.id, person.phone);
-                            return;
-                        }
-                        await addNote(post.id, `✅ ${person.name} onayladı (WhatsApp).`).catch(() => {});
-                        reply('✅ Onaylandı. Gönderi planlanan zamanda yayınlanacak.');
-                    } else {
-                        await addNote(post.id, `👍 ${person.name}: Uygun (WhatsApp).`);
-                        reply('👍 Teşekkürler, görüşün eklendi.');
-                    }
-                } catch (error) {
-                    echo.store.undecide(row.id, person.phone);
-                    echo.log('error', 'trypost action failed', error.message);
-                    throw giveUp(error);
-                }
-                return;
-            }
 
             // A new tap replaces any open session; the prompt names the content, so the person sees where the next message goes.
             echo.store.setSession(person.phone, row.id, action);
@@ -374,35 +477,33 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
         async handleText({ echo, person, row, mode, text, messageId, progress = {} }) {
             const member = memberByPhone(person.phone);
             if (!member) return;
-            const reply = (body) => echo.reply(person, body, messageId, project.id, row.id);
+            const reply = (body, dedupeKey = null) => echo.reply(person, body, messageId, project.id, row.id, dedupeKey);
             try {
-                if (mode === 'revise' && row.kind === 'approval' && progress.rejected) {
-                    // Rejected on an earlier attempt; only the note is left.
-                    await addNote(row.item_id, `✏️ ${person.name} düzeltme istedi (WhatsApp): ${text}`);
-                    reply('↩️ Not eklendi, gönderi düzeltme için geri gönderildi.');
+                if (mode === 'revise' && row.kind === 'approval' && can(member, 'approver')) {
+                    // Reject first, with the version the person saw; then the note. A crash after the reject
+                    // leaves only the note (and the answer) for the retry; the note may then be added twice.
+                    const finish = async () => {
+                        await addNote(row.item_id, `✏️ ${person.name} düzeltme istedi (WhatsApp): ${text}`);
+                        reply('↩️ Not eklendi, gönderi düzeltme için geri gönderildi.', `${project.id}:answer:${messageId}`);
+                    };
+                    // progress.rejected: a retry queued by an older version, after its reject went through.
+                    const current = progress.rejected ? { state: 'done' } : decisionState(echo, row, person, messageId);
+                    if (current.state === 'done') return await finish();
+                    if (current.state === 'busy') return reply('Bu içerik için kararını zaten aldım, işleniyor.');
+                    if (current.state === 'taken') {
+                        await addNote(row.item_id, `💬 ${person.name}: ${text}`);
+                        reply('Bu içerik için kararını zaten aldım; notunu yine de ekledim.');
+                        return;
+                    }
+                    if (!(await settle(echo, person, row, messageId, 'reject', 'revise', current))) return;
+                    await finish();
                     return;
                 }
                 const post = await checkCurrent(echo, person, row, messageId, { decision: mode === 'revise' });
                 if (!post) return;
                 if (mode === 'revise' && row.kind === 'approval') {
-                    if (!can(member, 'approver')) {
-                        await addNote(post.id, `💬 ${person.name}: ${text}`);
-                        reply('Onay verme yetkin yok; yorumunu not olarak ekledim.');
-                        return;
-                    }
-                    if (!echo.store.decide(row.id, person.phone, 'revise')) {
-                        await addNote(post.id, `💬 ${person.name}: ${text}`);
-                        reply('Bu içerik için kararını zaten aldım; notunu yine de ekledim.');
-                        return;
-                    }
-                    // Reject first, with the version the person saw; then the note.
-                    if (!(await decideOnPost(echo, person, row, messageId, post, 'reject'))) {
-                        echo.store.undecide(row.id, person.phone);
-                        return;
-                    }
-                    progress.rejected = true;
-                    await addNote(post.id, `✏️ ${person.name} düzeltme istedi (WhatsApp): ${text}`);
-                    reply('↩️ Not eklendi, gönderi düzeltme için geri gönderildi.');
+                    await addNote(post.id, `💬 ${person.name}: ${text}`);
+                    reply('Onay verme yetkin yok; yorumunu not olarak ekledim.');
                     return;
                 }
                 if (mode === 'revise') {
@@ -413,7 +514,8 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
                 await addNote(post.id, `💬 ${person.name} (WhatsApp): ${text}`);
                 reply('💬 Yorumun eklendi.');
             } catch (error) {
-                if (mode === 'revise' && !progress.rejected) echo.store.undecide(row.id, person.phone);
+                // A temporary error keeps a started decision for the retry; a final one removes it (applied ones stay).
+                if (!error.retryable) echo.store.undecide(row.id, person.phone, messageId);
                 echo.log('error', 'trypost note failed', error.message);
                 throw giveUp(error);
             }

@@ -3,6 +3,8 @@ import { OUTSIDE_WINDOW, toPayload, toTemplatePayload } from './whatsapp.js';
 
 const BACKOFF_MS = [30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
 const MAX_ATTEMPTS = BACKOFF_MS.length + 1;
+const REPORT_RETRY_MS = 5 * 60_000;
+const REPORT_GIVE_UP_MS = 24 * 60 * 60_000;
 
 /**
  * Echo's heart: projects turn their events into outbox messages, the worker
@@ -63,8 +65,8 @@ export function createEcho({ config, store, whatsapp, log = () => {} }) {
          * `about` is the outbox id of the request the reply concerns: quote-replying
          * to this reply then counts as replying to that request.
          */
-        reply(person, text, replyTo = null, project = '_echo', about = null) {
-            return store.enqueue({ project, kind: 'reply', recipient: person.phone, message: { text, replyTo, ...(about ? { about } : {}) } });
+        reply(person, text, replyTo = null, project = '_echo', about = null, dedupeKey = null) {
+            return store.enqueue({ project, kind: 'reply', recipient: person.phone, message: { text, replyTo, ...(about ? { about } : {}) }, dedupeKey });
         },
 
         async tick() {
@@ -78,6 +80,7 @@ export function createEcho({ config, store, whatsapp, log = () => {} }) {
                     again = false;
                     await processInbox();
                     await deliverDue();
+                    await reportFailures();
                 } while (again);
             })().finally(() => {
                 ticking = null;
@@ -85,25 +88,43 @@ export function createEcho({ config, store, whatsapp, log = () => {} }) {
             return ticking;
         },
 
-        async handleProjectEvent(projectId, event) {
+        /** Lets the project queue what an event asks for (stored in the outbox); delivery is left to the worker. */
+        async acceptProjectEvent(projectId, event) {
             const adapter = adapters.get(projectId);
             if (!adapter) throw new Error(`Unknown project ${projectId}`);
             await adapter.handleEvent(event, echo);
+        },
+
+        async handleProjectEvent(projectId, event) {
+            await echo.acceptProjectEvent(projectId, event);
             await echo.tick();
         },
 
-        /** Statuses are applied at once; messages are only stored, the worker processes them. */
-        async handleWebhook({ messages, statuses }) {
-            for (const status of statuses) await onStatus(status);
-            for (const message of messages) {
-                const person = people.get(normalizePhone(message.from));
-                if (!person) {
-                    log('warn', 'message from an unknown number ignored');
-                    continue;
+        /**
+         * Stores what a WhatsApp webhook brought, synchronously and in one
+         * transaction: inbound messages (keyed by their id), the senders' windows
+         * and delivery statuses. Throws when it could not; the webhook is then
+         * answered with an error so Meta sends it again, which is safe because
+         * all of it is idempotent. Nothing here calls a project or WhatsApp: the
+         * worker (tick) does that, after Meta got its answer.
+         */
+        ingest({ messages = [], statuses = [] }) {
+            store.transaction(() => {
+                for (const status of statuses) onStatus(status);
+                for (const message of messages) {
+                    const person = people.get(normalizePhone(message.from));
+                    if (!person) {
+                        log('warn', 'message from an unknown number ignored');
+                        continue;
+                    }
+                    // A retried Meta webhook finds the id already stored and adds nothing.
+                    if (store.receive(message, person.phone)) store.touchWindow(person.phone);
                 }
-                // A retried Meta webhook finds the id already stored and adds nothing.
-                if (store.receive(message, person.phone)) store.touchWindow(person.phone);
-            }
+            });
+        },
+
+        async handleWebhook(parsed) {
+            echo.ingest(parsed);
             await echo.tick();
         },
     };
@@ -224,30 +245,51 @@ export function createEcho({ config, store, whatsapp, log = () => {} }) {
                 log('warn', 'retrying', row.id, error.message);
                 return;
             }
-            store.fail(row.id, error.message);
+            // The failure is reported to the project by reportFailures (in this same pass), from the stored row.
+            store.fail(row.id, error.code === OUTSIDE_WINDOW ? 'Kişi son 24 saatte yazmadı ve onaylı şablon yok.' : error.message);
             log('error', 'failed', row.id, error.message);
-            await reportFailure(store.outbox(row.id), error.code === OUTSIDE_WINDOW ? 'Kişi son 24 saatte yazmadı ve onaylı şablon yok.' : error.message);
         }
     }
 
-    async function reportFailure(row, reason) {
-        const adapter = adapters.get(row.project);
-        if (!adapter?.onDeliveryFailed || !['approval', 'feedback'].includes(row.kind)) return;
-        const person = people.get(row.recipient);
-        await adapter.onDeliveryFailed({ echo, row, person, reason }).catch((error) => log('error', 'failure report failed', error.message));
+    /**
+     * Tells projects about requests that could not be delivered. Driven by the
+     * outbox (status 'failed', failure_reported 0), so a failure stored just
+     * before a crash is still reported. While the project is unreachable the
+     * report is retried every 5 minutes for a day.
+     */
+    async function reportFailures() {
+        for (const row of store.unreportedFailures(50)) {
+            const adapter = adapters.get(row.project);
+            if (!adapter?.onDeliveryFailed || !['approval', 'feedback'].includes(row.kind)) {
+                store.markReported(row.id);
+                continue;
+            }
+            try {
+                await adapter.onDeliveryFailed({ echo, row, person: people.get(row.recipient), reason: row.last_error ?? 'WhatsApp mesajı teslim edemedi.' });
+                store.markReported(row.id);
+            } catch (error) {
+                if (error.retryable && store.now() - row.updated_at < REPORT_GIVE_UP_MS) {
+                    store.delayReport(row.id, REPORT_RETRY_MS);
+                    log('warn', 'failure report retrying', row.id, error.message);
+                } else {
+                    store.markReported(row.id);
+                    log('error', 'failure report failed', row.id, error.message);
+                }
+            }
+        }
     }
 
-    async function onStatus(status) {
+    /** Only database writes: a failed status is reported to the project later, by the worker. */
+    function onStatus(status) {
         const row = store.outboxByWaId(status.id);
-        if (!row) return;
-        const order = ['pending', 'sending', 'sent', 'delivered', 'read'];
+        // A failure is final; a late "read" does not undo it.
+        if (!row || row.status === 'failed') return;
         if (status.status === 'failed') {
-            if (row.status === 'failed') return;
-            store.setStatusByWaId(status.id, 'failed', status.error);
-            await reportFailure(store.outbox(row.id), status.error ?? 'WhatsApp mesajı teslim edemedi.');
+            store.setStatusByWaId(status.id, 'failed', status.error ?? 'WhatsApp mesajı teslim edemedi.');
             return;
         }
         // Statuses can arrive out of order; only move forward.
+        const order = ['pending', 'sending', 'sent', 'delivered', 'read'];
         if (order.indexOf(status.status) > order.indexOf(row.status)) store.setStatusByWaId(status.id, status.status);
     }
 
@@ -277,7 +319,6 @@ export function createEcho({ config, store, whatsapp, log = () => {} }) {
             if (adapter) {
                 if (!item.route) store.setRoute(message.id, { ...route, progress });
                 if (/^\s*(iptal|vazgeç|vazgec)\s*$/i.test(message.text)) {
-                    if (route.usedSession) store.undecide(row.id, person.phone);
                     echo.reply(person, 'Tamam, vazgeçildi.', message.id, row.project, row.id);
                     return route;
                 }

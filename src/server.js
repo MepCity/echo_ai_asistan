@@ -37,6 +37,15 @@ export function createHttpServer({ config, echo, log = () => {} }) {
         response.writeHead(status, { 'Content-Type': type });
         response.end(typeof body === 'string' ? body : JSON.stringify(body));
     };
+    const parseJson = (raw) => {
+        try {
+            return JSON.parse(raw.toString('utf8') || '{}');
+        } catch {
+            return undefined;
+        }
+    };
+    // Work after the answer: the caller's timeout never waits on WhatsApp or a project API.
+    const work = () => echo.tick().catch((error) => log('error', 'tick failed', error.message));
 
     async function handle(request, response) {
         const url = new URL(request.url, 'http://echo');
@@ -57,10 +66,18 @@ export function createHttpServer({ config, echo, log = () => {} }) {
                 log('warn', 'WhatsApp webhook with a bad signature rejected');
                 return send(response, 401, 'bad signature');
             }
-            // Answer Meta at once; messages are stored first (keyed by id, so retries are harmless) and processed after.
+            const body = parseJson(raw);
+            if (body === undefined) return send(response, 400, 'bad json');
+            // 200 only once everything is stored: if storing fails, a 500 makes Meta send the webhook again
+            // (messages are keyed by id and statuses only move forward, so that is safe).
+            try {
+                echo.ingest(parseWebhook(body));
+            } catch (error) {
+                log('error', 'webhook could not be stored', error.message);
+                return send(response, 500, 'error');
+            }
             send(response, 200, 'ok');
-            const parsed = parseWebhook(JSON.parse(raw.toString('utf8') || '{}'));
-            echo.handleWebhook(parsed).catch((error) => log('error', 'webhook handling failed', error.message));
+            work();
             return;
         }
 
@@ -73,16 +90,20 @@ export function createHttpServer({ config, echo, log = () => {} }) {
                 log('warn', `project ${project.id} webhook with a bad signature rejected`);
                 return send(response, 401, 'bad signature');
             }
-            const event = JSON.parse(raw.toString('utf8') || '{}');
+            const event = parseJson(raw);
+            if (event === undefined) return send(response, 400, 'bad json');
             if (event.type === 'webhook.test') return send(response, 200, 'ok');
             try {
-                await echo.handleProjectEvent(project.id, event);
+                // Queues the messages in the outbox (durable) before the 200; they are delivered after it.
+                await echo.acceptProjectEvent(project.id, event);
             } catch (error) {
                 // A 5xx makes TryPost retry the webhook; dedupe keys keep that safe.
                 log('error', `project ${project.id} event failed`, error.message);
                 return send(response, 500, 'error');
             }
-            return send(response, 200, 'ok');
+            send(response, 200, 'ok');
+            work();
+            return;
         }
 
         return send(response, 404, 'not found');

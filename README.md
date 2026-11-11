@@ -45,15 +45,45 @@ quote-reply; it never guesses.
 - Outbox in SQLite: messages survive restarts and are retried with backoff
   (30 s, 2 min, 10 min, 30 min, 2 h).
 - Dedupe keys per event and person: a retried project webhook sends nothing twice.
-- Inbox in SQLite: the WhatsApp webhook only stores each message (keyed by its
-  id, so a retried Meta webhook acts once); a worker processes them in order per
+- Inbox in SQLite: the WhatsApp webhook stores each message (keyed by its id,
+  so a retried Meta webhook acts once), the sender's window and delivery
+  statuses in one transaction, and answers Meta 200 only after that commit. If
+  storing fails it answers 500 and Meta sends the webhook again. Nothing that
+  calls TryPost or WhatsApp runs before the answer; the worker is started right
+  after it. Bad JSON gets 400. A worker processes messages in order per
   person. While TryPost is unreachable a message stays queued and is retried
   with the same backoff (6 attempts); the person gets one "cevabını kaydettim"
   message, then the normal answer when it goes through, or a "use the panel"
   message if it finally fails. A later message of the same person waits for
   the earlier one, so "Düzeltme iste" and the typed note keep their order. A
   message left half-done by a crash is picked up again after 5 minutes.
-- One decision per person per message: a double tap acts once.
+- A failed delivery (a send error or a `failed` status from Meta) is stored on
+  the outbox row first; the worker reports it to the project afterwards
+  (`failure_reported`), so a crash right after the 200 loses nothing. While
+  TryPost is down the report is retried every 5 minutes for a day.
+- The project webhook queues its messages in the outbox before answering 200;
+  delivery happens after the answer.
+- One decision per person per message: a double tap acts once. A decision is
+  `started` (owned by the inbound message that made it) until TryPost
+  confirms it, then `applied`; a final error removes it. If Echo crashes in
+  between, or TryPost's answer is lost, the same message is retried and
+  reconciles instead of refusing: it re-reads the post and, if still pending,
+  approves/rejects again with the same `expected_version`; if the post is
+  already approved (status scheduled/publishing/published with `approved_by`
+  and an `approved_at` no earlier than the decision, 5 min clock skew allowed)
+  or already sent back (draft/rejected), it counts as done and the person gets
+  the normal answer. `approved_by` is the API token's user, so Echo cannot tell
+  its own approval from one made in the panel after the decision started; in
+  that case the person is told "Onaylandı" for a post that is approved anyway.
+  Another message finding an `applied` decision gets "zaten aldım"; one finding
+  a `started` decision whose message is still queued gets "zaten aldım,
+  işleniyor"; a `started` decision left by a message that failed or gave up is
+  taken over by the new message.
+- Notes are at-least-once: a crash between a successful note POST and marking
+  the decision applied (for "Uygun", or the note after a reject) adds the note
+  again on the retry. A duplicate note is harmless, a lost one is not. The
+  final answer to the person is keyed by the inbound message, so it is not sent
+  twice.
 - Outside the 24-hour window, requests go as approved templates; courtesy
   updates are skipped.
 
@@ -86,3 +116,6 @@ Write an adapter in `src/projects/` with `handleEvent`, `handleAction`,
 `retryable = true` when the project is temporarily unreachable (Echo retries),
 or with a `userMessage` when the answer cannot be applied; they reply only after
 the work succeeded, and pass the request's outbox id as `about` to `echo.reply`.
+A step that must happen once should be recorded as started before it and
+applied after it (see `decisions`), so a retry after a crash can tell the two
+apart.

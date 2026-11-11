@@ -13,7 +13,11 @@ import { DatabaseSync } from 'node:sqlite';
  *              message id is the key, so a retried Meta webhook acts once.
  * - windows:   when each person last wrote to us (24-hour service window)
  * - sessions:  "I asked you to type a note, the next message is the note"
- * - decisions: one decision per person per message, so a double tap acts once
+ * - decisions: one decision per person per message, so a double tap acts once;
+ *              'started' (owned by the inbound message that started it) until
+ *              the project confirmed it, then 'applied'. A retry of the same
+ *              message after a crash finds its own 'started' decision and
+ *              finishes it instead of refusing.
  */
 export function openDatabase(dataDir) {
     let file = ':memory:';
@@ -41,6 +45,7 @@ export function openDatabase(dataDir) {
             next_attempt_at INTEGER NOT NULL DEFAULT 0,
             last_error      TEXT,
             wa_message_id   TEXT UNIQUE,
+            failure_reported INTEGER NOT NULL DEFAULT 0,
             created_at      INTEGER NOT NULL,
             updated_at      INTEGER NOT NULL
         );
@@ -79,10 +84,32 @@ export function openDatabase(dataDir) {
             phone      TEXT NOT NULL,
             action     TEXT NOT NULL,
             decided_at INTEGER NOT NULL,
+            state      TEXT NOT NULL DEFAULT 'applied',
+            wa_message_id TEXT,
             PRIMARY KEY (outbox_id, phone)
         );
     `);
+    migrate(db);
     return db;
+}
+
+/** Adds columns that databases created by older versions lack. */
+function migrate(db) {
+    const columns = (table) => db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name);
+    if (!columns('decisions').includes('state')) {
+        // Decisions recorded before states existed were applied (they were recorded and acted on together).
+        db.exec(`
+            ALTER TABLE decisions ADD COLUMN state TEXT NOT NULL DEFAULT 'applied';
+            ALTER TABLE decisions ADD COLUMN wa_message_id TEXT;
+        `);
+    }
+    if (!columns('outbox').includes('failure_reported')) {
+        // Failures from before the upgrade were already reported at the time.
+        db.exec(`
+            ALTER TABLE outbox ADD COLUMN failure_reported INTEGER NOT NULL DEFAULT 0;
+            UPDATE outbox SET failure_reported = 1 WHERE status = 'failed';
+        `);
+    }
 }
 
 export function createStore(db, now = () => Date.now()) {
@@ -124,8 +151,15 @@ export function createStore(db, now = () => Date.now()) {
             ON CONFLICT(phone) DO UPDATE SET outbox_id = excluded.outbox_id, mode = excluded.mode, expires_at = excluded.expires_at`),
         session: q(`SELECT * FROM sessions WHERE phone = ? AND expires_at > ?`),
         clearSession: q(`DELETE FROM sessions WHERE phone = ?`),
-        decide: q(`INSERT OR IGNORE INTO decisions (outbox_id, phone, action, decided_at) VALUES (?, ?, ?, ?)`),
-        undecide: q(`DELETE FROM decisions WHERE outbox_id = ? AND phone = ?`),
+        // Failed requests whose failure the project was not told about yet.
+        unreported: q(`SELECT * FROM outbox WHERE status = 'failed' AND failure_reported = 0 AND next_attempt_at <= ? ORDER BY id LIMIT ?`),
+        markReported: q(`UPDATE outbox SET failure_reported = 1 WHERE id = ?`),
+        delayReport: q(`UPDATE outbox SET next_attempt_at = ? WHERE id = ?`),
+        decision: q(`SELECT * FROM decisions WHERE outbox_id = ? AND phone = ?`),
+        startDecision: q(`INSERT OR IGNORE INTO decisions (outbox_id, phone, action, decided_at, state, wa_message_id) VALUES (?, ?, ?, ?, 'started', ?)`),
+        applyDecision: q(`UPDATE decisions SET state = 'applied' WHERE outbox_id = ? AND phone = ?`),
+        adoptDecision: q(`UPDATE decisions SET wa_message_id = ? WHERE outbox_id = ? AND phone = ? AND state = 'started'`),
+        undecide: q(`DELETE FROM decisions WHERE outbox_id = ? AND phone = ? AND state = 'started' AND wa_message_id = ?`),
         stats: q(`SELECT status, COUNT(*) AS count FROM outbox GROUP BY status`),
     };
 
@@ -140,6 +174,19 @@ export function createStore(db, now = () => Date.now()) {
         };
 
     return {
+        /** Runs fn (synchronous) in one transaction: all of its writes are stored, or none. */
+        now,
+        transaction(fn) {
+            db.exec('BEGIN IMMEDIATE');
+            try {
+                const result = fn();
+                db.exec('COMMIT');
+                return result;
+            } catch (error) {
+                db.exec('ROLLBACK');
+                throw error;
+            }
+        },
         /** @returns {number|null} the new id, or null when dedupe_key was already used */
         enqueue({ project, itemId = null, kind, recipient, message, template = null, fingerprint = null, dedupeKey = null }) {
             const t = now();
@@ -181,9 +228,19 @@ export function createStore(db, now = () => Date.now()) {
         setSession: (phone, outboxId, mode, ttlMs = 30 * 60 * 1000) => statements.setSession.run(phone, outboxId, mode, now() + ttlMs),
         session: (phone) => statements.session.get(phone, now()) ?? null,
         clearSession: (phone) => statements.clearSession.run(phone),
-        /** @returns {boolean} true when this is the person's first decision on this message */
-        decide: (outboxId, phone, action) => statements.decide.run(outboxId, phone, action, now()).changes === 1,
-        undecide: (outboxId, phone) => statements.undecide.run(outboxId, phone),
+        unreportedFailures: (limit = 50) => statements.unreported.all(now(), limit).map(parse),
+        markReported: (id) => statements.markReported.run(id),
+        delayReport: (id, delayMs) => statements.delayReport.run(now() + delayMs, id),
+        decision: (outboxId, phone) => statements.decision.get(outboxId, phone) ?? null,
+        /** Records a decision as started by an inbound message. @returns {boolean} false when the person already has one */
+        startDecision: (outboxId, phone, action, waMessageId) =>
+            statements.startDecision.run(outboxId, phone, action, now(), waMessageId).changes === 1,
+        /** The project confirmed it. */
+        applyDecision: (outboxId, phone) => statements.applyDecision.run(outboxId, phone),
+        /** Hands a started decision left behind by a message that will never finish to another message. */
+        adoptDecision: (outboxId, phone, waMessageId) => statements.adoptDecision.run(waMessageId, outboxId, phone).changes === 1,
+        /** Removes a decision that was started by this message and could not be applied. Applied decisions stay. */
+        undecide: (outboxId, phone, waMessageId) => statements.undecide.run(outboxId, phone, waMessageId),
         stats: () => Object.fromEntries(statements.stats.all().map((row) => [row.status, row.count])),
     };
 }
