@@ -566,8 +566,10 @@ describe('content versions', () => {
         t.trypost.hooks.afterGet = (p) => (p.content = 'Atölye ertelendi');
         await t.user.say(PHONES.yasir, 'Saat 19:00 olacak');
         assert.equal(t.trypost.posts.get('p1').status, 'pending_approval');
-        assert.equal(t.trypost.notes.length, 0);
-        assert.match(t.whatsapp.to(PHONES.yasir).at(-1).interactive.body.text, /Atölye ertelendi/);
+        // The typed text is kept as a plain comment, not as a "düzeltme istedi" note.
+        assert.deepEqual(t.trypost.notes.map((note) => note.body), ['💬 Yasir (WhatsApp): Saat 19:00 olacak']);
+        assert.equal(textsTo(t, PHONES.yasir, /yorum olarak ekledim/).length, 1);
+        assert.ok(t.whatsapp.to(PHONES.yasir).some((m) => /Atölye ertelendi/.test(m.interactive?.body.text ?? '')));
     });
 
     it('compares like with like, and still reads older fingerprints', () => {
@@ -907,6 +909,38 @@ describe('request ids: a retried decision is only claimed when TryPost says it w
         assert.equal(textsTo(t, PHONES.yasir, /geri gönderildi/).length, 0);
         assert.equal(textsTo(t, PHONES.yasir, /başka biri karar vermiş/).length, 1);
         assert.equal(notesWith('düzeltme istedi').length, 0);
+        assert.deepEqual(t.trypost.notes.map((note) => note.body), ['💬 Yasir (WhatsApp): Saat 19:00 olacak']);
+        assert.equal(textsTo(t, PHONES.yasir, /Düzeltme notunu gönderiye yorum olarak ekledim/).length, 1);
+        assert.equal(decisionRow(), null);
+    });
+
+    it('keeps the typed text as a comment once when the note POST fails after a refused reject', async () => {
+        await t.user.tap(PHONES.yasir, buttonsOf(request)[1]);
+        t.trypost.panelDecide('p1', 'approve'); // someone approved before the note arrived
+        t.trypost.crashOn('POST /posts/p1/notes', { when: 'before', mode: 'network' });
+        await t.user.say(PHONES.yasir, 'Saat 19:00 olacak', null, 'note-1');
+        assert.equal(t.store.inbox('note-1').status, 'pending');
+        await later(t, 31_000);
+
+        assert.equal(t.store.inbox('note-1').status, 'done');
+        assert.equal(textsTo(t, PHONES.yasir, /artık onay beklemiyor/).length, 1); // explained once
+        assert.deepEqual(t.trypost.notes.map((note) => note.body), ['💬 Yasir (WhatsApp): Saat 19:00 olacak']);
+        assert.equal(textsTo(t, PHONES.yasir, /Düzeltme notunu gönderiye yorum olarak ekledim/).length, 1);
+    });
+
+    it('keeps the typed text as a comment when the reject hits a request_id conflict', async () => {
+        await t.user.tap(PHONES.yasir, buttonsOf(request)[1]);
+        const crashed = t.trypost.crashOn('POST /posts/p1/reject', { when: 'before' });
+        t.user.say(PHONES.yasir, 'Saat 19:00 olacak', null, 'note-1');
+        await crashed;
+        t.trypost.decided.set(`p1 ${decisionRow().request_id}`, 'approve');
+        restart(t);
+        await later(t, 6 * 60_000);
+
+        assert.equal(t.trypost.posts.get('p1').status, 'pending_approval');
+        assert.equal(textsTo(t, PHONES.yasir, /paneli kullan/).length, 1);
+        assert.deepEqual(t.trypost.notes.map((note) => note.body), ['💬 Yasir (WhatsApp): Saat 19:00 olacak']);
+        assert.equal(textsTo(t, PHONES.yasir, /Düzeltme notunu gönderiye yorum olarak ekledim/).length, 1);
         assert.equal(decisionRow(), null);
     });
 
@@ -996,6 +1030,8 @@ describe('request ids: a retried decision is only claimed when TryPost says it w
             assert.equal(textsTo(t, PHONES.yasir, /doğrulayamadım/).length, 1);
             assert.equal(textsTo(t, PHONES.yasir, /geri gönderildi/).length, 0);
             assert.equal(notesWith('düzeltme istedi').length, 0);
+            assert.equal(notesWith('💬 Yasir (WhatsApp): Saat 19:00 olacak').length, 1);
+            assert.equal(textsTo(t, PHONES.yasir, /yorum olarak ekledim/).length, 1);
         });
 
         it('still applies a resumed approval whose call never reached TryPost', async () => {

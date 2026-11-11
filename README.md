@@ -96,6 +96,11 @@ quote-reply; it never guesses.
   by an Echo version without request ids gets "not pending" on the retry, the
   person is told "Onayının uygulanıp uygulanmadığını doğrulayamadım; lütfen
   panelden kontrol et." A first attempt that gets a 200 is applied either way.
+- A typed "Düzeltme iste" note whose reject is refused (someone else decided,
+  the content changed, a request_id conflict, or it could not be verified) is
+  not lost: it is added as a plain comment (`💬 <Ad> (WhatsApp): <text>`) and
+  the person is told it was saved as a comment. A failed note POST is retried
+  without explaining the refusal again.
 - Another message finding an `applied` decision gets "zaten aldım"; one finding
   a `started` decision whose message is still queued gets "zaten aldım,
   işleniyor"; a `started` decision left by a message that failed or gave up is

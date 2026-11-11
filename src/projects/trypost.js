@@ -290,7 +290,9 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
      * true only when TryPost answered 200 to this decision's request_id: then it
      * marks the decision applied, and only then may the caller add the
      * "onayladı" / "düzeltme istedi" note. Otherwise it tells the person why,
-     * removes the decision and returns false. Temporary errors (network, 5xx,
+     * removes the decision and returns 'refused' (the post is there but the
+     * decision was not applied: changed, decided by someone else, unverifiable,
+     * request_id conflict) or 'gone' (deleted, or a decision already taken). Temporary errors (network, 5xx,
      * 429) are thrown and the started decision is kept for the retry; other
      * errors are thrown too (the caller removes the decision).
      *
@@ -309,9 +311,10 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
      */
     async function settle(echo, person, row, messageId, verb, action, { state, decision }) {
         const store = echo.store;
+        // Refused: the decision was not applied and the person was told why ('refused' lets the caller keep their note).
         const drop = () => {
             store.undecide(row.id, person.phone, messageId);
-            return false;
+            return 'refused';
         };
         const say = (text) => echo.reply(person, text, messageId, project.id, row.id);
         const newRequestId = (startedAt) => requestIdFor({ project: project.id, outboxId: row.id, person: person.id, verb, startedAt });
@@ -329,7 +332,8 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
                 const post = await currentPost(row.item_id);
                 if (!post) {
                     say('Bu gönderi silinmiş, işlem yapılmadı.');
-                    return drop();
+                    drop();
+                    return 'gone';
                 }
                 // A changed post that is still pending must not be decided on. One that is no longer pending
                 // cannot be changed by the call, and TryPost's answer to the request_id tells whose decision it was.
@@ -339,11 +343,11 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
                 }
             }
         } else {
-            const post = await checkCurrent(echo, person, row, messageId);
-            if (!post) return false;
+            const post = await currentPost(row.item_id);
+            if (!checkPost(echo, person, row, messageId, post)) return post ? 'refused' : 'gone';
             if (!store.startDecision(row.id, person.phone, action, messageId, newRequestId)) {
                 say('Bu içerik için cevabını zaten aldım.');
-                return false;
+                return 'gone';
             }
             decision = store.decision(row.id, person.phone);
         }
@@ -478,7 +482,7 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
                 if (current.state === 'done') return answer();
                 try {
                     if (action === 'approve') {
-                        if (!(await settle(echo, person, row, messageId, 'approve', action, current))) return;
+                        if ((await settle(echo, person, row, messageId, 'approve', action, current)) !== true) return;
                         await addNote(row.item_id, `✅ ${person.name} onayladı (WhatsApp).`).catch(() => {});
                     } else {
                         const post = await checkCurrent(echo, person, row, messageId);
@@ -534,6 +538,15 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
                         await addNote(row.item_id, `✏️ ${person.name} düzeltme istedi (WhatsApp): ${text}`);
                         reply('↩️ Not eklendi, gönderi düzeltme için geri gönderildi.', `${project.id}:answer:${messageId}`);
                     };
+                    // The reject was refused (someone else decided, the content changed, it could not be verified):
+                    // the typed text is still kept, as a plain comment. Recorded in progress first, so a retry after a
+                    // failed note POST only adds the note (the refusal was already explained); duplicate tradeoff as above.
+                    const keepAsComment = async () => {
+                        progress.commentOnly = true;
+                        await addNote(row.item_id, `💬 ${person.name} (WhatsApp): ${text}`);
+                        reply('💬 Düzeltme notunu gönderiye yorum olarak ekledim.', `${project.id}:answer:${messageId}`);
+                    };
+                    if (progress.commentOnly) return await keepAsComment();
                     // progress.rejected: a retry queued by an older version, after its reject went through.
                     const current = progress.rejected ? { state: 'done' } : decisionState(echo, row, person, messageId);
                     if (current.state === 'done') return await finish();
@@ -543,7 +556,9 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
                         reply('Bu içerik için kararını zaten aldım; notunu yine de ekledim.');
                         return;
                     }
-                    if (!(await settle(echo, person, row, messageId, 'reject', 'revise', current))) return;
+                    const settled = await settle(echo, person, row, messageId, 'reject', 'revise', current);
+                    if (settled === 'refused') return await keepAsComment();
+                    if (settled !== true) return;
                     await finish();
                     return;
                 }
