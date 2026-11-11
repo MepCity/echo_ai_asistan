@@ -32,10 +32,26 @@ quote-reply; it never guesses.
 
 - Webhook payload and API post resource carry `data.content_version`, TryPost's
   hash of content, media and schedule. Echo stores the version it showed.
-- `POST /api/posts/{id}/approve` and `/reject` get `{"expected_version": "<content_version>"}`.
-  TryPost checks it in the same locked transaction as the decision and answers
-  **409** `{"message": ..., "content_version": "<current>"}` when the content
-  changed. Echo then applies nothing, tells the person and sends the current version.
+- `POST /api/posts/{id}/approve` and `/reject` get
+  `{"request_id": "<id>", "expected_version": "<content_version>"}`.
+  - `request_id` (≤100 chars, `^[A-Za-z0-9:._-]+$`) is the idempotency key of
+    one decision: `echo-<project>-<outbox id>-<person id>-<approve|reject>-<start time base36><4 hex>`,
+    e.g. `echo-marmara-12-yasir-approve-mhu5l4w0a3f9`. Echo makes it when the
+    decision starts, stores it on the decision row and sends the same id on
+    every retry. TryPost records it in the transaction that applies the
+    decision, and only then.
+  - **200** `{"data": ..., "replayed": false}`: applied now. **200** with
+    `"replayed": true`: this request_id was already applied with this action
+    (even if the post is no longer pending or its version moved since).
+  - **409** `{"error": "request_id_conflict"}`: the id was used for the other
+    action. Echo logs it, drops the decision and points the person to the panel.
+  - **409** `{"error": "version_mismatch", "content_version": "<current>"}`: the
+    content changed. Echo applies nothing; it sends the current version, or, if
+    the post was decided meanwhile, says someone else decided.
+  - **422** `{"error": "not_pending"}`: someone else decided. Echo says so
+    ("başka biri karar vermiş") and adds no note.
+  - Older TryPost: a 409 without `error` is a version mismatch, any 422 is
+    not pending, and a 200 has no `replayed`.
 - Older TryPost without `content_version`: Echo compares its own hash of the
   post (re-read just before acting) and sends no `expected_version`.
 - 5xx, 429 and network errors are temporary (retried); other 4xx are final.
@@ -64,21 +80,26 @@ quote-reply; it never guesses.
 - The project webhook queues its messages in the outbox before answering 200;
   delivery happens after the answer.
 - One decision per person per message: a double tap acts once. A decision is
-  `started` (owned by the inbound message that made it) until TryPost
-  confirms it, then `applied`; a final error removes it. If Echo crashes in
-  between, or TryPost's answer is lost, the same message is retried and
-  reconciles instead of refusing: it re-reads the post and, if still pending,
-  approves/rejects again with the same `expected_version`; if the post is
-  already approved (status scheduled/publishing/published with `approved_by`
-  and an `approved_at` no earlier than the decision, 5 min clock skew allowed)
-  or already sent back (draft/rejected), it counts as done and the person gets
-  the normal answer. `approved_by` is the API token's user, so Echo cannot tell
-  its own approval from one made in the panel after the decision started; in
-  that case the person is told "Onaylandı" for a post that is approved anyway.
-  Another message finding an `applied` decision gets "zaten aldım"; one finding
+  `started` (owned by the inbound message that made it, with its
+  `request_id`) until TryPost confirms it, then `applied`; a final error
+  removes it. If Echo crashes in between, or TryPost's answer is lost, the
+  same message is retried and simply sends the approve/reject again with the
+  same `request_id` and `expected_version`. Only a 200 for that request_id
+  (fresh or `replayed`) counts as the person's decision: then they get
+  "Onaylandı" / "geri gönderildi" and the post gets the "onayladı (WhatsApp)" /
+  "düzeltme istedi" note. A 422 means someone else decided (for example
+  approved in the panel while Echo's call was lost on the way): the person is
+  told so and nothing is claimed in their name. Echo no longer guesses from the
+  post's status or `approved_at`.
+- A resumed decision that cannot be verified is not claimed: when an older
+  TryPost (no request_id support, a 422 without `error`) or a decision started
+  by an Echo version without request ids gets "not pending" on the retry, the
+  person is told "Onayının uygulanıp uygulanmadığını doğrulayamadım; lütfen
+  panelden kontrol et." A first attempt that gets a 200 is applied either way.
+- Another message finding an `applied` decision gets "zaten aldım"; one finding
   a `started` decision whose message is still queued gets "zaten aldım,
   işleniyor"; a `started` decision left by a message that failed or gave up is
-  taken over by the new message.
+  taken over by the new message (with the same `request_id`).
 - Notes are at-least-once: a crash between a successful note POST and marking
   the decision applied (for "Uygun", or the note after a reject) adds the note
   again on the retry. A duplicate note is harmless, a lost one is not. The

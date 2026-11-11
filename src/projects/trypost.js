@@ -70,23 +70,23 @@ const toTime = (value) => {
     return Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(value) ? value : `${value.replace(' ', 'T')}Z`);
 };
 
-// Clock difference tolerated between Echo and TryPost when comparing approved_at to a decision's start.
-const CLOCK_SKEW_MS = 5 * 60_000;
-const APPLIED_STATUSES = { approve: ['scheduled', 'publishing', 'published'], reject: ['draft', 'rejected'] };
+const REQUEST_ID = /^[A-Za-z0-9:._-]{1,100}$/;
+const idPart = (value, length) => String(value ?? '').replace(/[^A-Za-z0-9._]/g, '_').slice(0, length) || 'x';
 
 /**
- * Whether the post shows `verb` as already done, the way an earlier attempt of
- * a decision started at `startedAt` would have left it (approved, but the
- * answer was lost or Echo crashed before recording it). Only asked for a
- * decision Echo already started. approved_by is the API token's user (Echo
- * itself), so it cannot say who tapped; approved_at rules out an approval
- * made before the decision started.
+ * The idempotency key of one approve/reject decision, sent as `request_id` on
+ * every attempt of it. TryPost records it in the transaction that applies the
+ * decision and answers a repeat with 200 `replayed: true`, so a retry after a
+ * lost answer or a crash can tell "we did it" from "someone else did". Made
+ * when the decision starts and stored with it: project, request (outbox id),
+ * person, verb, start time, plus a few random characters in case the same
+ * decision is started again within the same millisecond.
  */
-export function showsApplied(post, verb, startedAt) {
-    if (!post || !APPLIED_STATUSES[verb].includes(post.status)) return false;
-    if (verb === 'reject') return true;
-    const at = toTime(post.approved_at);
-    return Boolean(post.approved_by) && !Number.isNaN(at) && at >= startedAt - CLOCK_SKEW_MS;
+export function requestIdFor({ project, outboxId, person, verb, startedAt }) {
+    const nonce = Math.floor(Math.random() * 0x10000).toString(16).padStart(4, '0');
+    const id = `echo-${idPart(project, 20)}-${idPart(outboxId, 12)}-${idPart(person, 20)}-${verb}-${Number(startedAt).toString(36)}${nonce}`;
+    if (!REQUEST_ID.test(id)) throw new Error(`invalid request_id ${id}`);
+    return id;
 }
 
 export function createTryPostProject(project, { fetchImpl = globalThis.fetch, timeZone = 'Europe/Istanbul' } = {}) {
@@ -276,17 +276,36 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
         return { state: 'resumed', decision };
     }
 
+    const notOurs = (verb) =>
+        verb === 'approve'
+            ? 'Bu gönderi artık onay beklemiyor; başka biri karar vermiş.'
+            : 'Bu gönderi artık onay beklemiyor; başka biri karar vermiş, düzeltme isteğin uygulanmadı.';
+    const unverified = (verb) =>
+        verb === 'approve'
+            ? 'Onayının uygulanıp uygulanmadığını doğrulayamadım; lütfen panelden kontrol et.'
+            : 'Düzeltme isteğinin uygulanıp uygulanmadığını doğrulayamadım; lütfen panelden kontrol et.';
+
     /**
-     * Approves or rejects (verb) for the decision this message owns. A fresh
-     * decision is checked against the current post and then started; a resumed
-     * one is first reconciled with the post: when TryPost already shows it done
-     * (an earlier attempt got through but its answer was lost), it counts as
-     * applied. The call carries the version the person saw; TryPost checks it in
-     * the same transaction and answers 409 when the content changed in between.
+     * Approves or rejects (verb) for the decision this message owns, and returns
+     * true only when TryPost answered 200 to this decision's request_id: then it
+     * marks the decision applied, and only then may the caller add the
+     * "onayladı" / "düzeltme istedi" note. Otherwise it tells the person why,
+     * removes the decision and returns false. Temporary errors (network, 5xx,
+     * 429) are thrown and the started decision is kept for the retry; other
+     * errors are thrown too (the caller removes the decision).
      *
-     * Returns true once TryPost has it, and marks the decision applied. Otherwise
-     * tells the person why, removes the decision and returns false. Other errors
-     * are thrown (the caller keeps a started decision only for a retry).
+     * A fresh decision is checked against the current post and started with a
+     * new request_id. A resumed one (crash, lost answer, outage) is simply sent
+     * again with the same request_id: TryPost replays it (200, `replayed`) when
+     * the earlier attempt went through, and otherwise applies it or refuses it
+     * as usual. Each call carries the version the person saw as
+     * `expected_version`; TryPost checks it in the same transaction (409).
+     *
+     * An older TryPost without request_id support answers a lost earlier
+     * attempt with a plain 422 (no `error` field), and a decision started
+     * before request ids existed has no key TryPost could know: on a resumed
+     * decision these cannot be told apart from someone else's decision, so
+     * Echo says it could not verify it instead of claiming it.
      */
     async function settle(echo, person, row, messageId, verb, action, { state, decision }) {
         const store = echo.store;
@@ -294,41 +313,70 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
             store.undecide(row.id, person.phone, messageId);
             return false;
         };
-        const applied = () => {
-            store.applyDecision(row.id, person.phone);
-            return true;
-        };
-        let post;
+        const say = (text) => echo.reply(person, text, messageId, project.id, row.id);
+        const newRequestId = (startedAt) => requestIdFor({ project: project.id, outboxId: row.id, person: person.id, verb, startedAt });
+        const expected = parseVersion(row.fingerprint).tp;
+        let verifiable = true;
         if (state === 'resumed') {
-            post = await currentPost(row.item_id);
-            if (showsApplied(post, verb, decision.decided_at)) return applied();
-            if (!checkPost(echo, person, row, messageId, post)) return drop();
+            if (!decision.request_id) {
+                // Started by a version without request ids: whatever an earlier attempt did is unknown to TryPost.
+                // A one-off id (not stored, so every retry stays unverifiable) still lets a 200 count.
+                verifiable = false;
+                decision = { ...decision, request_id: newRequestId(store.now()) };
+            }
+            if (!expected) {
+                // No TryPost version to send: Echo's own hash is the only check that the content is unchanged.
+                const post = await currentPost(row.item_id);
+                if (!post) {
+                    say('Bu gönderi silinmiş, işlem yapılmadı.');
+                    return drop();
+                }
+                // A changed post that is still pending must not be decided on. One that is no longer pending
+                // cannot be changed by the call, and TryPost's answer to the request_id tells whose decision it was.
+                if (row.fingerprint && !sameVersion(row.fingerprint, post) && post.status === 'pending_approval') {
+                    refresh(echo, person, row, messageId, post);
+                    return drop();
+                }
+            }
         } else {
-            post = await checkCurrent(echo, person, row, messageId);
+            const post = await checkCurrent(echo, person, row, messageId);
             if (!post) return false;
-            if (!store.startDecision(row.id, person.phone, action, messageId)) {
-                echo.reply(person, 'Bu içerik için cevabını zaten aldım.', messageId, project.id, row.id);
+            if (!store.startDecision(row.id, person.phone, action, messageId, newRequestId)) {
+                say('Bu içerik için cevabını zaten aldım.');
                 return false;
             }
             decision = store.decision(row.id, person.phone);
         }
-        const expected = parseVersion(row.fingerprint).tp;
+
         try {
-            await api('POST', `/posts/${post.id}/${verb}`, expected ? { expected_version: expected } : {});
+            const body = { request_id: decision.request_id, ...(expected ? { expected_version: expected } : {}) };
+            const result = await api('POST', `/posts/${row.item_id}/${verb}`, body);
+            if (result?.replayed === true) echo.log('info', `trypost ${verb} replayed`, decision.request_id);
         } catch (error) {
+            const code = error.body && typeof error.body === 'object' ? error.body.error : undefined;
+            if (error.status === 409 && code === 'request_id_conflict') {
+                echo.log('error', `trypost ${verb} request_id conflict`, decision.request_id);
+                say('Kararın TryPost’a işlenemedi; lütfen paneli kullan.');
+                return drop();
+            }
             if (error.status === 409) {
-                refresh(echo, person, row, messageId, await currentPost(post.id).catch(() => null));
+                // The content changed. If someone also decided on it meanwhile, say that rather than resend it.
+                const now = await currentPost(row.item_id).catch(() => null);
+                // (An older TryPost sends no `error` field and might be refusing our own applied, then edited, attempt.)
+                if (now && row.kind === 'approval' && now.status !== 'pending_approval') {
+                    say(state === 'resumed' && (!verifiable || code !== 'version_mismatch') ? unverified(verb) : notOurs(verb));
+                }
+                else refresh(echo, person, row, messageId, now);
                 return drop();
             }
             if (error.status !== 422) throw error;
-            // No longer pending. On a resumed decision that may be our own earlier attempt.
-            const now = state === 'resumed' ? await currentPost(post.id) : null;
-            if (!showsApplied(now, verb, decision.decided_at)) {
-                echo.reply(person, 'Bu gönderi artık onay beklemiyor; başka biri karar vermiş ya da gönderi değişmiş.', messageId, project.id, row.id);
-                return drop();
-            }
+            // Not pending. TryPost with request ids would have replayed our own earlier attempt, so this is
+            // someone else's decision; without them (no `error` field) a resumed decision cannot be told apart.
+            say(state === 'resumed' && (!verifiable || code !== 'not_pending') ? unverified(verb) : notOurs(verb));
+            return drop();
         }
-        return applied();
+        store.applyDecision(row.id, person.phone);
+        return true;
     }
 
     const explain = (error) => {

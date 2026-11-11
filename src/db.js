@@ -17,7 +17,10 @@ import { DatabaseSync } from 'node:sqlite';
  *              'started' (owned by the inbound message that started it) until
  *              the project confirmed it, then 'applied'. A retry of the same
  *              message after a crash finds its own 'started' decision and
- *              finishes it instead of refusing.
+ *              finishes it instead of refusing. An approve/reject decision
+ *              carries a request_id, created when it starts and sent with
+ *              every attempt, so the project can tell a retry of this
+ *              decision from anyone else's.
  */
 export function openDatabase(dataDir) {
     let file = ':memory:';
@@ -86,6 +89,7 @@ export function openDatabase(dataDir) {
             decided_at INTEGER NOT NULL,
             state      TEXT NOT NULL DEFAULT 'applied',
             wa_message_id TEXT,
+            request_id TEXT,
             PRIMARY KEY (outbox_id, phone)
         );
     `);
@@ -102,6 +106,10 @@ function migrate(db) {
             ALTER TABLE decisions ADD COLUMN state TEXT NOT NULL DEFAULT 'applied';
             ALTER TABLE decisions ADD COLUMN wa_message_id TEXT;
         `);
+    }
+    if (!columns('decisions').includes('request_id')) {
+        // Decisions started before request ids existed keep NULL: a resume cannot verify them.
+        db.exec('ALTER TABLE decisions ADD COLUMN request_id TEXT;');
     }
     if (!columns('outbox').includes('failure_reported')) {
         // Failures from before the upgrade were already reported at the time.
@@ -156,7 +164,7 @@ export function createStore(db, now = () => Date.now()) {
         markReported: q(`UPDATE outbox SET failure_reported = 1 WHERE id = ?`),
         delayReport: q(`UPDATE outbox SET next_attempt_at = ? WHERE id = ?`),
         decision: q(`SELECT * FROM decisions WHERE outbox_id = ? AND phone = ?`),
-        startDecision: q(`INSERT OR IGNORE INTO decisions (outbox_id, phone, action, decided_at, state, wa_message_id) VALUES (?, ?, ?, ?, 'started', ?)`),
+        startDecision: q(`INSERT OR IGNORE INTO decisions (outbox_id, phone, action, decided_at, state, wa_message_id, request_id) VALUES (?, ?, ?, ?, 'started', ?, ?)`),
         applyDecision: q(`UPDATE decisions SET state = 'applied' WHERE outbox_id = ? AND phone = ?`),
         adoptDecision: q(`UPDATE decisions SET wa_message_id = ? WHERE outbox_id = ? AND phone = ? AND state = 'started'`),
         undecide: q(`DELETE FROM decisions WHERE outbox_id = ? AND phone = ? AND state = 'started' AND wa_message_id = ?`),
@@ -232,9 +240,16 @@ export function createStore(db, now = () => Date.now()) {
         markReported: (id) => statements.markReported.run(id),
         delayReport: (id, delayMs) => statements.delayReport.run(now() + delayMs, id),
         decision: (outboxId, phone) => statements.decision.get(outboxId, phone) ?? null,
-        /** Records a decision as started by an inbound message. @returns {boolean} false when the person already has one */
-        startDecision: (outboxId, phone, action, waMessageId) =>
-            statements.startDecision.run(outboxId, phone, action, now(), waMessageId).changes === 1,
+        /**
+         * Records a decision as started by an inbound message. `requestId` may be a
+         * function of the start time (it is stored with the row and reused on every retry).
+         * @returns {boolean} false when the person already has one
+         */
+        startDecision(outboxId, phone, action, waMessageId, requestId = null) {
+            const t = now();
+            const id = typeof requestId === 'function' ? requestId(t) : requestId;
+            return statements.startDecision.run(outboxId, phone, action, t, waMessageId, id).changes === 1;
+        },
         /** The project confirmed it. */
         applyDecision: (outboxId, phone) => statements.applyDecision.run(outboxId, phone),
         /** Hands a started decision left behind by a message that will never finish to another message. */

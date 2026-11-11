@@ -66,9 +66,14 @@ const contentVersion = (post) =>
 
 /**
  * A fake TryPost API with the endpoints Echo uses. Like TryPost, it adds
- * `content_version` to the post resource, refuses (409) an approve/reject
- * whose `expected_version` is not the current one, and records the approver
- * (the API token's user) and time.
+ * `content_version` to the post resource, refuses (409 version_mismatch) an
+ * approve/reject whose `expected_version` is not the current one, answers 422
+ * not_pending for a decided post, and records the approver (the API token's
+ * user) and time. An approve/reject with a `request_id` is recorded with the
+ * action it applied; repeating it answers 200 `replayed: true` (whatever the
+ * post's state now), the same id with another action 409 request_id_conflict.
+ * `setLegacy(true)` makes it an older TryPost: request_id ignored, no `error`
+ * or `replayed` fields.
  *
  * `crashOn(call, { when, mode })` makes the next matching call (e.g.
  * "POST /posts/p1/approve") never answer ("hang": Echo's process died during
@@ -82,6 +87,8 @@ function fakeTryPost(clock) {
     const calls = [];
     const requests = [];
     const hooks = { afterGet: null };
+    const decided = new Map(); // "<post id> <request_id>" -> action
+    let legacy = false;
     let down = false;
     let crash = null;
     const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -108,13 +115,25 @@ function fakeTryPost(clock) {
             return json(201, { data: {} });
         }
         if (match[2] === 'approve' || match[2] === 'reject') {
-            if (body?.expected_version && body.expected_version !== contentVersion(post)) {
-                return json(409, { message: 'content changed', content_version: contentVersion(post) });
+            const action = match[2];
+            const requestId = legacy ? undefined : body?.request_id;
+            const error = (code) => (legacy ? {} : { error: code });
+            if (requestId !== undefined && (typeof requestId !== 'string' || !/^[A-Za-z0-9:._-]{1,100}$/.test(requestId))) {
+                return json(400, { message: 'invalid request_id' });
             }
-            if (post.status !== 'pending_approval') return json(422, { message: 'not pending' });
-            post.status = match[2] === 'approve' ? 'scheduled' : 'draft';
-            if (match[2] === 'approve') Object.assign(post, { approved_by: { id: 'u-echo', name: 'Echo' }, approved_at: stamp() });
-            return json(200, { data: toApi(post) });
+            if (requestId) {
+                const done = decided.get(`${post.id} ${requestId}`);
+                if (done === action) return json(200, { data: toApi(post), replayed: true });
+                if (done) return json(409, { ...error('request_id_conflict'), message: 'request_id used for another action' });
+            }
+            if (body?.expected_version && body.expected_version !== contentVersion(post)) {
+                return json(409, { ...error('version_mismatch'), message: 'content changed', content_version: contentVersion(post) });
+            }
+            if (post.status !== 'pending_approval') return json(422, { ...error('not_pending'), message: 'not pending' });
+            post.status = action === 'approve' ? 'scheduled' : 'draft';
+            if (action === 'approve') Object.assign(post, { approved_by: { id: 'u-echo', name: 'Echo' }, approved_at: stamp() });
+            if (requestId) decided.set(`${post.id} ${requestId}`, action);
+            return json(200, { data: toApi(post), ...(legacy ? {} : { replayed: false }) });
         }
         return json(404, {});
     }
@@ -125,7 +144,15 @@ function fakeTryPost(clock) {
         calls,
         requests,
         hooks,
+        decided,
         setDown: (value) => (down = value),
+        setLegacy: (value) => (legacy = value),
+        /** Someone decides in the panel (the API token's user is Echo's, so approved_by says nothing). */
+        panelDecide(id, action, changes = {}) {
+            const p = posts.get(id);
+            Object.assign(p, changes, { status: action === 'approve' ? 'scheduled' : 'draft' });
+            if (action === 'approve') Object.assign(p, { approved_by: { id: 'u-echo', name: 'Echo' }, approved_at: stamp() });
+        },
         crashOn(call, { when = 'before', mode = 'hang' } = {}) {
             return new Promise((resolve) => (crash = { call, when, mode, resolve }));
         },
@@ -158,11 +185,12 @@ const toApi = (post) => ({
 function setup() {
     const clock = { t: Date.parse('2026-11-11T12:00:00Z') };
     const config = baseConfig();
-    const store = createStore(openDatabase(':memory:'), () => clock.t);
+    const db = openDatabase(':memory:');
+    const store = createStore(db, () => clock.t);
     const whatsapp = fakeWhatsApp();
     const trypost = fakeTryPost(clock);
     const logs = [];
-    const t = { clock, config, store, whatsapp, trypost, logs };
+    const t = { clock, config, db, store, whatsapp, trypost, logs };
     t.echo = boot(t);
 
     let inbound = 1;
@@ -513,7 +541,9 @@ describe('content versions', () => {
         assert.ok(t.store.outboxByWaId(request.id).fingerprint.startsWith(`tp:${contentVersion(post())} echo:`));
         await t.user.tap(PHONES.yasir, buttonsOf(request)[0]);
         const approve = t.trypost.requests.find((r) => r.path.endsWith('/approve'));
-        assert.deepEqual(approve.body, { expected_version: contentVersion(post()) });
+        assert.equal(approve.body.expected_version, contentVersion(post()));
+        assert.match(approve.body.request_id, /^echo-marmara-\d+-yasir-approve-[a-z0-9]+$/);
+        assert.ok(approve.body.request_id.length <= 100);
         assert.equal(t.trypost.posts.get('p1').status, 'scheduled');
     });
 
@@ -695,7 +725,10 @@ describe('crash between a decision and TryPost', () => {
         restart(t);
         await later(t, 6 * 60_000);
 
-        assert.equal(t.trypost.calls.filter((call) => call.endsWith('/approve')).length, 1);
+        // Sent again with the same request_id, and TryPost replays it.
+        const attempts = t.trypost.requests.filter((r) => r.path.endsWith('/approve'));
+        assert.equal(attempts.length, 2);
+        assert.equal(attempts[1].body.request_id, attempts[0].body.request_id);
         assert.equal(textsTo(t, PHONES.yasir, /Onaylandı/).length, 1);
         assert.equal(textsTo(t, PHONES.yasir, /zaten aldım|artık onay beklemiyor/).length, 0);
         assert.equal(approvals().length, 1);
@@ -714,7 +747,8 @@ describe('crash between a decision and TryPost', () => {
         assert.equal(t.store.inbox('tap-1').status, 'done');
         assert.match(t.whatsapp.last(PHONES.yasir).text.body, /Onaylandı/);
         assert.equal(textsTo(t, PHONES.yasir, /artık onay beklemiyor/).length, 0);
-        assert.equal(t.trypost.calls.filter((call) => call.endsWith('/approve')).length, 1);
+        assert.equal(t.trypost.calls.filter((call) => call.endsWith('/approve')).length, 2); // the second one replayed
+        assert.equal(approvals().length, 1);
     });
 
     it('lets a new tap finish a decision whose message gave up after its approval got through', async () => {
@@ -780,6 +814,201 @@ describe('crash between a decision and TryPost', () => {
     });
 });
 
+describe('request ids: a retried decision is only claimed when TryPost says it was ours', () => {
+    let t;
+    let request;
+    beforeEach(async () => {
+        t = setup();
+        t.trypost.posts.set('p1', post());
+        await t.user.hello(PHONES.yasir);
+        await t.echo.handleProjectEvent('marmara', approvalEvent(post()));
+        request = t.whatsapp.last(PHONES.yasir);
+    });
+    const notesWith = (text) => t.trypost.notes.filter((note) => note.body.includes(text));
+    const decisionRow = () => t.store.decision(t.store.outboxByWaId(request.id).id, PHONES.yasir);
+    const sent = (verb) => t.trypost.requests.filter((r) => r.path.endsWith(`/${verb}`));
+
+    for (const versioned of [false, true]) {
+        it(`does not claim an approval made in the panel after its own call was lost before reaching TryPost${versioned ? ' (content_version)' : ''}`, async () => {
+            if (versioned) {
+                const event = approvalEvent(post(), 'evt-v');
+                event.data.content_version = contentVersion(post());
+                await t.echo.handleProjectEvent('marmara', event);
+                request = t.whatsapp.last(PHONES.yasir);
+            }
+            t.trypost.crashOn('POST /posts/p1/approve', { when: 'before', mode: 'network' });
+            await t.user.tap(PHONES.yasir, buttonsOf(request)[0], 'tap-1');
+            assert.equal(t.store.inbox('tap-1').status, 'pending');
+            // Another admin edits the post and approves it in the panel.
+            t.trypost.panelDecide('p1', 'approve', { content: 'Panelde düzenlendi' });
+            const requestsBefore = t.whatsapp.to(PHONES.yasir).filter((m) => m.type === 'interactive').length;
+            await later(t, 31_000);
+
+            assert.equal(t.store.inbox('tap-1').status, 'done');
+            assert.equal(textsTo(t, PHONES.yasir, /Onaylandı/).length, 0);
+            assert.equal(textsTo(t, PHONES.yasir, /artık onay beklemiyor; başka biri karar vermiş/).length, 1);
+            assert.equal(notesWith('Yasir onayladı').length, 0);
+            assert.equal(decisionRow(), null);
+            // No new approval request for a post that is no longer pending.
+            assert.equal(t.whatsapp.to(PHONES.yasir).filter((m) => m.type === 'interactive').length, requestsBefore);
+        });
+    }
+
+    it('does not claim an approval made in the panel (without an edit) after its own call was lost', async () => {
+        t.trypost.crashOn('POST /posts/p1/approve', { when: 'before', mode: 'network' });
+        await t.user.tap(PHONES.yasir, buttonsOf(request)[0], 'tap-1');
+        t.trypost.panelDecide('p1', 'approve');
+        await later(t, 31_000);
+
+        assert.equal(textsTo(t, PHONES.yasir, /Onaylandı/).length, 0);
+        assert.equal(textsTo(t, PHONES.yasir, /başka biri karar vermiş/).length, 1);
+        assert.equal(notesWith('Yasir onayladı').length, 0);
+        assert.equal(decisionRow(), null);
+    });
+
+    it('claims its own approval when TryPost applied it and the answer was lost (replayed)', async () => {
+        t.trypost.crashOn('POST /posts/p1/approve', { when: 'after', mode: 'network' });
+        await t.user.tap(PHONES.yasir, buttonsOf(request)[0], 'tap-1');
+        const id = decisionRow().request_id;
+        assert.equal(t.trypost.decided.get(`p1 ${id}`), 'approve');
+        await later(t, 31_000);
+
+        assert.deepEqual(sent('approve').map((r) => r.body.request_id), [id, id]);
+        assert.equal(textsTo(t, PHONES.yasir, /Onaylandı/).length, 1);
+        assert.equal(notesWith('Yasir onayladı').length, 1);
+        assert.equal(decisionRow().state, 'applied');
+        await later(t, 3 * 60 * 60_000);
+        assert.equal(textsTo(t, PHONES.yasir, /Onaylandı/).length, 1);
+        assert.equal(notesWith('Yasir onayladı').length, 1);
+    });
+
+    it('applies a decision whose process died after recording it and before calling TryPost', async () => {
+        const crashed = t.trypost.crashOn('POST /posts/p1/approve', { when: 'before' });
+        t.user.tap(PHONES.yasir, buttonsOf(request)[0], 'tap-1');
+        await crashed;
+        const id = decisionRow().request_id;
+        restart(t);
+        await later(t, 6 * 60_000);
+
+        assert.equal(t.trypost.posts.get('p1').status, 'scheduled');
+        assert.equal(t.trypost.decided.get(`p1 ${id}`), 'approve');
+        assert.equal(textsTo(t, PHONES.yasir, /Onaylandı/).length, 1);
+        assert.equal(notesWith('Yasir onayladı').length, 1);
+    });
+
+    it('does not claim a rejection when someone else decided after its own call was lost', async () => {
+        await t.user.tap(PHONES.yasir, buttonsOf(request)[1]); // Düzeltme iste
+        t.trypost.crashOn('POST /posts/p1/reject', { when: 'before', mode: 'network' });
+        await t.user.say(PHONES.yasir, 'Saat 19:00 olacak', null, 'note-1');
+        t.trypost.panelDecide('p1', 'reject', { content: 'Panelde düzenlendi' });
+        await later(t, 31_000);
+
+        assert.equal(t.store.inbox('note-1').status, 'done');
+        assert.equal(textsTo(t, PHONES.yasir, /geri gönderildi/).length, 0);
+        assert.equal(textsTo(t, PHONES.yasir, /başka biri karar vermiş/).length, 1);
+        assert.equal(notesWith('düzeltme istedi').length, 0);
+        assert.equal(decisionRow(), null);
+    });
+
+    it('claims its own rejection when TryPost applied it and the answer was lost (replayed)', async () => {
+        await t.user.tap(PHONES.yasir, buttonsOf(request)[1]);
+        t.trypost.crashOn('POST /posts/p1/reject', { when: 'after', mode: 'network' });
+        await t.user.say(PHONES.yasir, 'Saat 19:00 olacak', null, 'note-1');
+        await later(t, 31_000);
+
+        const [first, second] = sent('reject');
+        assert.equal(second.body.request_id, first.body.request_id);
+        assert.match(first.body.request_id, /-yasir-reject-/);
+        assert.equal(t.trypost.posts.get('p1').status, 'draft');
+        assert.equal(notesWith('düzeltme istedi').length, 1);
+        assert.equal(textsTo(t, PHONES.yasir, /geri gönderildi/).length, 1);
+    });
+
+    it('rejects after a crash right after the decision was recorded', async () => {
+        await t.user.tap(PHONES.yasir, buttonsOf(request)[1]);
+        const crashed = t.trypost.crashOn('POST /posts/p1/reject', { when: 'before' });
+        t.user.say(PHONES.yasir, 'Saat 19:00 olacak', null, 'note-1');
+        await crashed;
+        restart(t);
+        await later(t, 6 * 60_000);
+
+        assert.equal(t.trypost.posts.get('p1').status, 'draft');
+        assert.equal(notesWith('düzeltme istedi').length, 1);
+        assert.equal(textsTo(t, PHONES.yasir, /geri gönderildi/).length, 1);
+    });
+
+    it('drops a decision whose request_id TryPost recorded for another action, and points to the panel', async () => {
+        const crashed = t.trypost.crashOn('POST /posts/p1/approve', { when: 'before' });
+        t.user.tap(PHONES.yasir, buttonsOf(request)[0], 'tap-1');
+        await crashed;
+        t.trypost.decided.set(`p1 ${decisionRow().request_id}`, 'reject');
+        restart(t);
+        await later(t, 6 * 60_000);
+
+        assert.equal(t.trypost.posts.get('p1').status, 'pending_approval');
+        assert.equal(textsTo(t, PHONES.yasir, /Onaylandı/).length, 0);
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /paneli kullan/);
+        assert.ok(t.logs.some((entry) => entry[0] === 'error' && /request_id conflict/.test(entry[1])));
+        assert.equal(decisionRow(), null);
+    });
+
+    it('does not claim a decision started before request ids existed (after an upgrade)', async () => {
+        const crashed = t.trypost.crashOn('POST /posts/p1/approve', { when: 'after' }); // applied, then the old process died
+        t.user.tap(PHONES.yasir, buttonsOf(request)[0], 'tap-1');
+        await crashed;
+        t.db.exec('UPDATE decisions SET request_id = NULL'); // as an older Echo left it
+        restart(t);
+        await later(t, 6 * 60_000);
+
+        assert.equal(decisionRow(), null);
+        assert.equal(textsTo(t, PHONES.yasir, /Onaylandı/).length, 0);
+        assert.equal(textsTo(t, PHONES.yasir, /doğrulayamadım/).length, 1);
+        assert.equal(notesWith('Yasir onayladı').length, 0);
+    });
+
+    describe('older TryPost without request_id support', () => {
+        beforeEach(() => t.trypost.setLegacy(true));
+
+        it('approves a fresh tap as before', async () => {
+            await t.user.tap(PHONES.yasir, buttonsOf(request)[0]);
+            assert.equal(t.trypost.posts.get('p1').status, 'scheduled');
+            assert.equal(textsTo(t, PHONES.yasir, /Onaylandı/).length, 1);
+        });
+
+        it('says it could not verify a resumed approval TryPost no longer accepts', async () => {
+            t.trypost.crashOn('POST /posts/p1/approve', { when: 'after', mode: 'network' });
+            await t.user.tap(PHONES.yasir, buttonsOf(request)[0], 'tap-1');
+            await later(t, 31_000);
+
+            assert.equal(t.store.inbox('tap-1').status, 'done');
+            assert.equal(textsTo(t, PHONES.yasir, /Onaylandı/).length, 0);
+            assert.equal(textsTo(t, PHONES.yasir, /Onayının uygulanıp uygulanmadığını doğrulayamadım; lütfen panelden kontrol et/).length, 1);
+            assert.equal(notesWith('Yasir onayladı').length, 0);
+            assert.equal(decisionRow(), null);
+        });
+
+        it('says it could not verify a resumed rejection TryPost no longer accepts', async () => {
+            await t.user.tap(PHONES.yasir, buttonsOf(request)[1]);
+            t.trypost.crashOn('POST /posts/p1/reject', { when: 'after', mode: 'network' });
+            await t.user.say(PHONES.yasir, 'Saat 19:00 olacak', null, 'note-1');
+            await later(t, 31_000);
+
+            assert.equal(textsTo(t, PHONES.yasir, /doğrulayamadım/).length, 1);
+            assert.equal(textsTo(t, PHONES.yasir, /geri gönderildi/).length, 0);
+            assert.equal(notesWith('düzeltme istedi').length, 0);
+        });
+
+        it('still applies a resumed approval whose call never reached TryPost', async () => {
+            t.trypost.crashOn('POST /posts/p1/approve', { when: 'before', mode: 'network' });
+            await t.user.tap(PHONES.yasir, buttonsOf(request)[0], 'tap-1');
+            await later(t, 31_000);
+            assert.equal(t.trypost.posts.get('p1').status, 'scheduled');
+            assert.equal(textsTo(t, PHONES.yasir, /Onaylandı/).length, 1);
+            assert.equal(notesWith('Yasir onayladı').length, 1);
+        });
+    });
+});
+
 describe('decisions table migration', () => {
     it('adds the new columns to an existing database and counts old decisions as applied', () => {
         const dir = mkdtempSync(join(tmpdir(), 'echo-'));
@@ -799,7 +1028,7 @@ describe('decisions table migration', () => {
 
             const db = openDatabase(dir);
             const store = createStore(db);
-            assert.deepEqual({ ...store.decision(7, '905550000001') }, { outbox_id: 7, phone: '905550000001', action: 'approve', decided_at: 1, state: 'applied', wa_message_id: null });
+            assert.deepEqual({ ...store.decision(7, '905550000001') }, { outbox_id: 7, phone: '905550000001', action: 'approve', decided_at: 1, state: 'applied', wa_message_id: null, request_id: null });
             assert.equal(store.unreportedFailures().length, 0); // already reported by the old version
             db.close();
             openDatabase(dir).close(); // a second open finds the columns and changes nothing
