@@ -14,11 +14,20 @@ const MAX_ATTEMPTS = BACKOFF_MS.length + 1;
  *   handleAction(ctx)             -> Promise<void>   (a button was tapped)
  *   handleText(ctx)               -> Promise<void>   (a typed note for a session or a reply)
  *   onDeliveryFailed(ctx)         -> Promise<void>   (a request could not be delivered)
+ *   texts?: { retrying, gaveUp }                     (what to tell people while the project is down)
+ *
+ * handleAction / handleText throw when they could not finish. An error with
+ * `retryable = true` (the project is down, 5xx, 429) keeps the inbound message
+ * queued and it is processed again later; any other error ends it, and the
+ * person is told `error.userMessage`. They must reply to the person only after
+ * the work succeeded, and may record steps already done in `ctx.progress`
+ * (kept across retries) so a retry does not repeat them.
  */
 export function createEcho({ config, store, whatsapp, log = () => {} }) {
     const adapters = new Map();
     const people = new Map(config.people.map((person) => [person.phone, person]));
     let ticking = null;
+    let again = false;
 
     const echo = {
         config,
@@ -49,15 +58,28 @@ export function createEcho({ config, store, whatsapp, log = () => {} }) {
             });
         },
 
-        /** A plain reply to someone who just wrote to us (their window is open). */
-        reply(person, text, replyTo = null, project = '_echo') {
-            return store.enqueue({ project, kind: 'reply', recipient: person.phone, message: { text, replyTo } });
+        /**
+         * A plain reply to someone who just wrote to us (their window is open).
+         * `about` is the outbox id of the request the reply concerns: quote-replying
+         * to this reply then counts as replying to that request.
+         */
+        reply(person, text, replyTo = null, project = '_echo', about = null) {
+            return store.enqueue({ project, kind: 'reply', recipient: person.phone, message: { text, replyTo, ...(about ? { about } : {}) } });
         },
 
         async tick() {
-            // One delivery pass at a time; callers may ask for one after any change.
-            if (ticking) return ticking;
-            ticking = deliverDue().finally(() => {
+            // One pass at a time; a call during a pass asks for another one after it.
+            if (ticking) {
+                again = true;
+                return ticking;
+            }
+            ticking = (async () => {
+                do {
+                    again = false;
+                    await processInbox();
+                    await deliverDue();
+                } while (again);
+            })().finally(() => {
                 ticking = null;
             });
             return ticking;
@@ -70,14 +92,93 @@ export function createEcho({ config, store, whatsapp, log = () => {} }) {
             await echo.tick();
         },
 
+        /** Statuses are applied at once; messages are only stored, the worker processes them. */
         async handleWebhook({ messages, statuses }) {
             for (const status of statuses) await onStatus(status);
             for (const message of messages) {
-                await onMessage(message).catch((error) => log('error', 'inbound message failed', error.message));
+                const person = people.get(normalizePhone(message.from));
+                if (!person) {
+                    log('warn', 'message from an unknown number ignored');
+                    continue;
+                }
+                // A retried Meta webhook finds the id already stored and adds nothing.
+                if (store.receive(message, person.phone)) store.touchWindow(person.phone);
             }
             await echo.tick();
         },
     };
+
+    async function processInbox() {
+        store.recoverInbox(5 * 60_000);
+        // Each person's messages in order: a message waiting for a retry holds back that person's later ones.
+        for (let count = 0; count < 500; count++) {
+            const item = store.inboxNext();
+            if (!item || !store.claimInbox(item.wa_message_id)) return;
+            await processInbound(store.inbox(item.wa_message_id));
+        }
+    }
+
+    async function processInbound(item) {
+        const message = item.message;
+        const person = people.get(item.phone);
+        const progress = item.route?.progress ?? {};
+        const saveProgress = () => store.setRoute(message.id, { ...(store.inbox(message.id).route ?? {}), progress });
+        try {
+            if (!person) throw new Error('unknown person');
+            const route = await onMessage(message, person, item, progress);
+            finishRoute(person, route);
+            store.inboxDone(message.id);
+        } catch (error) {
+            const route = store.inbox(message.id).route;
+            const attempts = item.attempts;
+            const adapter = route?.project ? adapters.get(route.project) : null;
+            const texts = adapter?.texts ?? {};
+            const about = route?.outboxId ?? null;
+            const project = route?.project ?? '_echo';
+            if (error.retryable && attempts < MAX_ATTEMPTS) {
+                saveProgress();
+                store.inboxRetry(message.id, BACKOFF_MS[attempts - 1], error.message);
+                log('warn', 'inbound retrying', message.id, error.message);
+                if (person && store.inboxNotified(message.id)) {
+                    echo.reply(person, texts.retrying ?? 'Şu an işleyemiyorum, cevabını kaydettim; bağlantı gelince işleyeceğim.', message.id, project, about);
+                }
+                return;
+            }
+            store.inboxFail(message.id, error.message);
+            finishRoute(person, route);
+            log('error', 'inbound failed', message.id, error.message);
+            if (!person) return;
+            const text = error.retryable
+                ? (texts.gaveUp ?? 'Uzun süre bağlantı kuramadım; cevabın uygulanamadı. Lütfen paneli kullan.')
+                : (error.userMessage ?? 'Cevabın uygulanamadı; lütfen paneli kullan.');
+            echo.reply(person, text, message.id, project, about);
+        }
+    }
+
+    /** A note typed for an open session ends that session once it is finished, either way. */
+    function finishRoute(person, route) {
+        if (!person || !route?.usedSession) return;
+        const session = store.session(person.phone);
+        if (session && session.outbox_id === route.outboxId && session.mode === route.mode) store.clearSession(person.phone);
+    }
+
+    /** The request a typed message is about: the quoted message wins over an open session. */
+    function resolveText(person, message) {
+        const session = store.session(person.phone);
+        let quoted = message.contextId ? store.outboxByWaId(message.contextId) : null;
+        // Quoting one of our replies ("Yorumunu yaz…") means quoting the request it was about.
+        if (quoted?.kind === 'reply' && quoted.message.about) quoted = store.outbox(quoted.message.about);
+        if (quoted && quoted.recipient === person.phone && quoted.kind !== 'reply' && quoted.item_id && adapters.has(quoted.project)) {
+            if (session?.outbox_id === quoted.id) return { outboxId: quoted.id, project: quoted.project, mode: session.mode, usedSession: true };
+            // An open session for another request stays: its prompt named that request, and the person may still write it.
+            return { outboxId: quoted.id, project: quoted.project, mode: 'comment', usedSession: false };
+        }
+        if (session) {
+            const row = store.outbox(session.outbox_id);
+            if (row && adapters.has(row.project)) return { outboxId: row.id, project: row.project, mode: session.mode, usedSession: true };
+        }
+        return null;
+    }
 
     async function deliverDue() {
         store.recoverStuck(5 * 60_000);
@@ -150,63 +251,51 @@ export function createEcho({ config, store, whatsapp, log = () => {} }) {
         if (order.indexOf(status.status) > order.indexOf(row.status)) store.setStatusByWaId(status.id, status.status);
     }
 
-    async function onMessage(message) {
-        if (!store.markInbound(message.id)) return; // WhatsApp retried a webhook we already handled
-        const person = people.get(normalizePhone(message.from));
-        if (!person) {
-            log('warn', 'message from an unknown number ignored');
-            return;
-        }
-        store.touchWindow(person.phone);
-
+    /** Handles one stored inbound message; returns its route (for finishing a session). Throws to retry or fail. */
+    async function onMessage(message, person, item, progress) {
         if (message.buttonId) {
             const [action, idText] = String(message.buttonId).split(':');
             const row = store.outbox(Number(idText));
             // A button only counts for the person it was sent to.
             if (!row || row.recipient !== person.phone) {
                 echo.reply(person, 'Bu buton artık geçerli değil.', message.id);
-                return;
+                return null;
             }
             const adapter = adapters.get(row.project);
-            if (!adapter) return;
-            await adapter.handleAction({ echo, person, row, action, messageId: message.id });
-            return;
+            const route = { outboxId: row.id, project: row.project, usedSession: false };
+            if (!adapter) return route;
+            store.setRoute(message.id, { ...route, progress });
+            await adapter.handleAction({ echo, person, row, action, messageId: message.id, progress });
+            return route;
         }
 
         if (message.type === 'text' && message.text) {
-            const session = store.session(person.phone);
-            if (session) {
-                store.clearSession(person.phone);
-                const row = store.outbox(session.outbox_id);
-                const adapter = row && adapters.get(row.project);
-                if (adapter) {
-                    if (/^\s*(iptal|vazgeç|vazgec)\s*$/i.test(message.text)) {
-                        echo.reply(person, 'Tamam, vazgeçildi.', message.id);
-                        store.undecide(row.id, person.phone);
-                        return;
-                    }
-                    await adapter.handleText({ echo, person, row, mode: session.mode, text: message.text, messageId: message.id });
-                    return;
+            // Resolved once and kept: a retry hours later goes to the same request even if the session expired.
+            const route = item.route?.outboxId ? item.route : resolveText(person, message);
+            const row = route && store.outbox(route.outboxId);
+            const adapter = row && adapters.get(row.project);
+            if (adapter) {
+                if (!item.route) store.setRoute(message.id, { ...route, progress });
+                if (/^\s*(iptal|vazgeç|vazgec)\s*$/i.test(message.text)) {
+                    if (route.usedSession) store.undecide(row.id, person.phone);
+                    echo.reply(person, 'Tamam, vazgeçildi.', message.id, row.project, row.id);
+                    return route;
                 }
+                await adapter.handleText({ echo, person, row, mode: route.mode, text: message.text, messageId: message.id, progress });
+                return route;
             }
 
-            const repliedTo = message.contextId ? store.outboxByWaId(message.contextId) : null;
-            if (repliedTo && repliedTo.recipient === person.phone && adapters.get(repliedTo.project)) {
-                await adapters
-                    .get(repliedTo.project)
-                    .handleText({ echo, person, row: repliedTo, mode: 'comment', text: message.text, messageId: message.id });
-                return;
-            }
-
+            // No quoted request and no open session: ask, never guess which content this is about.
             echo.reply(
                 person,
                 'Merhaba! Görüşünü ya da onayını bekleyen içerikler buraya gelecek. Bir içerik hakkında yazmak için o mesajı yanıtla.',
                 message.id,
             );
-            return;
+            return null;
         }
 
         echo.reply(person, 'Şimdilik yazılı mesajları ve butonları anlayabiliyorum.', message.id);
+        return null;
     }
 
     return echo;

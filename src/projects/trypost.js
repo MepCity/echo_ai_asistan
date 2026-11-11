@@ -33,6 +33,37 @@ export function fingerprint(post) {
         .slice(0, 16);
 }
 
+/**
+ * The version Echo showed a person, stored as the outbox fingerprint. TryPost's
+ * own `content_version` ("tp:") is preferred and is sent back as
+ * `expected_version`, so TryPost refuses (409) an approval of changed content
+ * inside its own transaction. Echo's hash ("echo:") is kept beside it for older
+ * TryPost versions that do not send one. A bare hash is an Echo hash stored
+ * before versions existed.
+ */
+export function versionTag(post) {
+    const echo = `echo:${fingerprint(post)}`;
+    return post.content_version ? `tp:${post.content_version} ${echo}` : echo;
+}
+
+export function parseVersion(stored) {
+    const parts = { tp: null, echo: null };
+    for (const part of String(stored ?? '').split(' ').filter(Boolean)) {
+        if (part.startsWith('tp:')) parts.tp = part.slice(3);
+        else if (part.startsWith('echo:')) parts.echo = part.slice(5);
+        else parts.echo = part;
+    }
+    return parts;
+}
+
+/** Compares like with like: TryPost's version when both sides have one, otherwise Echo's hash. */
+export function sameVersion(stored, post) {
+    const { tp, echo } = parseVersion(stored);
+    if (tp && post.content_version) return tp === String(post.content_version);
+    if (echo) return echo === fingerprint(post);
+    return !tp; // only a TryPost version was stored and TryPost no longer sends one: cannot tell, treat as changed
+}
+
 export function createTryPostProject(project, { fetchImpl = globalThis.fetch, timeZone = 'Europe/Istanbul' } = {}) {
     const members = project.members;
     const memberByUserId = (id) => members.find((member) => member.userId && member.userId === id) ?? null;
@@ -40,15 +71,21 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
     const can = (member, role) => Boolean(member?.roles.includes(role));
 
     async function api(method, path, body) {
-        const response = await fetchImpl(`${project.apiUrl.replace(/\/$/, '')}${path}`, {
-            method,
-            headers: {
-                Authorization: `Bearer ${project.apiToken}`,
-                Accept: 'application/json',
-                'Content-Type': 'application/json',
-            },
-            body: body === undefined ? undefined : JSON.stringify(body),
-        });
+        let response;
+        try {
+            response = await fetchImpl(`${project.apiUrl.replace(/\/$/, '')}${path}`, {
+                method,
+                headers: {
+                    Authorization: `Bearer ${project.apiToken}`,
+                    Accept: 'application/json',
+                    'Content-Type': 'application/json',
+                },
+                body: body === undefined ? undefined : JSON.stringify(body),
+            });
+        } catch (cause) {
+            // Network errors (DNS, refused, timeout): TryPost is unreachable, try again later.
+            throw Object.assign(new Error(`TryPost ${method} ${path} -> ${cause.message}`), { status: null, retryable: true });
+        }
         const text = await response.text();
         let json = null;
         try {
@@ -60,6 +97,7 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
             const error = new Error(`TryPost ${method} ${path} -> ${response.status}`);
             error.status = response.status;
             error.body = json ?? text;
+            error.retryable = response.status >= 500 || response.status === 429;
             throw error;
         }
         return json;
@@ -143,7 +181,7 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
             person: member.person,
             message: { ...message, requesterName, note },
             template,
-            fingerprint: fingerprint(post),
+            fingerprint: versionTag(post),
             dedupeKey,
         });
     }
@@ -159,37 +197,65 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
         });
     }
 
+    /** Tells the person the content changed since they saw it and sends the current version. */
+    function refresh(echo, person, row, messageId, post) {
+        echo.reply(person, 'Bu içerik sen baktıktan sonra değişti, eski mesaja verilen cevabı uygulamadım. Güncel hâlini gönderiyorum.', messageId, project.id, row.id);
+        const member = memberByPhone(person.phone);
+        if (!member || !post) return;
+        queueRequest(echo, row.kind, post, member, {
+            requesterName: row.message.requesterName ?? 'Bir ekip üyesi',
+            note: row.message.note,
+            dedupeKey: `${project.id}:refresh:${row.id}:${versionTag(post)}:${person.id}`,
+        });
+    }
+
     /** Re-reads the post. Returns it when the reply still applies, otherwise answers and returns null. */
     async function checkCurrent(echo, person, row, messageId, { decision = true } = {}) {
         const post = await currentPost(row.item_id);
         if (!post) {
-            echo.reply(person, 'Bu gönderi silinmiş, işlem yapılmadı.', messageId, project.id);
+            echo.reply(person, 'Bu gönderi silinmiş, işlem yapılmadı.', messageId, project.id, row.id);
             return null;
         }
-        if (row.fingerprint && fingerprint(post) !== row.fingerprint) {
-            echo.reply(person, 'Bu içerik sen baktıktan sonra değişti, eski mesaja verilen cevabı uygulamadım. Güncel hâlini gönderiyorum.', messageId, project.id);
-            const member = memberByPhone(person.phone);
-            if (member) {
-                queueRequest(echo, row.kind, post, member, {
-                    requesterName: row.message.requesterName ?? 'Bir ekip üyesi',
-                    note: row.message.note,
-                    dedupeKey: `${project.id}:refresh:${row.id}:${fingerprint(post)}:${person.id}`,
-                });
-            }
+        if (row.fingerprint && !sameVersion(row.fingerprint, post)) {
+            refresh(echo, person, row, messageId, post);
             return null;
         }
         if (decision && row.kind === 'approval' && post.status !== 'pending_approval') {
-            echo.reply(person, 'Bu gönderi artık onay beklemiyor; başka biri karar vermiş ya da gönderi değişmiş.', messageId, project.id);
+            echo.reply(person, 'Bu gönderi artık onay beklemiyor; başka biri karar vermiş ya da gönderi değişmiş.', messageId, project.id, row.id);
             return null;
         }
         return post;
+    }
+
+    /**
+     * Approve / reject with the version the person saw. TryPost checks it in the
+     * same transaction and answers 409 when the content changed in between.
+     * Returns false (after telling the person and sending the new version) on 409.
+     */
+    async function decideOnPost(echo, person, row, messageId, post, verb) {
+        const expected = parseVersion(row.fingerprint).tp;
+        try {
+            await api('POST', `/posts/${post.id}/${verb}`, expected ? { expected_version: expected } : {});
+            return true;
+        } catch (error) {
+            if (error.status !== 409) throw error;
+            refresh(echo, person, row, messageId, await currentPost(post.id).catch(() => null));
+            return false;
+        }
     }
 
     const explain = (error) => {
         if (error.status === 403) return 'Bu işlem için TryPost yetkim yok, yöneticiye haber ver.';
         if (error.status === 404) return 'Gönderi bulunamadı, silinmiş olabilir.';
         if (error.status === 422) return 'TryPost bu işlemi kabul etmedi; gönderi artık bu durumda olmayabilir.';
-        return 'Bir sorun oldu; birazdan tekrar dene ya da paneli kullan.';
+        return 'Cevabın TryPost’a işlenemedi; lütfen paneli kullan.';
+    };
+
+    /** Hands an error to Echo: retryable ones are tried again later, others are explained to the person. */
+    const giveUp = (error) => {
+        error.retryable = Boolean(error.retryable);
+        error.userMessage = explain(error);
+        return error;
     };
 
     return {
@@ -244,17 +310,18 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
             const member = memberByPhone(person.phone);
             if (!member) return;
             const isApproval = row.kind === 'approval';
+            const reply = (text) => echo.reply(person, text, messageId, project.id, row.id);
 
             if (isApproval && (action === 'approve' || action === 'revise') && !can(member, 'approver')) {
-                echo.reply(person, 'Onay verme yetkin yok; yorum yazabilirsin.', messageId, project.id);
+                reply('Onay verme yetkin yok; yorum yazabilirsin.');
                 return;
             }
             if (!isApproval && !can(member, 'reviewer') && !can(member, 'approver')) {
-                echo.reply(person, 'Bu projede görüş verme yetkin yok.', messageId, project.id);
+                reply('Bu projede görüş verme yetkin yok.');
                 return;
             }
             if (!['approve', 'ok', 'revise', 'comment'].includes(action) || (isApproval && action === 'ok') || (!isApproval && action === 'approve')) {
-                echo.reply(person, 'Bu buton artık geçerli değil.', messageId, project.id);
+                reply('Bu buton artık geçerli değil.');
                 return;
             }
 
@@ -262,82 +329,99 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
             try {
                 post = await checkCurrent(echo, person, row, messageId, { decision: action !== 'comment' });
             } catch (error) {
-                echo.reply(person, explain(error), messageId, project.id);
-                return;
+                throw giveUp(error);
             }
             if (!post) return;
 
             if (action === 'approve' || action === 'ok') {
                 // A double tap (or a retried webhook) acts once.
                 if (!echo.store.decide(row.id, person.phone, action)) {
-                    echo.reply(person, 'Bu içerik için cevabını zaten aldım.', messageId, project.id);
+                    reply('Bu içerik için cevabını zaten aldım.');
                     return;
                 }
                 try {
                     if (action === 'approve') {
-                        await api('POST', `/posts/${post.id}/approve`, {});
+                        if (!(await decideOnPost(echo, person, row, messageId, post, 'approve'))) {
+                            echo.store.undecide(row.id, person.phone);
+                            return;
+                        }
                         await addNote(post.id, `✅ ${person.name} onayladı (WhatsApp).`).catch(() => {});
-                        echo.reply(person, '✅ Onaylandı. Gönderi planlanan zamanda yayınlanacak.', messageId, project.id);
+                        reply('✅ Onaylandı. Gönderi planlanan zamanda yayınlanacak.');
                     } else {
                         await addNote(post.id, `👍 ${person.name}: Uygun (WhatsApp).`);
-                        echo.reply(person, '👍 Teşekkürler, görüşün eklendi.', messageId, project.id);
+                        reply('👍 Teşekkürler, görüşün eklendi.');
                     }
                 } catch (error) {
                     echo.store.undecide(row.id, person.phone);
                     echo.log('error', 'trypost action failed', error.message);
-                    echo.reply(person, explain(error), messageId, project.id);
+                    throw giveUp(error);
                 }
                 return;
             }
 
+            // A new tap replaces any open session; the prompt names the content, so the person sees where the next message goes.
             echo.store.setSession(person.phone, row.id, action);
-            echo.reply(
-                person,
+            const about = `şu içerik için: "${excerpt(post.content, 60)}" (${channel(post)})`;
+            reply(
                 action === 'revise'
                     ? isApproval
-                        ? 'Ne düzeltilsin? Yazdığın not gönderiye eklenecek ve gönderi hazırlayana geri dönecek. Vazgeçmek için "iptal" yaz.'
-                        : 'Neyin revize edilmesini istiyorsun? Yazdığın not içeriğe eklenecek. Vazgeçmek için "iptal" yaz.'
-                    : 'Yorumunu yaz, içeriğin notlarına eklenecek. Vazgeçmek için "iptal" yaz.',
-                messageId,
-                project.id,
+                        ? `Ne düzeltilsin, ${about}? Yazdığın not gönderiye eklenecek ve gönderi hazırlayana geri dönecek. Vazgeçmek için "iptal" yaz.`
+                        : `Neyin revize edilmesini istiyorsun, ${about}? Yazdığın not içeriğe eklenecek. Vazgeçmek için "iptal" yaz.`
+                    : `Yorumunu yaz, ${about}. İçeriğin notlarına eklenecek. Vazgeçmek için "iptal" yaz.`,
             );
         },
 
-        async handleText({ echo, person, row, mode, text, messageId }) {
+        async handleText({ echo, person, row, mode, text, messageId, progress = {} }) {
             const member = memberByPhone(person.phone);
             if (!member) return;
-            let post;
+            const reply = (body) => echo.reply(person, body, messageId, project.id, row.id);
             try {
-                post = await checkCurrent(echo, person, row, messageId, { decision: mode === 'revise' });
+                if (mode === 'revise' && row.kind === 'approval' && progress.rejected) {
+                    // Rejected on an earlier attempt; only the note is left.
+                    await addNote(row.item_id, `✏️ ${person.name} düzeltme istedi (WhatsApp): ${text}`);
+                    reply('↩️ Not eklendi, gönderi düzeltme için geri gönderildi.');
+                    return;
+                }
+                const post = await checkCurrent(echo, person, row, messageId, { decision: mode === 'revise' });
                 if (!post) return;
                 if (mode === 'revise' && row.kind === 'approval') {
                     if (!can(member, 'approver')) {
-                        echo.reply(person, 'Onay verme yetkin yok; yorumunu not olarak ekledim.', messageId, project.id);
                         await addNote(post.id, `💬 ${person.name}: ${text}`);
+                        reply('Onay verme yetkin yok; yorumunu not olarak ekledim.');
                         return;
                     }
                     if (!echo.store.decide(row.id, person.phone, 'revise')) {
-                        echo.reply(person, 'Bu içerik için kararını zaten aldım; notunu yine de ekledim.', messageId, project.id);
                         await addNote(post.id, `💬 ${person.name}: ${text}`);
+                        reply('Bu içerik için kararını zaten aldım; notunu yine de ekledim.');
                         return;
                     }
+                    // Reject first, with the version the person saw; then the note.
+                    if (!(await decideOnPost(echo, person, row, messageId, post, 'reject'))) {
+                        echo.store.undecide(row.id, person.phone);
+                        return;
+                    }
+                    progress.rejected = true;
                     await addNote(post.id, `✏️ ${person.name} düzeltme istedi (WhatsApp): ${text}`);
-                    await api('POST', `/posts/${post.id}/reject`, {});
-                    echo.reply(person, '↩️ Not eklendi, gönderi düzeltme için geri gönderildi.', messageId, project.id);
+                    reply('↩️ Not eklendi, gönderi düzeltme için geri gönderildi.');
                     return;
                 }
                 if (mode === 'revise') {
                     await addNote(post.id, `✏️ ${person.name}: Revize gerekli (WhatsApp): ${text}`);
-                    echo.reply(person, '✏️ Revize notun içeriğe eklendi.', messageId, project.id);
+                    reply('✏️ Revize notun içeriğe eklendi.');
                     return;
                 }
                 await addNote(post.id, `💬 ${person.name} (WhatsApp): ${text}`);
-                echo.reply(person, '💬 Yorumun eklendi.', messageId, project.id);
+                reply('💬 Yorumun eklendi.');
             } catch (error) {
-                if (mode === 'revise') echo.store.undecide(row.id, person.phone);
+                if (mode === 'revise' && !progress.rejected) echo.store.undecide(row.id, person.phone);
                 echo.log('error', 'trypost note failed', error.message);
-                echo.reply(person, explain(error), messageId, project.id);
+                throw giveUp(error);
             }
+        },
+
+        texts: {
+            retrying: 'TryPost’a şu an ulaşamıyorum, cevabını kaydettim; bağlantı gelince işleyeceğim.',
+            gaveUp: 'TryPost’a uzun süre ulaşamadım; cevabın uygulanamadı. Lütfen paneli kullan.',
         },
 
         async onDeliveryFailed({ row, person, reason }) {

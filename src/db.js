@@ -7,7 +7,10 @@ import { DatabaseSync } from 'node:sqlite';
  * - outbox:    every message Echo means to send, with its delivery status;
  *              survives restarts, retried with backoff, never sent twice for
  *              the same event (dedupe_key)
- * - inbound:   WhatsApp message ids already handled (webhooks are retried)
+ * - inbox:     every WhatsApp message we received, processed in order per
+ *              person by the worker; kept pending (with backoff) while the
+ *              project is unreachable, so a reply is never lost. The WhatsApp
+ *              message id is the key, so a retried Meta webhook acts once.
  * - windows:   when each person last wrote to us (24-hour service window)
  * - sessions:  "I asked you to type a note, the next message is the note"
  * - decisions: one decision per person per message, so a double tap acts once
@@ -43,10 +46,21 @@ export function openDatabase(dataDir) {
         );
         CREATE INDEX IF NOT EXISTS outbox_due ON outbox (status, next_attempt_at);
 
-        CREATE TABLE IF NOT EXISTS inbound (
-            wa_message_id TEXT PRIMARY KEY,
-            received_at   INTEGER NOT NULL
+        CREATE TABLE IF NOT EXISTS inbox (
+            wa_message_id   TEXT PRIMARY KEY,
+            phone           TEXT NOT NULL,
+            payload_json    TEXT NOT NULL,
+            route_json      TEXT,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            attempts        INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL DEFAULT 0,
+            last_error      TEXT,
+            notified        INTEGER NOT NULL DEFAULT 0,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS inbox_due ON inbox (status, next_attempt_at);
+        CREATE INDEX IF NOT EXISTS inbox_phone ON inbox (phone, status);
 
         CREATE TABLE IF NOT EXISTS windows (
             phone           TEXT PRIMARY KEY,
@@ -88,7 +102,21 @@ export function createStore(db, now = () => Date.now()) {
         skip: q(`UPDATE outbox SET status = 'skipped', last_error = ?, updated_at = ? WHERE id = ?`),
         setStatus: q(`UPDATE outbox SET status = ?, last_error = COALESCE(?, last_error), updated_at = ? WHERE wa_message_id = ?`),
         recoverStuck: q(`UPDATE outbox SET status = 'pending', updated_at = ? WHERE status = 'sending' AND updated_at < ?`),
-        markInbound: q(`INSERT OR IGNORE INTO inbound (wa_message_id, received_at) VALUES (?, ?)`),
+        receive: q(`INSERT OR IGNORE INTO inbox (wa_message_id, phone, payload_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`),
+        // The oldest due message of each person whose earlier messages are all finished.
+        inboxNext: q(`SELECT i.rowid AS seq, i.* FROM inbox i
+            WHERE i.status = 'pending' AND i.next_attempt_at <= ?
+              AND NOT EXISTS (SELECT 1 FROM inbox e WHERE e.phone = i.phone AND e.rowid < i.rowid AND e.status IN ('pending', 'processing'))
+            ORDER BY i.rowid LIMIT 1`),
+        inboxById: q(`SELECT rowid AS seq, * FROM inbox WHERE wa_message_id = ?`),
+        claimInbox: q(`UPDATE inbox SET status = 'processing', attempts = attempts + 1, updated_at = ? WHERE wa_message_id = ? AND status = 'pending'`),
+        setRoute: q(`UPDATE inbox SET route_json = ?, updated_at = ? WHERE wa_message_id = ?`),
+        inboxDone: q(`UPDATE inbox SET status = 'done', last_error = NULL, updated_at = ? WHERE wa_message_id = ?`),
+        inboxRetry: q(`UPDATE inbox SET status = 'pending', next_attempt_at = ?, last_error = ?, updated_at = ? WHERE wa_message_id = ?`),
+        inboxFail: q(`UPDATE inbox SET status = 'failed', last_error = ?, updated_at = ? WHERE wa_message_id = ?`),
+        inboxNotified: q(`UPDATE inbox SET notified = 1 WHERE wa_message_id = ? AND notified = 0`),
+        recoverInbox: q(`UPDATE inbox SET status = 'pending', updated_at = ? WHERE status = 'processing' AND updated_at < ?`),
+        inboxStats: q(`SELECT status, COUNT(*) AS count FROM inbox GROUP BY status`),
         touchWindow: q(`INSERT INTO windows (phone, last_inbound_at) VALUES (?, ?)
             ON CONFLICT(phone) DO UPDATE SET last_inbound_at = excluded.last_inbound_at`),
         window: q(`SELECT last_inbound_at FROM windows WHERE phone = ?`),
@@ -100,6 +128,9 @@ export function createStore(db, now = () => Date.now()) {
         undecide: q(`DELETE FROM decisions WHERE outbox_id = ? AND phone = ?`),
         stats: q(`SELECT status, COUNT(*) AS count FROM outbox GROUP BY status`),
     };
+
+    const parseInbox = (row) =>
+        row && { ...row, message: JSON.parse(row.payload_json), route: row.route_json ? JSON.parse(row.route_json) : null };
 
     const parse = (row) =>
         row && {
@@ -128,8 +159,20 @@ export function createStore(db, now = () => Date.now()) {
         skip: (id, reason) => statements.skip.run(reason, now(), id),
         setStatusByWaId: (waId, status, error = null) => statements.setStatus.run(status, error, now(), waId).changes,
         recoverStuck: (olderThanMs) => statements.recoverStuck.run(now(), now() - olderThanMs).changes,
-        /** @returns {boolean} true the first time this WhatsApp message id is seen */
-        markInbound: (waId) => statements.markInbound.run(waId, now()).changes === 1,
+        /** Stores an inbound WhatsApp message. @returns {boolean} true the first time this id is seen */
+        receive: (message, phone) => statements.receive.run(message.id, phone, JSON.stringify(message), now(), now()).changes === 1,
+        inboxNext: () => parseInbox(statements.inboxNext.get(now())) ?? null,
+        inbox: (waId) => parseInbox(statements.inboxById.get(waId)) ?? null,
+        claimInbox: (waId) => statements.claimInbox.run(now(), waId).changes === 1,
+        /** Remembers where a message goes (and how far it got), so a retry ends up in the same place. */
+        setRoute: (waId, route) => statements.setRoute.run(JSON.stringify(route), now(), waId),
+        inboxDone: (waId) => statements.inboxDone.run(now(), waId),
+        inboxRetry: (waId, delayMs, error) => statements.inboxRetry.run(now() + delayMs, error, now(), waId),
+        inboxFail: (waId, error) => statements.inboxFail.run(error, now(), waId),
+        /** @returns {boolean} true the first time: one "I'll try again later" message per inbound message */
+        inboxNotified: (waId) => statements.inboxNotified.run(waId).changes === 1,
+        recoverInbox: (olderThanMs) => statements.recoverInbox.run(now(), now() - olderThanMs).changes,
+        inboxStats: () => Object.fromEntries(statements.inboxStats.all().map((row) => [row.status, row.count])),
         touchWindow: (phone) => statements.touchWindow.run(phone, now()),
         windowOpen(phone, marginMs = 10 * 60 * 1000) {
             const row = statements.window.get(phone);

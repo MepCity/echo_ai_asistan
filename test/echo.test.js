@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { beforeEach, describe, it } from 'node:test';
 import { normalizeConfig } from '../src/config.js';
 import { createEcho } from '../src/core.js';
 import { createStore, openDatabase } from '../src/db.js';
-import { createTryPostProject, fingerprint } from '../src/projects/trypost.js';
+import { createTryPostProject, fingerprint, sameVersion, versionTag } from '../src/projects/trypost.js';
 import { createHttpServer } from '../src/server.js';
 import { WhatsAppError, parseWebhook, verifySignature } from '../src/whatsapp.js';
 
@@ -56,31 +56,59 @@ function fakeWhatsApp() {
     };
 }
 
-/** A fake TryPost API with the endpoints Echo uses. */
+/** TryPost's own content version: a hash of content, media and schedule. */
+const contentVersion = (post) =>
+    createHash('sha1').update(JSON.stringify([post.content, post.media, post.scheduled_at])).digest('hex').slice(0, 12);
+
+/**
+ * A fake TryPost API with the endpoints Echo uses. Like TryPost, it adds
+ * `content_version` to the post resource and refuses (409) an approve/reject
+ * whose `expected_version` is not the current one.
+ */
 function fakeTryPost() {
     const posts = new Map();
     const notes = [];
     const calls = [];
+    const requests = [];
+    const hooks = { afterGet: null };
     let down = false;
     const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
     return {
         posts,
         notes,
         calls,
+        requests,
+        hooks,
         setDown: (value) => (down = value),
         fetch: async (url, init) => {
             const path = new URL(url).pathname.replace(/^\/api/, '');
             calls.push(`${init.method} ${path}`);
+            const body = init.body ? JSON.parse(init.body) : null;
+            requests.push({ method: init.method, path, body });
+            if (down === 'network') throw new TypeError('fetch failed');
+            if (typeof down === 'number') return json(down, { message: 'error' });
             if (down) return json(503, { message: 'down' });
             const match = path.match(/^\/posts\/([^/]+)(?:\/(\w+))?$/);
             const post = match && posts.get(match[1]);
             if (!post) return json(404, { message: 'not found' });
-            if (init.method === 'GET') return json(200, { data: toApi(post) });
+            if (init.method === 'GET') {
+                const response = json(200, { data: toApi(post) });
+                // Lets a test change the post right after Echo read it (before Echo's next call).
+                if (hooks.afterGet) {
+                    const hook = hooks.afterGet;
+                    hooks.afterGet = null;
+                    hook(post);
+                }
+                return response;
+            }
             if (match[2] === 'notes') {
-                notes.push({ postId: post.id, body: JSON.parse(init.body).body });
+                notes.push({ postId: post.id, body: body.body });
                 return json(201, { data: {} });
             }
             if (match[2] === 'approve' || match[2] === 'reject') {
+                if (body?.expected_version && body.expected_version !== contentVersion(post)) {
+                    return json(409, { message: 'content changed', content_version: contentVersion(post) });
+                }
                 if (post.status !== 'pending_approval') return json(422, { message: 'not pending' });
                 post.status = match[2] === 'approve' ? 'scheduled' : 'draft';
                 return json(200, { data: toApi(post) });
@@ -91,7 +119,11 @@ function fakeTryPost() {
 }
 
 // The API resource formats dates as "Y-m-d H:i:s" (UTC); the webhook uses ISO 8601.
-const toApi = (post) => ({ ...post, scheduled_at: post.scheduled_at.replace('T', ' ').replace(/(\.\d+)?(Z|[+-]\d\d:\d\d)$/, '') });
+const toApi = (post) => ({
+    ...post,
+    scheduled_at: post.scheduled_at.replace('T', ' ').replace(/(\.\d+)?(Z|[+-]\d\d:\d\d)$/, ''),
+    content_version: contentVersion(post),
+});
 
 function setup() {
     const clock = { t: Date.parse('2026-11-11T12:00:00Z') };
@@ -273,16 +305,210 @@ describe('approval requests', () => {
         assert.equal(t.trypost.posts.get('p1').status, 'pending_approval');
     });
 
-    it('answers a TryPost outage politely and lets the person try again', async () => {
+    it('says which content a "Yorum yaz" prompt is about', async () => {
         await t.user.hello(PHONES.yasir);
         await t.echo.handleProjectEvent('marmara', approvalEvent(post()));
+        await t.user.tap(PHONES.yasir, buttonsOf(t.whatsapp.last(PHONES.yasir))[2]);
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /Yorumunu yaz, şu içerik için: "Yapay zeka atölyemiz cuma 18:00’de!" \(Instagram · marmaraai\)/);
+    });
+});
+
+const later = async (t, ms) => {
+    t.clock.t += ms;
+    await t.echo.tick();
+};
+const textsTo = (t, phone, pattern) => t.whatsapp.to(phone).filter((m) => pattern.test(m.text?.body ?? ''));
+
+describe('routing typed notes', () => {
+    let t;
+    let requestA;
+    let requestB;
+    beforeEach(async () => {
+        t = setup();
+        t.trypost.posts.set('p1', post());
+        t.trypost.posts.set('p2', post({ id: 'p2', content: 'İkinci gönderi' }));
+        await t.user.hello(PHONES.yasir);
+        await t.echo.handleProjectEvent('marmara', approvalEvent(post(), 'e1'));
+        requestA = t.whatsapp.last(PHONES.yasir);
+        await t.echo.handleProjectEvent('marmara', approvalEvent(post({ id: 'p2', content: 'İkinci gönderi' }), 'e2'));
+        requestB = t.whatsapp.last(PHONES.yasir);
+    });
+
+    it('puts a quote-reply on the quoted post even when another post has an open session', async () => {
+        await t.user.tap(PHONES.yasir, buttonsOf(requestA)[2]); // Yorum yaz on A
+        await t.user.tap(PHONES.yasir, buttonsOf(requestB)[2]); // Yorum yaz on B: the session is now B
+        await t.user.say(PHONES.yasir, 'A için yorum', requestA.id);
+        assert.deepEqual(t.trypost.notes.map((note) => note.postId), ['p1']);
+
+        // The session for B was left open: the next plain message is B's note.
+        await t.user.say(PHONES.yasir, 'B için yorum');
+        assert.deepEqual(t.trypost.notes.map((note) => [note.postId, note.body.includes('B için')]), [['p1', false], ['p2', true]]);
+    });
+
+    it('treats a quote-reply to a "Yorumunu yaz" prompt as a reply to its post', async () => {
+        await t.user.tap(PHONES.yasir, buttonsOf(requestA)[2]);
+        const promptA = t.whatsapp.last(PHONES.yasir);
+        assert.match(promptA.text.body, /Yapay zeka atölyemiz/);
+        await t.user.tap(PHONES.yasir, buttonsOf(requestB)[2]);
+        await t.user.say(PHONES.yasir, 'A için yorum', promptA.id);
+        assert.deepEqual(t.trypost.notes.map((note) => note.postId), ['p1']);
+    });
+
+    it('uses the session mode when the quote-reply is to the session\'s own post', async () => {
+        await t.user.tap(PHONES.yasir, buttonsOf(requestA)[1]); // Düzeltme iste on A
+        await t.user.say(PHONES.yasir, 'Saat 19:00 olacak', requestA.id);
+        assert.equal(t.trypost.posts.get('p1').status, 'draft');
+        assert.equal(t.trypost.posts.get('p2').status, 'pending_approval');
+        // The session is used up: a plain message now gets the help reply.
+        await t.user.say(PHONES.yasir, 'teşekkürler');
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /o mesajı yanıtla/);
+        assert.equal(t.trypost.notes.length, 1);
+    });
+
+    it('never guesses the post for a plain message without a quote or session', async () => {
+        await t.user.say(PHONES.yasir, 'Görsel karanlık');
+        assert.equal(t.trypost.notes.length, 0);
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /o mesajı yanıtla/);
+    });
+});
+
+describe('TryPost outages', () => {
+    let t;
+    beforeEach(async () => {
+        t = setup();
+        t.trypost.posts.set('p1', post());
+        await t.user.hello(PHONES.yasir);
+        await t.echo.handleProjectEvent('marmara', approvalEvent(post()));
+    });
+
+    it('keeps a typed note through an outage and applies it, in order, when TryPost is back', async () => {
+        const request = t.whatsapp.last(PHONES.yasir);
+        await t.user.tap(PHONES.yasir, buttonsOf(request)[1]); // Düzeltme iste, while TryPost is up
+        t.trypost.setDown(true);
+        await t.user.say(PHONES.yasir, 'Saat 19:00 olacak');
+        await t.user.say(PHONES.yasir, 'Bir de hashtag ekleyelim', request.id); // waits behind the first
+        assert.equal(textsTo(t, PHONES.yasir, /ulaşamıyorum, cevabını kaydettim/).length, 1);
+        assert.equal(t.trypost.notes.length, 0);
+
+        await later(t, 31_000); // still down: retried quietly
+        assert.equal(textsTo(t, PHONES.yasir, /ulaşamıyorum/).length, 1);
+
+        t.trypost.setDown(false);
+        await later(t, 2 * 60_000 + 1_000);
+        assert.equal(t.trypost.posts.get('p1').status, 'draft');
+        const bodies = t.trypost.notes.map((note) => note.body);
+        assert.equal(bodies.length, 2);
+        assert.match(bodies[0], /düzeltme istedi.*19:00/);
+        assert.match(bodies[1], /hashtag/);
+        assert.equal(textsTo(t, PHONES.yasir, /gönderi düzeltme için geri gönderildi/).length, 1);
+        assert.equal(t.store.inboxStats().pending ?? 0, 0);
+    });
+
+    it('applies a tap made during an outage once TryPost is back', async () => {
+        const [approve] = buttonsOf(t.whatsapp.last(PHONES.yasir));
+        t.trypost.setDown('network');
+        await t.user.tap(PHONES.yasir, approve);
+        assert.equal(t.trypost.posts.get('p1').status, 'pending_approval');
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /ulaşamıyorum/);
+
+        t.trypost.setDown(false);
+        await later(t, 31_000);
+        assert.equal(t.trypost.posts.get('p1').status, 'scheduled');
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /Onaylandı/);
+        assert.equal(textsTo(t, PHONES.yasir, /ulaşamıyorum/).length, 1);
+    });
+
+    it('gives up after the last retry, says so once, and records no decision', async () => {
         const [approve] = buttonsOf(t.whatsapp.last(PHONES.yasir));
         t.trypost.setDown(true);
-        await t.user.tap(PHONES.yasir, approve);
-        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /sorun oldu/);
+        await t.user.tap(PHONES.yasir, approve, 'tap-1');
+        for (let i = 0; i < 6; i++) await later(t, 3 * 60 * 60_000);
+        assert.equal(t.store.inbox('tap-1').status, 'failed');
+        assert.equal(t.store.inbox('tap-1').attempts, 6);
+        assert.equal(textsTo(t, PHONES.yasir, /ulaşamıyorum/).length, 1);
+        assert.equal(textsTo(t, PHONES.yasir, /uygulanamadı. Lütfen paneli kullan/).length, 1);
+
         t.trypost.setDown(false);
         await t.user.tap(PHONES.yasir, approve);
         assert.equal(t.trypost.posts.get('p1').status, 'scheduled');
+    });
+
+    it('does not retry a refusal', async () => {
+        const [approve] = buttonsOf(t.whatsapp.last(PHONES.yasir));
+        t.trypost.setDown(403);
+        await t.user.tap(PHONES.yasir, approve, 'tap-1');
+        assert.equal(t.store.inbox('tap-1').status, 'failed');
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /yetkim yok/);
+        assert.equal(textsTo(t, PHONES.yasir, /ulaşamıyorum/).length, 0);
+    });
+
+    it('recovers a message left in processing by a crash', async () => {
+        t.store.receive({ id: 'crashed', from: PHONES.yasir, type: 'text', text: 'selam' }, PHONES.yasir);
+        assert.ok(t.store.claimInbox('crashed'));
+        await t.echo.tick();
+        assert.equal(t.store.inbox('crashed').status, 'processing');
+        await later(t, 6 * 60_000);
+        assert.equal(t.store.inbox('crashed').status, 'done');
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /Merhaba/);
+    });
+});
+
+describe('content versions', () => {
+    let t;
+    const versionedEvent = (p, id = 'evt-1') => {
+        const event = approvalEvent(p, id);
+        event.data.content_version = contentVersion(p);
+        return event;
+    };
+    beforeEach(async () => {
+        t = setup();
+        t.trypost.posts.set('p1', post());
+        await t.user.hello(PHONES.yasir);
+        await t.echo.handleProjectEvent('marmara', versionedEvent(post()));
+    });
+
+    it('keeps TryPost\'s content_version and sends it back as expected_version', async () => {
+        const request = t.whatsapp.last(PHONES.yasir);
+        assert.ok(t.store.outboxByWaId(request.id).fingerprint.startsWith(`tp:${contentVersion(post())} echo:`));
+        await t.user.tap(PHONES.yasir, buttonsOf(request)[0]);
+        const approve = t.trypost.requests.find((r) => r.path.endsWith('/approve'));
+        assert.deepEqual(approve.body, { expected_version: contentVersion(post()) });
+        assert.equal(t.trypost.posts.get('p1').status, 'scheduled');
+    });
+
+    it('does not approve content that changed between Echo\'s check and the approval', async () => {
+        t.trypost.hooks.afterGet = (p) => (p.content = 'Atölye ertelendi');
+        await t.user.tap(PHONES.yasir, buttonsOf(t.whatsapp.last(PHONES.yasir))[0]);
+        assert.equal(t.trypost.posts.get('p1').status, 'pending_approval');
+        const messages = t.whatsapp.to(PHONES.yasir);
+        assert.ok(messages.some((m) => m.text?.body.includes('değişti')));
+        assert.match(messages.at(-1).interactive.body.text, /Atölye ertelendi/);
+        assert.ok(!t.trypost.notes.some((note) => note.body.includes('onayladı')));
+
+        // The new version can be approved.
+        await t.user.tap(PHONES.yasir, buttonsOf(messages.at(-1))[0]);
+        assert.equal(t.trypost.posts.get('p1').status, 'scheduled');
+    });
+
+    it('does not send back content that changed between Echo\'s check and the rejection', async () => {
+        await t.user.tap(PHONES.yasir, buttonsOf(t.whatsapp.last(PHONES.yasir))[1]);
+        t.trypost.hooks.afterGet = (p) => (p.content = 'Atölye ertelendi');
+        await t.user.say(PHONES.yasir, 'Saat 19:00 olacak');
+        assert.equal(t.trypost.posts.get('p1').status, 'pending_approval');
+        assert.equal(t.trypost.notes.length, 0);
+        assert.match(t.whatsapp.to(PHONES.yasir).at(-1).interactive.body.text, /Atölye ertelendi/);
+    });
+
+    it('compares like with like, and still reads older fingerprints', () => {
+        const p = post();
+        const api = toApi(p);
+        assert.ok(sameVersion(versionTag({ ...p, content_version: contentVersion(p) }), api));
+        assert.ok(!sameVersion(versionTag({ ...p, content_version: 'old' }), api));
+        // Without a TryPost version on one side, Echo's hash decides.
+        assert.ok(sameVersion(versionTag(p), api));
+        assert.ok(sameVersion(versionTag({ ...p, content_version: 'v1' }), { ...api, content_version: undefined }));
+        assert.ok(sameVersion(fingerprint(p), api)); // a bare hash stored before versions existed
+        assert.ok(!sameVersion(fingerprint(p), { ...api, content: 'başka' }));
     });
 });
 

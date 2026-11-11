@@ -43,7 +43,7 @@ export function createHttpServer({ config, echo, log = () => {} }) {
         const path = url.pathname.replace(/\/+$/, '') || '/';
 
         if (request.method === 'GET' && path === '/health') {
-            return send(response, 200, { ok: true, outbox: echo.store.stats() }, 'application/json');
+            return send(response, 200, { ok: true, outbox: echo.store.stats(), inbox: echo.store.inboxStats() }, 'application/json');
         }
 
         if (path === '/whatsapp' && request.method === 'GET') {
@@ -57,7 +57,7 @@ export function createHttpServer({ config, echo, log = () => {} }) {
                 log('warn', 'WhatsApp webhook with a bad signature rejected');
                 return send(response, 401, 'bad signature');
             }
-            // Answer Meta at once; the work runs after. Inbound ids make retries harmless.
+            // Answer Meta at once; messages are stored first (keyed by id, so retries are harmless) and processed after.
             send(response, 200, 'ok');
             const parsed = parseWebhook(JSON.parse(raw.toString('utf8') || '{}'));
             echo.handleWebhook(parsed).catch((error) => log('error', 'webhook handling failed', error.message));
