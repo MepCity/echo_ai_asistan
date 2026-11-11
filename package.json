@@ -1,0 +1,12 @@
+{
+  "name": "echo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Echo: WhatsApp assistant that asks people for feedback and approvals on behalf of projects (TryPost first).",
+  "type": "module",
+  "engines": { "node": ">=22.5" },
+  "scripts": {
+    "start": "node --no-warnings src/index.js",
+    "test": "node --no-warnings --test test/*.test.js"
+  }
+}

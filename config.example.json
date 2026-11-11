@@ -1,0 +1,30 @@
+{
+  "publicUrl": "https://echo.example.com",
+  "timeZone": "Europe/Istanbul",
+  "whatsapp": {
+    "phoneNumberId": "${WA_PHONE_NUMBER_ID}",
+    "accessToken": "${WA_ACCESS_TOKEN}",
+    "appSecret": "${WA_APP_SECRET}",
+    "verifyToken": "${WA_VERIFY_TOKEN}"
+  },
+  "people": [
+    { "id": "yasir", "name": "Yasir", "phone": "905xxxxxxxxx" },
+    { "id": "ayse", "name": "Ayşe", "phone": "905yyyyyyyyy" }
+  ],
+  "projects": [
+    {
+      "id": "marmara",
+      "type": "trypost",
+      "name": "Marmara AI Sosyal",
+      "apiUrl": "https://sosyal.marmaraai.com/api",
+      "publicUrl": "https://sosyal.marmaraai.com",
+      "apiToken": "${MARMARA_TRYPOST_TOKEN}",
+      "webhookSecret": "${MARMARA_TRYPOST_WEBHOOK_SECRET}",
+      "templates": { "language": "tr", "approval": "onay_bekliyor", "feedback": "gorus_istegi" },
+      "members": [
+        { "person": "yasir", "userId": "<TryPost user id>", "roles": ["reviewer", "approver"] },
+        { "person": "ayse", "userId": "<TryPost user id>", "roles": ["reviewer"] }
+      ]
+    }
+  ]
+}
