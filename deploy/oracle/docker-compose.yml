@@ -1,5 +1,8 @@
-# Echo on one VM: Echo (no published port) behind Caddy (HTTPS via Let's Encrypt).
+# Echo on one VM: Echo (no published port) behind Caddy (HTTPS via Let's Encrypt), and
+# optionally Hermes Agent (profile "hermes", no published port; only Echo reaches it at
+# http://hermes:8090/whatsapp/webhook). Set up Hermes with deploy/oracle/hermes/setup-hermes.sh.
 # Run: docker compose -f /opt/echo/app/deploy/oracle/docker-compose.yml --env-file /opt/echo/.env up -d --build
+#      (add --profile hermes once Hermes is set up; update.sh does that by itself)
 name: echo
 
 x-logging: &logging
@@ -36,6 +39,21 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    restart: unless-stopped
+    logging: *logging
+
+  hermes:
+    profiles: ["hermes"]
+    # Official multi-arch image (amd64 + arm64); "stable" is the release-gated channel.
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:stable}
+    command: ["gateway", "run"]
+    environment:
+      # Files in /opt/hermes/data stay owned by the VM user (ubuntu).
+      HERMES_UID: ${HERMES_UID:-1000}
+      HERMES_GID: ${HERMES_GID:-1000}
+    volumes:
+      # Hermes' HERMES_HOME: .env, config.yaml, SOUL.md, auth.json, mcp-tokens/, sessions, logs.
+      - /opt/hermes/data:/opt/data
     restart: unless-stopped
     logging: *logging
 
