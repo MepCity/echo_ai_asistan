@@ -1,3 +1,4 @@
+import { createAssistant } from './assistant.js';
 import { normalizePhone } from './config.js';
 import { MEDIA_ERROR_CODES, OUTSIDE_WINDOW, toPayload, toTemplatePayload } from './whatsapp.js';
 
@@ -12,6 +13,15 @@ const MEDIA_LIMITS = { image: 5 * 1024 * 1024, video: 16 * 1024 * 1024 };
 const MEDIA_LINK = 0;
 const MEDIA_UPLOAD = 1;
 const MEDIA_NONE = 2;
+// Forwarding to the assistant: a chat should not wait hours, so it gives up after about 20 minutes.
+const ASSISTANT_BACKOFF_MS = [15_000, 60_000, 5 * 60_000, 15 * 60_000];
+const ASSISTANT_TEXTS = {
+    retrying: 'Asistana şu an ulaşamıyorum; mesajını kaydettim, ulaşınca ileteceğim.',
+    gaveUp: 'Asistan şu an yanıt veremiyor. Lütfen biraz sonra tekrar yaz.',
+};
+// Echo's own buttons are "<action>:<outbox id>"; anything else (e.g. Hermes' "appr:<id>:approve") is the assistant's.
+const ECHO_BUTTON = /^[a-z_]+:\d+$/i;
+const CANCEL = /^\s*(iptal|vazgeç|vazgec)\s*$/i;
 
 /**
  * Echo's heart: projects turn their events into outbox messages, the worker
@@ -40,10 +50,20 @@ const MEDIA_NONE = 2;
  * person is told `error.userMessage`. They must reply to the person only after
  * the work succeeded, and may record steps already done in `ctx.progress`
  * (kept across retries) so a retry does not repeat them.
+ *
+ * With `config.assistant`, a message from a known person that no project
+ * handles (no Echo button, no open session, no quote-reply to a request, not
+ * "iptal") is forwarded to the assistant (see assistant.js) from the same
+ * inbox: in order per person, retried on network errors and 5xx, and the
+ * person is told when it finally fails. Delivery statuses of messages Echo
+ * did not send are the assistant's too, and are forwarded from `forwards`.
  */
 export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl = globalThis.fetch }) {
     const adapters = new Map();
     const people = new Map(config.people.map((person) => [person.phone, person]));
+    const assistant = config.assistant
+        ? createAssistant(config.assistant, { phoneNumberId: config.whatsapp.phoneNumberId, fetchImpl })
+        : null;
     let ticking = null;
     let again = false;
 
@@ -95,6 +115,7 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
                 do {
                     again = false;
                     await processInbox();
+                    await forwardStatuses();
                     await runPeriodic();
                     await deliverDue();
                     await reportFailures();
@@ -169,13 +190,15 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
         } catch (error) {
             const route = store.inbox(message.id).route;
             const attempts = item.attempts;
+            const forAssistant = Boolean(route?.assistant);
             const adapter = route?.project ? adapters.get(route.project) : null;
-            const texts = adapter?.texts ?? {};
+            const texts = forAssistant ? ASSISTANT_TEXTS : (adapter?.texts ?? {});
+            const backoff = forAssistant ? ASSISTANT_BACKOFF_MS : BACKOFF_MS;
             const about = route?.outboxId ?? null;
             const project = route?.project ?? '_echo';
-            if (error.retryable && attempts < MAX_ATTEMPTS) {
+            if (error.retryable && attempts < backoff.length + 1) {
                 saveProgress();
-                store.inboxRetry(message.id, BACKOFF_MS[attempts - 1], error.message);
+                store.inboxRetry(message.id, backoff[attempts - 1], error.message);
                 log('warn', 'inbound retrying', message.id, error.message);
                 if (person && store.inboxNotified(message.id)) {
                     echo.reply(person, texts.retrying ?? 'Şu an işleyemiyorum, cevabını kaydettim; bağlantı gelince işleyeceğim.', message.id, project, about);
@@ -186,9 +209,11 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
             finishRoute(person, route);
             log('error', 'inbound failed', message.id, error.message);
             if (!person) return;
-            const text = error.retryable
-                ? (texts.gaveUp ?? 'Uzun süre bağlantı kuramadım; cevabın uygulanamadı. Lütfen paneli kullan.')
-                : (error.userMessage ?? 'Cevabın uygulanamadı; lütfen paneli kullan.');
+            const text = forAssistant
+                ? ASSISTANT_TEXTS.gaveUp
+                : error.retryable
+                  ? (texts.gaveUp ?? 'Uzun süre bağlantı kuramadım; cevabın uygulanamadı. Lütfen paneli kullan.')
+                  : (error.userMessage ?? 'Cevabın uygulanamadı; lütfen paneli kullan.');
             echo.reply(person, text, message.id, project, about);
         }
     }
@@ -383,8 +408,13 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
     /** Only database writes: a failed status is reported to the project later, by the worker. */
     function onStatus(status) {
         const row = store.outboxByWaId(status.id);
+        if (!row) {
+            // Not one of Echo's messages: the assistant sent it (to one of our people).
+            if (assistant && people.has(normalizePhone(status.recipient))) store.queueForward(status, `status:${status.id}:${status.status}`);
+            return;
+        }
         // A failure is final; a late "read" does not undo it.
-        if (!row || row.status === 'failed') return;
+        if (row.status === 'failed') return;
         if (status.status === 'failed' && MEDIA_ERROR_CODES.has(Number(status.code)) && row.message.media?.url && (row.media_mode ?? 0) < MEDIA_NONE) {
             // Meta accepted the message but could not fetch its media: send it again, uploaded (or without media).
             if ((row.media_mode ?? 0) === MEDIA_UPLOAD) store.dropMedia(row.message.media.url);
@@ -400,9 +430,42 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
         if (order.indexOf(status.status) > order.indexOf(row.status)) store.setStatusByWaId(status.id, status.status);
     }
 
+    /** Passes delivery statuses of the assistant's messages on to it. Best effort: given up silently. */
+    async function forwardStatuses() {
+        if (!assistant) return;
+        for (const row of store.forwardsDue(50)) {
+            try {
+                await assistant.forwardStatus(row.payload);
+                store.forwardDone(row.id);
+            } catch (error) {
+                const attempts = row.attempts + 1;
+                if (error.retryable && attempts < ASSISTANT_BACKOFF_MS.length + 1) {
+                    store.forwardRetry(row.id, ASSISTANT_BACKOFF_MS[attempts - 1], error.message);
+                } else {
+                    store.forwardFail(row.id, error.message);
+                    log('warn', 'status not forwarded to the assistant', row.id, error.message);
+                }
+                // The assistant is down: leave the rest for a later pass.
+                if (error.retryable) return;
+            }
+        }
+    }
+
+    /** Forwards a message to the assistant; the route is stored first so a retry (and a failure) knows where it went. */
+    async function toAssistant(message, person, progress) {
+        store.setRoute(message.id, { assistant: true, progress });
+        await assistant.forwardMessage(message, person);
+        log('info', 'forwarded to the assistant', message.id);
+        return null;
+    }
+
     /** Handles one stored inbound message; returns its route (for finishing a session). Throws to retry or fail. */
     async function onMessage(message, person, item, progress) {
+        // Once forwarded, a retry goes to the assistant again, even if an Echo session opened meanwhile.
+        if (item.route?.assistant && assistant) return toAssistant(message, person, progress);
+
         if (message.buttonId) {
+            if (assistant && !ECHO_BUTTON.test(String(message.buttonId))) return toAssistant(message, person, progress);
             const [action, idText] = String(message.buttonId).split(':');
             const row = store.outbox(Number(idText));
             // A button only counts for the person it was sent to.
@@ -425,12 +488,21 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
             const adapter = row && adapters.get(row.project);
             if (adapter) {
                 if (!item.route) store.setRoute(message.id, { ...route, progress });
-                if (/^\s*(iptal|vazgeç|vazgec)\s*$/i.test(message.text)) {
+                if (CANCEL.test(message.text)) {
                     echo.reply(person, 'Tamam, vazgeçildi.', message.id, row.project, row.id);
                     return route;
                 }
                 await adapter.handleText({ echo, person, row, mode: route.mode, text: message.text, messageId: message.id, progress });
                 return route;
+            }
+
+            if (assistant) {
+                // "iptal" is Echo's word; with nothing open there is nothing to cancel.
+                if (CANCEL.test(message.text)) {
+                    echo.reply(person, 'İptal edilecek açık bir işlem yok.', message.id);
+                    return null;
+                }
+                return toAssistant(message, person, progress);
             }
 
             // No quoted request and no open session: ask, never guess which content this is about.
@@ -442,6 +514,7 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
             return null;
         }
 
+        if (assistant) return toAssistant(message, person, progress);
         echo.reply(person, 'Şimdilik yazılı mesajları ve butonları anlayabiliyorum.', message.id);
         return null;
     }

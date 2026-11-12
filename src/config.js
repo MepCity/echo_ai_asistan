@@ -15,8 +15,15 @@ import { readFileSync } from 'node:fs';
  *                   "apiUrl": "https://sosyal.marmaraai.com/api", "publicUrl": "https://sosyal.marmaraai.com",
  *                   "apiToken": "${TRYPOST_API_TOKEN}", "webhookSecret": "${TRYPOST_WEBHOOK_SECRET}",
  *                   "templates": { "language": "tr", "approval": "onay_bekliyor", "feedback": "gorus_istegi" },
- *                   "members": [ { "person": "yasir", "userId": "<TryPost user id>", "roles": ["reviewer", "approver"] } ] } ]
+ *                   "members": [ { "person": "yasir", "userId": "<TryPost user id>", "roles": ["reviewer", "approver"] } ] } ],
+ *   "assistant": { "url": "http://hermes:8090/whatsapp/webhook", "enabled": true }
  * }
+ *
+ * `assistant` (optional): where messages from known people that Echo does not
+ * handle itself are forwarded, as signed WhatsApp webhooks (Hermes Agent's
+ * WhatsApp Cloud adapter). Optional keys: "appSecret" (defaults to
+ * whatsapp.appSecret) and "timeoutMs" (20000). Without it, or with
+ * "enabled": false, Echo answers such messages with its help text.
  */
 export function loadConfig(env = process.env) {
     const raw = env.ECHO_CONFIG_JSON ?? (env.ECHO_CONFIG ? readFileSync(env.ECHO_CONFIG, 'utf8') : null);
@@ -76,5 +83,22 @@ export function normalizeConfig(config) {
         },
         people,
         projects,
+        assistant: normalizeAssistant(config.assistant, config.whatsapp),
+    };
+}
+
+function normalizeAssistant(assistant, whatsapp) {
+    if (!assistant || assistant.enabled === false || !assistant.url) return null;
+    let url;
+    try {
+        url = new URL(assistant.url);
+    } catch {
+        throw new Error(`Config: assistant.url is not a URL (${assistant.url})`);
+    }
+    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Config: assistant.url must be http(s)');
+    return {
+        url: url.href,
+        appSecret: assistant.appSecret ?? whatsapp.appSecret,
+        timeoutMs: Number(assistant.timeoutMs ?? 20_000),
     };
 }

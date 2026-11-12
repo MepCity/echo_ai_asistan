@@ -160,13 +160,18 @@ export function toTemplatePayload(to, template, buttons = [], media = null) {
     };
 }
 
-/** Flattens a webhook body into messages and delivery statuses. */
+/**
+ * Flattens a webhook body into messages and delivery statuses. Each keeps what
+ * Meta sent (`raw`, the sender's `contact`, the `metadata` and the entry id), so
+ * Echo can pass it on to the assistant unchanged.
+ */
 export function parseWebhook(body) {
     const messages = [];
     const statuses = [];
     for (const entry of body?.entry ?? []) {
         for (const change of entry.changes ?? []) {
             const value = change.value ?? {};
+            const origin = { metadata: value.metadata ?? null, entryId: entry.id ?? null };
             for (const message of value.messages ?? []) {
                 messages.push({
                     id: message.id,
@@ -176,6 +181,9 @@ export function parseWebhook(body) {
                     buttonId: message.interactive?.button_reply?.id ?? message.button?.payload ?? null,
                     contextId: message.context?.id ?? null,
                     timestamp: Number(message.timestamp ?? 0) * 1000,
+                    raw: message,
+                    contact: (value.contacts ?? []).find((contact) => contact.wa_id === message.from) ?? null,
+                    ...origin,
                 });
             }
             for (const status of value.statuses ?? []) {
@@ -185,6 +193,8 @@ export function parseWebhook(body) {
                     recipient: status.recipient_id,
                     code: status.errors?.[0]?.code ?? null,
                     error: status.errors?.[0] ? `${status.errors[0].code}: ${status.errors[0].title ?? status.errors[0].message ?? ''}` : null,
+                    raw: status,
+                    ...origin,
                 });
             }
         }

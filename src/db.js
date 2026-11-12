@@ -25,6 +25,9 @@ import { DatabaseSync } from 'node:sqlite';
  *              (WhatsApp keeps them 30 days; Echo reuses them for 25)
  * - state:     small named values that must survive restarts (the day each
  *              person last got their digest)
+ * - forwards:  delivery statuses of messages Echo did not send (the assistant
+ *              sent them), waiting to be passed on to the assistant; retried
+ *              with backoff, removed once it took them
  */
 export function openDatabase(dataDir) {
     let file = ':memory:';
@@ -109,6 +112,19 @@ export function openDatabase(dataDir) {
             value      TEXT NOT NULL,
             updated_at INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS forwards (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            dedupe_key      TEXT UNIQUE,
+            payload_json    TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            attempts        INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL DEFAULT 0,
+            last_error      TEXT,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS forwards_due ON forwards (status, next_attempt_at);
     `);
     migrate(db);
     return db;
@@ -205,6 +221,12 @@ export function createStore(db, now = () => Date.now()) {
         requests: q(`SELECT * FROM outbox WHERE project = ? AND kind = ? AND item_id IS NOT NULL AND status != 'skipped' AND created_at > ? ORDER BY id`),
         decidedOnItem: q(`SELECT 1 FROM decisions d JOIN outbox o ON o.id = d.outbox_id
             WHERE o.project = ? AND o.item_id = ? AND d.phone = ? LIMIT 1`),
+        queueForward: q(`INSERT OR IGNORE INTO forwards (dedupe_key, payload_json, created_at, updated_at) VALUES (?, ?, ?, ?)`),
+        forwardsDue: q(`SELECT * FROM forwards WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY id LIMIT ?`),
+        forwardDone: q(`DELETE FROM forwards WHERE id = ?`),
+        forwardRetry: q(`UPDATE forwards SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ?`),
+        forwardFail: q(`UPDATE forwards SET status = 'failed', attempts = attempts + 1, last_error = ?, updated_at = ? WHERE id = ?`),
+        forwardStats: q(`SELECT status, COUNT(*) AS count FROM forwards GROUP BY status`),
     };
 
     const parseInbox = (row) =>
@@ -307,5 +329,12 @@ export function createStore(db, now = () => Date.now()) {
         requests: (project, kind, sinceMs) => statements.requests.all(project, kind, sinceMs).map(parse),
         /** @returns {boolean} true when the person has a decision (started or applied) on any request about this item */
         decidedOnItem: (project, itemId, phone) => Boolean(statements.decidedOnItem.get(project, String(itemId), phone)),
+        /** Queues something for the assistant. @returns {boolean} false when this dedupe key was already queued */
+        queueForward: (payload, dedupeKey = null) => statements.queueForward.run(dedupeKey, JSON.stringify(payload), now(), now()).changes === 1,
+        forwardsDue: (limit = 50) => statements.forwardsDue.all(now(), limit).map((row) => ({ ...row, payload: JSON.parse(row.payload_json) })),
+        forwardDone: (id) => statements.forwardDone.run(id),
+        forwardRetry: (id, delayMs, error) => statements.forwardRetry.run(now() + delayMs, error, now(), id),
+        forwardFail: (id, error) => statements.forwardFail.run(error, now(), id),
+        forwardStats: () => Object.fromEntries(statements.forwardStats.all().map((row) => [row.status, row.count])),
     };
 }

@@ -52,7 +52,7 @@ export function createHttpServer({ config, echo, log = () => {} }) {
         const path = url.pathname.replace(/\/+$/, '') || '/';
 
         if (request.method === 'GET' && path === '/health') {
-            return send(response, 200, { ok: true, outbox: echo.store.stats(), inbox: echo.store.inboxStats() }, 'application/json');
+            return send(response, 200, { ok: true, outbox: echo.store.stats(), inbox: echo.store.inboxStats(), forwards: echo.store.forwardStats() }, 'application/json');
         }
 
         if (path === '/whatsapp' && request.method === 'GET') {

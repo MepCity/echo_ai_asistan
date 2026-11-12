@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { createHash, createHmac } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { beforeEach, describe, it } from 'node:test';
+import { after, beforeEach, describe, it } from 'node:test';
 import { normalizeConfig } from '../src/config.js';
 import { createEcho } from '../src/core.js';
 import { createStore, openDatabase } from '../src/db.js';
@@ -14,8 +15,9 @@ import { WhatsAppError, parseWebhook, verifySignature } from '../src/whatsapp.js
 
 const PHONES = { yasir: '905550000001', ayse: '905550000002', mehmet: '905550000003' };
 
-const baseConfig = () =>
+const baseConfig = (extra = {}) =>
     normalizeConfig({
+        ...extra,
         whatsapp: { phoneNumberId: '1', accessToken: 't', appSecret: 'app-secret', verifyToken: 'verify' },
         people: [
             { id: 'yasir', name: 'Yasir', phone: `+${PHONES.yasir}` },
@@ -182,9 +184,9 @@ const toApi = (post) => ({
     content_version: contentVersion(post),
 });
 
-function setup() {
+function setup(extra = {}) {
     const clock = { t: Date.parse('2026-11-11T12:00:00Z') };
-    const config = baseConfig();
+    const config = baseConfig(extra);
     const db = openDatabase(':memory:');
     const store = createStore(db, () => clock.t);
     const whatsapp = fakeWhatsApp();
@@ -1276,5 +1278,211 @@ describe('whatsapp helpers', () => {
         assert.ok(verifySignature('s', body, header));
         assert.ok(!verifySignature('s', body, 'sha256=abc'));
         assert.ok(!verifySignature('s', body, undefined));
+    });
+});
+
+/**
+ * A fake Hermes Agent WhatsApp Cloud adapter on a real HTTP port: it checks the
+ * signature like Hermes does (X-Hub-Signature-256 "sha256=<hex>" of the raw
+ * body, keyed by the app secret: 401 otherwise), takes only WhatsApp Business
+ * webhooks for its phone number id, and records what it accepted.
+ * `respond(status | 'network')` sets the answer to the next requests.
+ */
+async function fakeHermes({ appSecret = 'app-secret', phoneNumberId = '1' } = {}) {
+    const accepted = [];
+    const refused = [];
+    let answer = 200;
+    const server = createServer((request, response) => {
+        const chunks = [];
+        request.on('data', (chunk) => chunks.push(chunk));
+        request.on('end', () => {
+            const raw = Buffer.concat(chunks);
+            if (answer === 'network') return request.socket.destroy();
+            const header = String(request.headers['x-hub-signature-256'] ?? '');
+            const expected = Buffer.from(`sha256=${createHmac('sha256', appSecret).update(raw).digest('hex')}`);
+            const given = Buffer.from(header);
+            if (request.url !== '/whatsapp/webhook' || given.length !== expected.length || !timingSafeEqual(given, expected)) {
+                refused.push(raw.toString());
+                response.writeHead(401).end();
+                return;
+            }
+            const body = JSON.parse(raw);
+            const value = body.entry?.[0]?.changes?.[0]?.value;
+            const ours = body.object === 'whatsapp_business_account' && body.entry[0].changes[0].field === 'messages' && value?.metadata?.phone_number_id === phoneNumberId;
+            if (answer !== 200) {
+                response.writeHead(answer).end();
+                return;
+            }
+            if (ours) accepted.push(body);
+            response.writeHead(200).end();
+        });
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const messages = () => accepted.flatMap((body) => body.entry[0].changes[0].value.messages ?? []);
+    const statuses = () => accepted.flatMap((body) => body.entry[0].changes[0].value.statuses ?? []);
+    return {
+        url: `http://127.0.0.1:${server.address().port}/whatsapp/webhook`,
+        accepted,
+        refused,
+        messages,
+        statuses,
+        texts: () => messages().map((message) => message.text?.body ?? message.interactive?.button_reply?.id ?? message.type),
+        respond: (status) => (answer = status),
+        close: () => {
+            server.closeAllConnections();
+            return new Promise((resolve) => server.close(resolve));
+        },
+    };
+}
+
+describe('assistant (Hermes) behind Echo', () => {
+    let t;
+    let hermes;
+    after(() => hermes?.close());
+    beforeEach(async () => {
+        await hermes?.close();
+        hermes = await fakeHermes();
+        t = setup({ assistant: { url: hermes.url, enabled: true } });
+        t.trypost.posts.set('p1', post());
+    });
+
+    it('forwards a message Echo does not handle, signed and shaped like Meta\'s webhook, instead of the help reply', async () => {
+        await t.user.say(PHONES.yasir, 'Bu hafta ne paylaşıyoruz?', null, 'm1');
+        assert.equal(hermes.accepted.length, 1);
+        assert.equal(hermes.refused.length, 0);
+        const value = hermes.accepted[0].entry[0].changes[0].value;
+        assert.equal(value.metadata.phone_number_id, '1');
+        assert.deepEqual(value.contacts, [{ profile: { name: 'Yasir' }, wa_id: PHONES.yasir }]);
+        assert.equal(value.messages[0].id, 'm1');
+        assert.equal(value.messages[0].from, PHONES.yasir);
+        assert.deepEqual(value.messages[0].text, { body: 'Bu hafta ne paylaşıyoruz?' });
+        assert.equal(t.whatsapp.sent.length, 0); // Hermes answers, not Echo
+        assert.equal(t.store.inbox('m1').status, 'done');
+    });
+
+    it('passes on exactly what Meta sent: message, contact and metadata', async () => {
+        const server = createHttpServer({ config: t.config, echo: t.echo });
+        await new Promise((resolve) => server.listen(0, resolve));
+        try {
+            const message = { from: PHONES.ayse, id: 'wamid.voice', timestamp: '1762862400', type: 'audio', audio: { id: 'media-1', mime_type: 'audio/ogg' } };
+            const contact = { profile: { name: 'Ayşe K.' }, wa_id: PHONES.ayse };
+            const metadata = { display_phone_number: '908500000000', phone_number_id: '1' };
+            const body = JSON.stringify({
+                object: 'whatsapp_business_account',
+                entry: [{ id: 'waba-1', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', metadata, contacts: [contact], messages: [message] } }] }],
+            });
+            const signature = createHmac('sha256', 'app-secret').update(body).digest('hex');
+            const answer = await fetch(`http://127.0.0.1:${server.address().port}/whatsapp`, { method: 'POST', body, headers: { 'X-Hub-Signature-256': `sha256=${signature}` } });
+            assert.equal(answer.status, 200);
+            for (let i = 0; i < 200 && !hermes.accepted.length; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+            assert.equal(hermes.accepted.length, 1);
+            assert.deepEqual(hermes.accepted[0], JSON.parse(body));
+        } finally {
+            server.closeAllConnections();
+            server.close();
+        }
+    });
+
+    it('keeps Echo\'s own flows: buttons, note sessions, quote-replies and "iptal"', async () => {
+        await t.user.hello(PHONES.yasir); // goes to Hermes
+        await t.echo.handleProjectEvent('marmara', approvalEvent(post()));
+        const request = t.whatsapp.last(PHONES.yasir);
+        const [, revise, comment] = buttonsOf(request);
+
+        await t.user.tap(PHONES.yasir, comment); // "Yorum yaz": Echo
+        await t.user.say(PHONES.yasir, 'Görsel biraz karanlık'); // the note: Echo
+        await t.user.say(PHONES.yasir, 'Saat de yanlış', request.id); // quote-reply: Echo
+        await t.user.tap(PHONES.yasir, revise); // "Düzeltme iste": Echo
+        await t.user.say(PHONES.yasir, 'iptal'); // cancels Echo's session
+        await t.user.say(PHONES.yasir, 'iptal'); // nothing open: Echo says so, Hermes never sees it
+        await t.user.tap(PHONES.yasir, 'approve:999'); // an old Echo button
+        await t.user.tap(PHONES.yasir, 'appr:a1b2:approve'); // Hermes' own approval button
+        await t.user.say(PHONES.yasir, 'Teşekkürler'); // nothing of Echo's: Hermes
+
+        assert.deepEqual(hermes.texts(), ['merhaba', 'appr:a1b2:approve', 'Teşekkürler']);
+        assert.deepEqual(t.trypost.notes.map((note) => note.body).length, 2);
+        assert.match(textsTo(t, PHONES.yasir, /vazgeçildi/)[0].text.body, /vazgeçildi/);
+        assert.equal(textsTo(t, PHONES.yasir, /İptal edilecek açık bir işlem yok/).length, 1);
+        assert.equal(textsTo(t, PHONES.yasir, /geçerli değil/).length, 1);
+        assert.equal(textsTo(t, PHONES.yasir, /o mesajı yanıtla/).length, 0);
+    });
+
+    it('retries while Hermes is down, in order per person, and then delivers', async () => {
+        hermes.respond(503);
+        await t.user.say(PHONES.yasir, 'birinci', null, 'm1');
+        await t.user.say(PHONES.yasir, 'ikinci', null, 'm2'); // waits behind the first
+        assert.equal(t.store.inbox('m1').status, 'pending');
+        assert.equal(t.store.inbox('m2').attempts, 0);
+        assert.equal(textsTo(t, PHONES.yasir, /Asistana şu an ulaşamıyorum/).length, 1);
+
+        hermes.respond('network');
+        await later(t, 16_000);
+        assert.equal(t.store.inbox('m1').attempts, 2);
+        assert.equal(hermes.accepted.length, 0);
+
+        hermes.respond(200);
+        await later(t, 61_000);
+        assert.deepEqual(hermes.texts(), ['birinci', 'ikinci']);
+        assert.equal(t.store.inbox('m2').status, 'done');
+        assert.equal(textsTo(t, PHONES.yasir, /Asistana şu an ulaşamıyorum/).length, 1);
+        assert.equal(textsTo(t, PHONES.yasir, /yanıt veremiyor/).length, 0);
+    });
+
+    it('gives up after the last retry and tells the person once', async () => {
+        hermes.respond(502);
+        await t.user.say(PHONES.yasir, 'orada mısın?', null, 'm1');
+        for (let i = 0; i < 6; i++) await later(t, 20 * 60_000);
+        assert.equal(t.store.inbox('m1').status, 'failed');
+        assert.equal(t.store.inbox('m1').attempts, 5);
+        assert.equal(textsTo(t, PHONES.yasir, /Asistan şu an yanıt veremiyor/).length, 1);
+        assert.equal(hermes.accepted.length, 0);
+    });
+
+    it('does not retry a refusal (bad signature)', async () => {
+        t = setup({ assistant: { url: hermes.url, appSecret: 'wrong-secret' } });
+        await t.user.say(PHONES.yasir, 'selam', null, 'm1');
+        assert.equal(hermes.refused.length, 1);
+        assert.equal(t.store.inbox('m1').status, 'failed');
+        assert.equal(textsTo(t, PHONES.yasir, /Asistan şu an yanıt veremiyor/).length, 1);
+    });
+
+    it('forwards statuses of Hermes\' messages, not of Echo\'s own', async () => {
+        await t.user.hello(PHONES.yasir);
+        await t.echo.handleProjectEvent('marmara', approvalEvent(post()));
+        const echoMessage = t.whatsapp.last(PHONES.yasir);
+        await t.echo.handleWebhook({
+            messages: [],
+            statuses: [
+                { id: echoMessage.id, status: 'delivered', recipient: PHONES.yasir },
+                { id: 'wamid.hermes1', status: 'read', recipient: PHONES.yasir, raw: { id: 'wamid.hermes1', status: 'read', recipient_id: PHONES.yasir, timestamp: '1' } },
+                { id: 'wamid.stranger', status: 'read', recipient: '905559999999' },
+            ],
+        });
+        assert.deepEqual(hermes.statuses(), [{ id: 'wamid.hermes1', status: 'read', recipient_id: PHONES.yasir, timestamp: '1' }]);
+        assert.equal(t.store.outbox(1).status, 'delivered');
+
+        // While Hermes is down a status waits and is sent later; a retried Meta webhook adds it once.
+        hermes.respond(500);
+        const late = { id: 'wamid.hermes2', status: 'delivered', recipient: PHONES.yasir };
+        await t.echo.handleWebhook({ messages: [], statuses: [late] });
+        await t.echo.handleWebhook({ messages: [], statuses: [late] });
+        hermes.respond(200);
+        await later(t, 16_000);
+        assert.deepEqual(hermes.statuses().map((status) => status.id), ['wamid.hermes1', 'wamid.hermes2']);
+        assert.deepEqual(t.store.forwardStats(), {});
+    });
+
+    it('never forwards unknown numbers', async () => {
+        await t.user.say('905559999999', 'selam');
+        await t.echo.handleWebhook({ messages: [], statuses: [{ id: 'wamid.x', status: 'read', recipient: '905559999999' }] });
+        assert.equal(hermes.accepted.length + hermes.refused.length, 0);
+        assert.equal(t.whatsapp.sent.length, 0);
+    });
+
+    it('keeps the help reply when the assistant is not configured or disabled', async () => {
+        t = setup({ assistant: { url: hermes.url, enabled: false } });
+        await t.user.say(PHONES.yasir, 'selam');
+        assert.equal(hermes.accepted.length, 0);
+        assert.match(t.whatsapp.last(PHONES.yasir).text.body, /o mesajı yanıtla/);
     });
 });
