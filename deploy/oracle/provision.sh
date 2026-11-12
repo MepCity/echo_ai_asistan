@@ -150,7 +150,7 @@ else
     return 1
   }
 
-  try_launch VM.Standard.A1.Flex '{"ocpus":1,"memoryInGBs":6}' \
+  try_launch VM.Standard.A1.Flex '{"ocpus":2,"memoryInGBs":12}' \
     || try_launch VM.Standard.E2.1.Micro "" \
     || fail "No Always Free capacity right now (A1.Flex and E2.1.Micro). Wait some minutes and run this script again."
   rm -f "$ERR" "$OUT"

@@ -21,6 +21,10 @@ import { DatabaseSync } from 'node:sqlite';
  *              carries a request_id, created when it starts and sent with
  *              every attempt, so the project can tell a retry of this
  *              decision from anyone else's.
+ * - media_cache: WhatsApp media ids of files Echo uploaded, per source URL
+ *              (WhatsApp keeps them 30 days; Echo reuses them for 25)
+ * - state:     small named values that must survive restarts (the day each
+ *              person last got their digest)
  */
 export function openDatabase(dataDir) {
     let file = ':memory:';
@@ -49,6 +53,7 @@ export function openDatabase(dataDir) {
             last_error      TEXT,
             wa_message_id   TEXT UNIQUE,
             failure_reported INTEGER NOT NULL DEFAULT 0,
+            media_mode      INTEGER NOT NULL DEFAULT 0,
             created_at      INTEGER NOT NULL,
             updated_at      INTEGER NOT NULL
         );
@@ -92,6 +97,18 @@ export function openDatabase(dataDir) {
             request_id TEXT,
             PRIMARY KEY (outbox_id, phone)
         );
+
+        CREATE TABLE IF NOT EXISTS media_cache (
+            url        TEXT PRIMARY KEY,
+            media_id   TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS state (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
     `);
     migrate(db);
     return db;
@@ -118,6 +135,11 @@ function migrate(db) {
             UPDATE outbox SET failure_reported = 1 WHERE status = 'failed';
         `);
     }
+    if (!columns('outbox').includes('media_mode')) {
+        // 0: media by link, 1: media uploaded to WhatsApp, 2: without media.
+        db.exec('ALTER TABLE outbox ADD COLUMN media_mode INTEGER NOT NULL DEFAULT 0;');
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS outbox_item ON outbox (project, item_id, kind);');
 }
 
 export function createStore(db, now = () => Date.now()) {
@@ -169,6 +191,20 @@ export function createStore(db, now = () => Date.now()) {
         adoptDecision: q(`UPDATE decisions SET wa_message_id = ? WHERE outbox_id = ? AND phone = ? AND state = 'started'`),
         undecide: q(`DELETE FROM decisions WHERE outbox_id = ? AND phone = ? AND state = 'started' AND wa_message_id = ?`),
         stats: q(`SELECT status, COUNT(*) AS count FROM outbox GROUP BY status`),
+        setMediaMode: q(`UPDATE outbox SET media_mode = ?, updated_at = ? WHERE id = ?`),
+        // A message whose media Meta could not fetch: send it again, the next way (upload, then without media).
+        retryMedia: q(`UPDATE outbox SET media_mode = ?, status = 'pending', next_attempt_at = 0, last_error = ?, updated_at = ? WHERE id = ?`),
+        mediaCached: q(`SELECT media_id FROM media_cache WHERE url = ? AND created_at > ?`),
+        cacheMedia: q(`INSERT INTO media_cache (url, media_id, created_at) VALUES (?, ?, ?)
+            ON CONFLICT(url) DO UPDATE SET media_id = excluded.media_id, created_at = excluded.created_at`),
+        dropMedia: q(`DELETE FROM media_cache WHERE url = ?`),
+        getState: q(`SELECT value FROM state WHERE key = ?`),
+        setState: q(`INSERT INTO state (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`),
+        dedupeUsed: q(`SELECT 1 FROM outbox WHERE dedupe_key = ?`),
+        requests: q(`SELECT * FROM outbox WHERE project = ? AND kind = ? AND item_id IS NOT NULL AND status != 'skipped' AND created_at > ? ORDER BY id`),
+        decidedOnItem: q(`SELECT 1 FROM decisions d JOIN outbox o ON o.id = d.outbox_id
+            WHERE o.project = ? AND o.item_id = ? AND d.phone = ? LIMIT 1`),
     };
 
     const parseInbox = (row) =>
@@ -257,5 +293,19 @@ export function createStore(db, now = () => Date.now()) {
         /** Removes a decision that was started by this message and could not be applied. Applied decisions stay. */
         undecide: (outboxId, phone, waMessageId) => statements.undecide.run(outboxId, phone, waMessageId),
         stats: () => Object.fromEntries(statements.stats.all().map((row) => [row.status, row.count])),
+        setMediaMode: (id, mode) => statements.setMediaMode.run(mode, now(), id),
+        retryMedia: (id, mode, error) => statements.retryMedia.run(mode, error, now(), id),
+        /** @returns {string|null} a WhatsApp media id uploaded for this URL less than maxAgeMs ago */
+        cachedMedia: (url, maxAgeMs) => statements.mediaCached.get(url, now() - maxAgeMs)?.media_id ?? null,
+        cacheMedia: (url, mediaId) => statements.cacheMedia.run(url, mediaId, now()),
+        dropMedia: (url) => statements.dropMedia.run(url),
+        getState: (key) => statements.getState.get(key)?.value ?? null,
+        setState: (key, value) => statements.setState.run(key, String(value), now()),
+        /** @returns {boolean} true when a message with this dedupe key was already queued */
+        dedupeUsed: (key) => Boolean(statements.dedupeUsed.get(key)),
+        /** Requests of one kind created since `sinceMs` (not skipped), oldest first. */
+        requests: (project, kind, sinceMs) => statements.requests.all(project, kind, sinceMs).map(parse),
+        /** @returns {boolean} true when the person has a decision (started or applied) on any request about this item */
+        decidedOnItem: (project, itemId, phone) => Boolean(statements.decidedOnItem.get(project, String(itemId), phone)),
     };
 }

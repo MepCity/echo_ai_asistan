@@ -1,10 +1,17 @@
 import { normalizePhone } from './config.js';
-import { OUTSIDE_WINDOW, toPayload, toTemplatePayload } from './whatsapp.js';
+import { MEDIA_ERROR_CODES, OUTSIDE_WINDOW, toPayload, toTemplatePayload } from './whatsapp.js';
 
 const BACKOFF_MS = [30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
 const MAX_ATTEMPTS = BACKOFF_MS.length + 1;
 const REPORT_RETRY_MS = 5 * 60_000;
 const REPORT_GIVE_UP_MS = 24 * 60 * 60_000;
+const MEDIA_CACHE_MS = 25 * 24 * 60 * 60_000;
+// WhatsApp's limits for uploaded media.
+const MEDIA_LIMITS = { image: 5 * 1024 * 1024, video: 16 * 1024 * 1024 };
+// How a message's media is sent: by link, uploaded to WhatsApp first, or left out.
+const MEDIA_LINK = 0;
+const MEDIA_UPLOAD = 1;
+const MEDIA_NONE = 2;
 
 /**
  * Echo's heart: projects turn their events into outbox messages, the worker
@@ -16,7 +23,16 @@ const REPORT_GIVE_UP_MS = 24 * 60 * 60_000;
  *   handleAction(ctx)             -> Promise<void>   (a button was tapped)
  *   handleText(ctx)               -> Promise<void>   (a typed note for a session or a reply)
  *   onDeliveryFailed(ctx)         -> Promise<void>   (a request could not be delivered)
+ *   periodic?(echo)               -> Promise<void>   (called on every worker pass: reminders, digests)
+ *   mediaHeaders?(url)            -> object          (headers for downloading the project's media)
  *   texts?: { retrying, gaveUp }                     (what to tell people while the project is down)
+ *
+ * A message may carry `media: { type: 'image'|'video', url, mime?, size? }`.
+ * Echo sends it by link; when Meta cannot fetch it (131052/131053, at once or
+ * in a failed status), Echo downloads it, uploads it to WhatsApp and sends the
+ * media id (cached per URL for 25 days); when that fails too, the message goes
+ * without media: `message.withoutMedia` (text) and `template.withoutMedia`
+ * (another template) say how.
  *
  * handleAction / handleText throw when they could not finish. An error with
  * `retryable = true` (the project is down, 5xx, 429) keeps the inbound message
@@ -25,7 +41,7 @@ const REPORT_GIVE_UP_MS = 24 * 60 * 60_000;
  * the work succeeded, and may record steps already done in `ctx.progress`
  * (kept across retries) so a retry does not repeat them.
  */
-export function createEcho({ config, store, whatsapp, log = () => {} }) {
+export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl = globalThis.fetch }) {
     const adapters = new Map();
     const people = new Map(config.people.map((person) => [person.phone, person]));
     let ticking = null;
@@ -79,6 +95,7 @@ export function createEcho({ config, store, whatsapp, log = () => {} }) {
                 do {
                     again = false;
                     await processInbox();
+                    await runPeriodic();
                     await deliverDue();
                     await reportFailures();
                 } while (again);
@@ -214,8 +231,83 @@ export function createEcho({ config, store, whatsapp, log = () => {} }) {
         return { ...row.message, buttons };
     }
 
+    /** Projects' scheduled work (reminders, digests). A failing project never stops delivery. */
+    async function runPeriodic() {
+        for (const [projectId, adapter] of adapters) {
+            if (!adapter.periodic) continue;
+            try {
+                await adapter.periodic(echo);
+            } catch (error) {
+                log('warn', `periodic work of ${projectId} failed`, error.message);
+            }
+        }
+    }
+
+    const mediaError = (message) => Object.assign(new Error(message), { media: true, retryable: false });
+
+    /** Downloads a message's media and uploads it to WhatsApp; returns the media id (cached per URL). */
+    async function uploadMedia(row, media) {
+        const cached = store.cachedMedia(media.url, MEDIA_CACHE_MS);
+        if (cached) return cached;
+        if (!whatsapp.uploadMedia) throw mediaError('media upload is not available');
+        const headers = adapters.get(row.project)?.mediaHeaders?.(media.url) ?? {};
+        let response;
+        try {
+            response = await fetchImpl(media.url, { headers });
+        } catch (error) {
+            throw Object.assign(new Error(`media download: ${error.message}`), { retryable: true });
+        }
+        if (!response.ok) {
+            if (response.status >= 500 || response.status === 429) {
+                throw Object.assign(new Error(`media download: HTTP ${response.status}`), { retryable: true });
+            }
+            throw mediaError(`media download: HTTP ${response.status}`);
+        }
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (bytes.length > (MEDIA_LIMITS[media.type] ?? MEDIA_LIMITS.image)) throw mediaError(`media too large (${bytes.length} bytes)`);
+        const mimeType = media.mime ?? response.headers.get('content-type')?.split(';')[0] ?? (media.type === 'video' ? 'video/mp4' : 'image/jpeg');
+        let id;
+        try {
+            id = await whatsapp.uploadMedia({ bytes, mimeType, filename: media.url.split('?')[0].split('/').pop() || 'media' });
+        } catch (error) {
+            if (error.retryable) throw error;
+            throw mediaError(`media upload: ${error.message}`);
+        }
+        store.cacheMedia(media.url, id);
+        return id;
+    }
+
+    /** The media to send for this mode: by link, as an uploaded id, or none. */
+    async function resolveMedia(row, mode) {
+        const media = row.message.media;
+        if (!media?.url || mode >= MEDIA_NONE) return null;
+        if (mode === MEDIA_LINK) return { type: media.type, link: media.url };
+        return { type: media.type, id: await uploadMedia(row, media) };
+    }
+
+    /** Sends one row with its media sent the given way. */
+    async function sendRow(row, windowOpen, mode) {
+        let message = materialize(row);
+        let template = row.template;
+        const withMedia = row.message.media?.url && mode < MEDIA_NONE;
+        if (row.message.media?.url && !withMedia) {
+            // Without its media: the project's fallback text and template (a template with a media header needs one).
+            if (row.message.withoutMedia !== undefined) message = { ...message, text: row.message.withoutMedia };
+            if (template?.header) template = template.withoutMedia ?? null;
+            if (!message.text && !message.buttons?.length) return null;
+        }
+        const media = await resolveMedia(row, mode);
+        const templateMedia = template?.header ? media : null;
+        if (template && !windowOpen) return whatsapp.send(toTemplatePayload(row.recipient, template, message.buttons, templateMedia));
+        try {
+            return await whatsapp.send(toPayload(row.recipient, message, media));
+        } catch (error) {
+            if (error.code !== OUTSIDE_WINDOW || !template) throw error;
+            return whatsapp.send(toTemplatePayload(row.recipient, template, message.buttons, templateMedia));
+        }
+    }
+
     async function deliver(row) {
-        const message = materialize(row);
         const windowOpen = store.windowOpen(row.recipient);
 
         // Updates and replies are courtesy messages: never pay for or force them.
@@ -224,17 +316,26 @@ export function createEcho({ config, store, whatsapp, log = () => {} }) {
             return;
         }
 
+        let mode = row.media_mode ?? MEDIA_LINK;
         try {
             let waId;
-            if (row.template && !windowOpen) {
-                waId = await whatsapp.send(toTemplatePayload(row.recipient, row.template, message.buttons));
-            } else {
+            for (;;) {
                 try {
-                    waId = await whatsapp.send(toPayload(row.recipient, message));
+                    waId = await sendRow(row, windowOpen, mode);
+                    break;
                 } catch (error) {
-                    if (error.code !== OUTSIDE_WINDOW || !row.template) throw error;
-                    waId = await whatsapp.send(toTemplatePayload(row.recipient, row.template, message.buttons));
+                    const isMediaError = error.media || MEDIA_ERROR_CODES.has(error.code);
+                    if (!isMediaError || !row.message.media?.url || mode >= MEDIA_NONE) throw error;
+                    log('warn', 'media not accepted, trying the next way', row.id, error.message);
+                    // An uploaded id WhatsApp refused may have expired: upload again next time.
+                    if (mode === MEDIA_UPLOAD) store.dropMedia(row.message.media.url);
+                    mode += 1;
+                    store.setMediaMode(row.id, mode);
                 }
+            }
+            if (waId === null) {
+                store.skip(row.id, 'nothing to send without its media');
+                return;
             }
             store.markSent(row.id, waId);
             log('info', 'sent', row.kind, row.id);
@@ -284,6 +385,12 @@ export function createEcho({ config, store, whatsapp, log = () => {} }) {
         const row = store.outboxByWaId(status.id);
         // A failure is final; a late "read" does not undo it.
         if (!row || row.status === 'failed') return;
+        if (status.status === 'failed' && MEDIA_ERROR_CODES.has(Number(status.code)) && row.message.media?.url && (row.media_mode ?? 0) < MEDIA_NONE) {
+            // Meta accepted the message but could not fetch its media: send it again, uploaded (or without media).
+            if ((row.media_mode ?? 0) === MEDIA_UPLOAD) store.dropMedia(row.message.media.url);
+            store.retryMedia(row.id, (row.media_mode ?? 0) + 1, status.error);
+            return;
+        }
         if (status.status === 'failed') {
             store.setStatusByWaId(status.id, 'failed', status.error ?? 'WhatsApp mesajı teslim edemedi.');
             return;

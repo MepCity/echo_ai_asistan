@@ -70,6 +70,121 @@ const toTime = (value) => {
     return Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(value) ? value : `${value.replace(' ', 'T')}Z`);
 };
 
+const HOUR_MS = 60 * 60_000;
+const DAY_MS = 24 * HOUR_MS;
+const VIDEO_HEADER_LIMIT = 16 * 1024 * 1024;
+const MORE_IMAGES = 4;
+
+/**
+ * The template names of a project. `approval` / `feedback` name the text
+ * templates; the media variants default to "<name>_gorsel" / "<name>_video"
+ * and the other templates to their standard names once `approval` (or
+ * `feedback`) is set. A key set to null or "" turns that template off.
+ */
+export function templateNames(templates = {}) {
+    const t = templates ?? {};
+    const on = Boolean(t.approval || t.feedback);
+    const pick = (key, fallback) => (t[key] !== undefined ? t[key] || null : (on && fallback) || null);
+    return {
+        language: t.language ?? 'tr',
+        approval: t.approval || null,
+        approvalImage: pick('approvalImage', t.approval && `${t.approval}_gorsel`),
+        approvalVideo: pick('approvalVideo', t.approval && `${t.approval}_video`),
+        feedback: t.feedback || null,
+        feedbackImage: pick('feedbackImage', t.feedback && `${t.feedback}_gorsel`),
+        feedbackVideo: pick('feedbackVideo', t.feedback && `${t.feedback}_video`),
+        alert: pick('alert', 'yayin_hatasi'),
+        reminder: pick('reminder', 'onay_hatirlatma'),
+        digest: pick('digest', 'gunluk_ozet'),
+    };
+}
+
+const extension = (url) => (String(url ?? '').split('?')[0].match(/\.([A-Za-z0-9]+)$/)?.[1] ?? '').toLowerCase();
+
+/** image / video / document / null, the way TryPost classifies: the stored type, then the MIME type, then the path. */
+function mediaType(item) {
+    if (item.type) return item.type;
+    const mime = String(item.mime_type ?? '');
+    if (mime.startsWith('image/')) return 'image';
+    if (mime.startsWith('video/')) return 'video';
+    const ext = extension(item.path ?? item.url);
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic'].includes(ext)) return 'image';
+    if (['mp4', 'mov', '3gp', 'webm'].includes(ext)) return 'video';
+    return mime ? 'document' : null;
+}
+
+// WhatsApp takes JPEG/PNG images and MP4/3GPP videos.
+const imageOk = (item) => (item.mime_type ? /^image\/(jpe?g|png)$/i.test(item.mime_type) : ['jpg', 'jpeg', 'png'].includes(extension(item.path ?? item.url)));
+const videoOk = (item) => (item.mime_type ? /^video\/(mp4|3gpp)$/i.test(item.mime_type) : ['mp4', '3gp', ''].includes(extension(item.path ?? item.url)));
+
+/**
+ * What of a post's media goes into a WhatsApp request: its first media as the
+ * header (a JPEG/PNG image, or an MP4 video of at most 16 MB or of unknown
+ * size), the next images (at most 4, sent before the request inside the
+ * window), and a line for media that cannot be shown ("🎞 Video panelde").
+ * TryPost stores absolute public URLs (Storage::url of the public disk or a
+ * public bucket); a relative one is resolved against the panel's URL.
+ */
+export function pickMedia(post, publicUrl = '') {
+    const absolute = (url) => {
+        if (!url) return null;
+        if (/^https?:\/\//i.test(url)) return url;
+        if (url.startsWith('/') && /^https?:\/\//i.test(publicUrl)) return `${publicUrl.replace(/\/$/, '')}${url}`;
+        return null;
+    };
+    const items = (post.media ?? []).filter((item) => item && typeof item === 'object');
+    const describe = (item, type) => ({
+        type,
+        url: absolute(item.url),
+        mime: item.mime_type ?? null,
+        size: Number.isFinite(Number(item.size)) && item.size !== null ? Number(item.size) : null,
+    });
+    const first = items[0];
+    const none = { header: null, missing: null, extras: [] };
+    if (!first) return none;
+    const type = mediaType(first);
+    if (type === 'image') {
+        const header = describe(first, 'image');
+        if (!header.url || !imageOk(first)) return { ...none, missing: '🖼 Görsel panelde' };
+        const extras = items
+            .slice(1)
+            .filter((item) => mediaType(item) === 'image' && imageOk(item) && absolute(item.url))
+            .slice(0, MORE_IMAGES)
+            .map((item) => describe(item, 'image'));
+        return { header, missing: null, extras };
+    }
+    if (type === 'video') {
+        const header = describe(first, 'video');
+        const fits = header.size === null || header.size <= VIDEO_HEADER_LIMIT;
+        if (!header.url || !videoOk(first) || !fits) return { ...none, missing: '🎞 Video panelde' };
+        return { header, missing: null, extras: [] };
+    }
+    return none;
+}
+
+/** Date and time parts of a moment in a time zone. */
+export function localParts(ms, timeZone) {
+    const parts = Object.fromEntries(
+        new Intl.DateTimeFormat('en-CA', {
+            timeZone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            hourCycle: 'h23',
+        })
+            .formatToParts(new Date(ms))
+            .map((part) => [part.type, part.value]),
+    );
+    return {
+        date: `${parts.year}-${parts.month}-${parts.day}`,
+        minutes: Number(parts.hour) * 60 + Number(parts.minute),
+        hhmm: `${parts.hour}:${parts.minute}`,
+        dayMonth: `${parts.day}.${parts.month}`,
+    };
+}
+
 const REQUEST_ID = /^[A-Za-z0-9:._-]{1,100}$/;
 const idPart = (value, length) => String(value ?? '').replace(/[^A-Za-z0-9._]/g, '_').slice(0, length) || 'x';
 
@@ -94,6 +209,9 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
     const memberByUserId = (id) => members.find((member) => member.userId && member.userId === id) ?? null;
     const memberByPhone = (phone) => members.find((member) => member.person.phone === phone) ?? null;
     const can = (member, role) => Boolean(member?.roles.includes(role));
+    const names = templateNames(project.templates);
+    const unique = (list) => list.filter(Boolean).filter((member, index, all) => all.indexOf(member) === index);
+    let lastReminderScan = -Infinity;
 
     async function api(method, path, body) {
         let response;
@@ -157,10 +275,15 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
     const link = (post) => `${project.publicUrl.replace(/\/$/, '')}/schedule?edit=${post.id}`;
     const nameOf = (user) => memberByUserId(user?.id)?.person.name ?? user?.name ?? 'Bir ekip üyesi';
 
-    function requestMessage(kind, post, { requesterName, note }) {
-        const header = kind === 'approval' ? '📝 *Onayını bekleyen gönderi*' : '👀 *Görüşünü bekleyen içerik*';
-        const lines = [
-            header,
+    function requestMessage(kind, post, { requesterName, note, reminder = false }) {
+        const { header, missing, extras } = pickMedia(post, project.publicUrl);
+        const title = reminder
+            ? '⏰ *Hatırlatma: onayını bekleyen gönderi*'
+            : kind === 'approval'
+              ? '📝 *Onayını bekleyen gönderi*'
+              : '👀 *Görüşünü bekleyen içerik*';
+        const body = (mediaLine) => [
+            title,
             `Proje: ${project.name}`,
             `Kanal: ${channel(post)}`,
             `${kind === 'approval' ? 'Onay isteyen' : 'Görüş isteyen'}: ${requesterName}`,
@@ -168,10 +291,12 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
             ...(note ? [`Not: ${note}`] : []),
             '',
             excerpt(post.content, 600),
+            ...(mediaLine ? ['', mediaLine] : []),
             '',
             `Panelde aç: ${link(post)}`,
             'Yorum yazmak için bu mesajı yanıtlayabilirsin.',
-        ];
+        ].join('\n');
+        const unshown = header?.type === 'video' ? '🎞 Video panelde' : '🖼 Görsel panelde';
         const buttons =
             kind === 'approval'
                 ? [
@@ -184,26 +309,56 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
                       { action: 'revise', title: 'Revize gerekli' },
                       { action: 'comment', title: 'Yorum yaz' },
                   ];
-        const templateName = project.templates?.[kind];
-        const template = templateName
-            ? {
-                  name: templateName,
-                  language: project.templates.language ?? 'tr',
-                  // Template body: {{1}} project, {{2}} requester, {{3}} channel, {{4}} time, {{5}} excerpt
-                  params: [project.name, requesterName, channel(post), when(post.scheduled_at), excerpt(post.content, 250)],
-              }
-            : null;
-        return { message: { text: lines.join('\n'), buttons }, template };
+        const message = {
+            text: body(missing ?? (extras.length ? `🖼 1/${extras.length + 1}` : null)),
+            buttons,
+            ...(header ? { media: header, withoutMedia: body(unshown) } : {}),
+        };
+
+        const language = names.language;
+        // A template parameter is one line: a missing media is said before the excerpt.
+        const withLine = (params, line) => (line ? [...params.slice(0, -1), `${line} · ${params.at(-1)}`] : params);
+        let template = null;
+        if (reminder && names.reminder) {
+            // Template body: {{1}} channel, {{2}} time, {{3}} excerpt
+            const params = [channel(post), when(post.scheduled_at), excerpt(post.content, 250)];
+            // No media header in this template: say where the media is.
+            template = { name: names.reminder, language, params: withLine(params, missing ?? (header ? unshown : null)) };
+        } else if (names[kind]) {
+            // Template body: {{1}} project, {{2}} requester, {{3}} channel, {{4}} time, {{5}} excerpt
+            const params = [project.name, requesterName, channel(post), when(post.scheduled_at), excerpt(post.content, 250)];
+            const text = { name: names[kind], language, params: withLine(params, missing) };
+            const variant = header && names[`${kind}${header.type === 'video' ? 'Video' : 'Image'}`];
+            if (variant) {
+                template = { name: variant, language, params, header: { type: header.type }, withoutMedia: { ...text, params: withLine(params, unshown) } };
+            } else {
+                template = header ? { ...text, params: withLine(params, unshown) } : text;
+            }
+        }
+        return { message, template, extras };
     }
 
-    function queueRequest(echo, kind, post, member, { requesterName, note = null, dedupeKey }) {
-        const { message, template } = requestMessage(kind, post, { requesterName, note });
+    function queueRequest(echo, kind, post, member, { requesterName, note = null, dedupeKey, reminder = false, moreImages = !reminder }) {
+        const { message, template, extras } = requestMessage(kind, post, { requesterName, note, reminder });
+        // The other images go first, as plain image messages, only inside the window (outside it only the template goes).
+        if (moreImages) {
+            extras.forEach((media, index) => {
+                echo.enqueue({
+                    project: project.id,
+                    itemId: post.id,
+                    kind: 'media',
+                    person: member.person,
+                    message: { text: `${index + 2}/${extras.length + 1}`, media, onlyInWindow: true },
+                    dedupeKey: `${dedupeKey}:media:${index + 2}`,
+                });
+            });
+        }
         return echo.enqueue({
             project: project.id,
             itemId: post.id,
             kind,
             person: member.person,
-            message: { ...message, requesterName, note },
+            message: { ...message, requesterName, note, scheduledAt: post.scheduled_at ?? null, ...(reminder ? { reminder: true } : {}) },
             template,
             fingerprint: versionTag(post),
             dedupeKey,

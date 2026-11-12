@@ -2,6 +2,8 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 
 /** WhatsApp error codes. https://developers.facebook.com/docs/whatsapp/cloud-api/support/error-codes */
 export const OUTSIDE_WINDOW = 131047; // re-engagement: more than 24h since the person wrote
+/** Meta could not fetch or process the media of a message (bad link, unreachable, unsupported, too large). */
+export const MEDIA_ERROR_CODES = new Set([131052, 131053]);
 const RETRYABLE_CODES = new Set([1, 2, 4, 17, 341, 80007, 130429, 131000, 131016, 131048, 131056, 133004]);
 
 export class WhatsAppError extends Error {
@@ -23,15 +25,14 @@ export function verifySignature(appSecret, rawBody, header) {
 }
 
 export function createWhatsAppClient(config, fetchImpl = globalThis.fetch) {
-    const url = `${config.graphUrl}/${config.graphVersion}/${config.phoneNumberId}/messages`;
+    const base = `${config.graphUrl}/${config.graphVersion}/${config.phoneNumberId}`;
 
-    async function send(payload) {
+    async function call(path, init) {
         let response;
         try {
-            response = await fetchImpl(url, {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${config.accessToken}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ messaging_product: 'whatsapp', ...payload }),
+            response = await fetchImpl(`${base}/${path}`, {
+                ...init,
+                headers: { Authorization: `Bearer ${config.accessToken}`, ...(init.headers ?? {}) },
             });
         } catch (error) {
             throw new WhatsAppError(`network: ${error.message}`, { retryable: true });
@@ -46,20 +47,46 @@ export function createWhatsAppClient(config, fetchImpl = globalThis.fetch) {
                 retryable,
             });
         }
+        return json;
+    }
+
+    async function send(payload) {
+        const json = await call('messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messaging_product: 'whatsapp', ...payload }),
+        });
         const id = json?.messages?.[0]?.id;
         if (!id) throw new WhatsAppError('WhatsApp accepted the request but returned no message id', { retryable: true });
         return id;
     }
 
-    return { send };
+    /** Uploads a file to WhatsApp (POST /{phone-number-id}/media); returns its media id (valid for 30 days). */
+    async function uploadMedia({ bytes, mimeType, filename = 'media' }) {
+        const form = new FormData();
+        form.append('messaging_product', 'whatsapp');
+        form.append('type', mimeType);
+        form.append('file', new Blob([bytes], { type: mimeType }), filename);
+        const json = await call('media', { method: 'POST', body: form });
+        if (!json?.id) throw new WhatsAppError('WhatsApp accepted the upload but returned no media id', { retryable: true });
+        return json.id;
+    }
+
+    return { send, uploadMedia };
 }
+
+/** A resolved media: { type: 'image' | 'video', link } or { type, id } (an uploaded media id). */
+const mediaObject = (media, extra = {}) => ({ ...(media.id ? { id: media.id } : { link: media.link }), ...extra });
 
 /**
  * Builds the API payload for one of Echo's messages. Messages are stored in a
- * channel-neutral shape: { text, buttons?: [{ id, title }], replyTo? }.
+ * channel-neutral shape: { text, buttons?: [{ id, title }], cta?: { title, url }, replyTo? }.
+ * `media` (resolved) becomes the header of an interactive message, or a plain
+ * image/video message with the text as caption when there is nothing to tap.
  */
-export function toPayload(to, message) {
+export function toPayload(to, message, media = null) {
     const context = message.replyTo ? { context: { message_id: message.replyTo } } : {};
+    const header = media ? { header: { type: media.type, [media.type]: mediaObject(media) } } : {};
     if (message.buttons?.length) {
         return {
             to,
@@ -67,6 +94,7 @@ export function toPayload(to, message) {
             ...context,
             interactive: {
                 type: 'button',
+                ...header,
                 body: { text: truncate(message.text, 1024) },
                 action: {
                     buttons: message.buttons.slice(0, 3).map((button) => ({
@@ -77,11 +105,32 @@ export function toPayload(to, message) {
             },
         };
     }
+    if (message.cta?.url) {
+        return {
+            to,
+            type: 'interactive',
+            ...context,
+            interactive: {
+                type: 'cta_url',
+                ...header,
+                body: { text: truncate(message.text, 1024) },
+                action: { name: 'cta_url', parameters: { display_text: truncate(message.cta.title, 20), url: message.cta.url } },
+            },
+        };
+    }
+    if (media) {
+        const caption = message.text ? { caption: truncate(message.text, 1024) } : {};
+        return { to, type: media.type, ...context, [media.type]: mediaObject(media, caption) };
+    }
     return { to, type: 'text', ...context, text: { body: truncate(message.text, 4096), preview_url: false } };
 }
 
-/** Template message; quick-reply buttons carry the same ids as the interactive buttons. */
-export function toTemplatePayload(to, template, buttons = []) {
+/**
+ * Template message; quick-reply buttons carry the same ids as the interactive
+ * buttons. `template.urlButton` ({ index, suffix }) fills a URL button's
+ * dynamic part; `media` (resolved) fills an IMAGE/VIDEO header.
+ */
+export function toTemplatePayload(to, template, buttons = [], media = null) {
     const param = (text) => ({ type: 'text', text: truncate(String(text).replace(/\s+/g, ' ').trim() || '-', 900) });
     return {
         to,
@@ -90,6 +139,7 @@ export function toTemplatePayload(to, template, buttons = []) {
             name: template.name,
             language: { code: template.language ?? 'tr' },
             components: [
+                ...(media ? [{ type: 'header', parameters: [{ type: media.type, [media.type]: mediaObject(media) }] }] : []),
                 ...(template.params?.length ? [{ type: 'body', parameters: template.params.map(param) }] : []),
                 ...buttons.slice(0, 3).map((button, index) => ({
                     type: 'button',
@@ -97,6 +147,14 @@ export function toTemplatePayload(to, template, buttons = []) {
                     index: String(index),
                     parameters: [{ type: 'payload', payload: button.id }],
                 })),
+                ...(template.urlButton
+                    ? [{
+                          type: 'button',
+                          sub_type: 'url',
+                          index: String(template.urlButton.index ?? 0),
+                          parameters: [{ type: 'text', text: template.urlButton.suffix }],
+                      }]
+                    : []),
             ],
         },
     };
@@ -125,6 +183,7 @@ export function parseWebhook(body) {
                     id: status.id,
                     status: status.status,
                     recipient: status.recipient_id,
+                    code: status.errors?.[0]?.code ?? null,
                     error: status.errors?.[0] ? `${status.errors[0].code}: ${status.errors[0].title ?? status.errors[0].message ?? ''}` : null,
                 });
             }
