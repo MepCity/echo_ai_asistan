@@ -10,7 +10,6 @@ import sys
 import yaml
 
 TRYPOST_MCP_URL = "https://sosyal.marmaraai.com/mcp/trypost"
-DEFAULT_MODEL = "gpt-5.5"
 
 # TryPost tools Hermes never gets: API keys and webhooks (Echo's own webhook lives there).
 # Tool names are TryPost's MCP names (kebab-case class names, see app/Mcp/Tools in TryPost).
@@ -53,12 +52,14 @@ def main(path):
     if not isinstance(config, dict):
         sys.exit(f"{path} is not a YAML mapping")
 
-    model = config.get("model") if isinstance(config.get("model"), dict) else {}
-    config["model"] = model
-    if model.get("provider") != "openai-codex":
+    # The model is the user's choice (`hermes.sh model`); only a fresh install gets the
+    # provider. No model name is set: which ones a ChatGPT account may use differs, and
+    # Hermes has no default for openai-codex, so setup-hermes.sh asks the user to pick one.
+    model = config.get("model")
+    if not model:
+        config["model"] = {"provider": "openai-codex"}
+    elif isinstance(model, dict) and not model.get("provider") and not model.get("default"):
         model["provider"] = "openai-codex"
-        model["default"] = DEFAULT_MODEL
-    model.setdefault("default", DEFAULT_MODEL)
 
     servers = config.get("mcp_servers")
     if not isinstance(servers, dict):

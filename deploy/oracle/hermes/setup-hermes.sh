@@ -97,7 +97,7 @@ else
   echo "SOUL.md senin duzenledigin haliyle birakildi."
 fi
 python3 -I "$HERE/configure.py" "$DATA/config.yaml"
-echo "config.yaml: model openai-codex, TryPost MCP (OAuth, yazma araclari onayli), riskli araclar kapali."
+echo "config.yaml: saglayici openai-codex (secilen model korunur), TryPost MCP (OAuth, yazma araclari onayli), riskli araclar kapali."
 
 # --- Start Hermes -----------------------------------------------------------------------------
 say "Hermes imaji indiriliyor ve baslatiliyor (ilk sefer birkac dakika surebilir)"
@@ -132,7 +132,17 @@ if [ -z "$SKIP_LOGIN" ]; then
   "cihaz kodu ile yetkilendirme" secenegini acip tekrar dene.
 
 EOF
-    hermes auth add openai-codex || echo "UYARI: Codex girisi tamamlanmadi; sonra tekrar: bash $HERE/hermes.sh auth add openai-codex"
+    if hermes auth add openai-codex; then
+      cat <<EOF
+
+  Codex girisi tamam. Simdi ChatGPT hesabinin kullanabildigi bir model sec:
+    bash $HERE/hermes.sh model
+  (Model secilmeden Hermes cevap veremez. Secimin bu kurulum tekrar calistiginda korunur.)
+
+EOF
+    else
+      echo "UYARI: Codex girisi tamamlanmadi; sonra tekrar: bash $HERE/hermes.sh auth add openai-codex"
+    fi
   fi
 
   mcp_default=E

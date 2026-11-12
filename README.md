@@ -183,7 +183,9 @@ yanıtlayan mesajlar, "iptal") kendisi işler. Bunların dışındaki her mesaj�
 sohbet, sesli mesaj, fotoğraf) aynı VM'de çalışan Hermes Agent'a iletir; Hermes aynı
 numaradan cevap verir. Hermes `hermes` adlı docker compose servisidir, dışarıya port
 açmaz; Echo ona `http://hermes:8090/whatsapp/webhook` adresinden, Meta gibi imzalı
-istekle ulaşır. Model: ChatGPT aboneliğinle OpenAI Codex. TryPost'a MCP ile bağlanır
+istekle ulaşır. Model: ChatGPT aboneliğinle OpenAI Codex; modeli Codex girişinden sonra
+`bash /opt/echo/app/deploy/oracle/hermes/hermes.sh model` ile sen seçersin (kurulum
+scripti seçimini değiştirmez). TryPost'a MCP ile bağlanır
 (https://sosyal.marmaraai.com/mcp/trypost). Kimliği (Türkçe, kısa, "Echo AI Asistan")
 `/opt/hermes/data/SOUL.md` dosyasındadır.
 
@@ -201,6 +203,7 @@ girişi senin onayınla yaptırır:
 
 1. **OpenAI Codex (cihaz kodu):** ekranda bir adres ve kod çıkar. Adresi tarayıcıda aç,
    ChatGPT hesabınla giriş yap, kodu gir, onayla. Pencere kendiliğinden devam eder.
+   Sonra hesabının kullanabildiği modeli seç: `bash /opt/echo/app/deploy/oracle/hermes/hermes.sh model`.
 2. **TryPost (OAuth):** TryPost'un MCP sunucusu API anahtarını kabul etmez, tek seferlik
    OAuth onayı ister. Ekrandaki "authorize" adresini aç, sosyal.marmaraai.com'a giriş
    yap, izin ver. Tarayıcı `http://127.0.0.1:.../callback?code=...` adresinde "bağlantı
