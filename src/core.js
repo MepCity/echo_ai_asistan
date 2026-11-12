@@ -1,5 +1,5 @@
 import { createAssistant } from './assistant.js';
-import { normalizePhone } from './config.js';
+import { normalizePhone, normalizeUsername } from './config.js';
 import { MEDIA_ERROR_CODES, OUTSIDE_WINDOW, toPayload, toTemplatePayload } from './whatsapp.js';
 
 const BACKOFF_MS = [30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
@@ -61,6 +61,8 @@ const CANCEL = /^\s*(iptal|vazgeç|vazgec)\s*$/i;
 export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl = globalThis.fetch }) {
     const adapters = new Map();
     const people = new Map(config.people.map((person) => [person.phone, person]));
+    const peopleByUserId = new Map(config.people.filter((person) => person.whatsappUserId).map((person) => [person.whatsappUserId, person]));
+    const peopleByUsername = new Map(config.people.filter((person) => person.whatsappUsername).map((person) => [person.whatsappUsername, person]));
     const assistant = config.assistant
         ? createAssistant(config.assistant, { phoneNumberId: config.whatsapp.phoneNumberId, fetchImpl })
         : null;
@@ -151,10 +153,16 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
                 for (const status of statuses) onStatus(status);
                 for (const message of messages) {
                     const phone = normalizePhone(message.from);
-                    const person = people.get(phone);
+                    const keys = `keys=${Object.keys(message.raw ?? message).join(',')}`;
+                    if (!phone) log('info', 'message without a phone number', `user=${maskUserId(message.userId)}`, keys);
+                    const person = findSender(phone, message);
                     if (!person) {
-                        log('warn', 'message from an unknown number ignored', maskPhone(phone));
+                        log('warn', 'message from an unknown number ignored', maskPhone(phone) || '-', `user=${maskUserId(message.userId)}`, `username=${message.username ? 'yes' : 'no'}`, keys);
                         continue;
+                    }
+                    // Seen together with a known number: a later message with only this BSUID finds the person too.
+                    if (phone && message.userId && people.get(phone) === person && store.learnUserId(String(message.userId), phone)) {
+                        log('info', 'learned the WhatsApp user id of', person.id);
                     }
                     // A retried Meta webhook finds the id already stored and adds nothing.
                     if (store.receive(message, person.phone)) store.touchWindow(person.phone);
@@ -167,6 +175,22 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
             await echo.tick();
         },
     };
+
+    /**
+     * The person a message is from: by phone number; without a known one (a
+     * user with a username may come with only a BSUID) by the configured
+     * user id, the user id seen earlier with their number, or the username.
+     */
+    function findSender(phone, message) {
+        if (phone && people.has(phone)) return people.get(phone);
+        const userId = message.userId ? String(message.userId) : null;
+        if (userId) {
+            const person = peopleByUserId.get(userId) ?? people.get(store.phoneForUserId(userId) ?? '');
+            if (person) return person;
+        }
+        const username = normalizeUsername(message.username);
+        return (username && peopleByUsername.get(username)) || null;
+    }
 
     async function processInbox() {
         store.recoverInbox(5 * 60_000);
@@ -411,7 +435,8 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
         const row = store.outboxByWaId(status.id);
         if (!row) {
             // Not one of Echo's messages: the assistant sent it (to one of our people).
-            if (assistant && people.has(normalizePhone(status.recipient))) store.queueForward(status, `status:${status.id}:${status.status}`);
+            const known = people.has(normalizePhone(status.recipient)) || Boolean(status.recipientUserId && findSender('', { userId: status.recipientUserId }));
+            if (assistant && known) store.queueForward(status, `status:${status.id}:${status.status}`);
             return;
         }
         // A failure is final; a late "read" does not undo it.
@@ -521,6 +546,14 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
     }
 
     return echo;
+}
+
+/** Keeps the country prefix and the last 3 characters of a BSUID: TR.123456789 -> TR.******789. */
+function maskUserId(userId) {
+    if (!userId) return '-';
+    const value = String(userId);
+    const head = value.indexOf('.') + 1;
+    return value.slice(0, head) + '*'.repeat(Math.max(value.length - head - 3, 0)) + value.slice(-3);
 }
 
 /** Keeps the country/operator prefix and the last 3 digits: 905326223863 -> 90532****863. */

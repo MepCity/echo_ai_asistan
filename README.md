@@ -229,7 +229,13 @@ token'ları yeniden kopyalanır).
 
 **İzinli numara eklemek:** iki yerde olmalı. (1) Echo: `/opt/echo/config.json` içindeki
 `people` listesine `{ "id": "ad", "name": "Ad", "phone": "905xxxxxxxxx" }` ekle (Echo
-bilinmeyen numaraları Hermes'e hiç iletmez). (2) Hermes: `/opt/hermes/data/.env`
+bilinmeyen numaraları Hermes'e hiç iletmez). İsteğe bağlı: `"whatsappUsername": "kullaniciadi"`
+(WhatsApp kullanıcı adı, büyük/küçük harf ve `@` fark etmez) ve `"whatsappUserId": "TR.…"`
+(Meta'nın BSUID'si). Kullanıcı adı olan biri Meta'nın webhook'unda numarasız (yalnızca
+`from_user_id` / `contacts[].user_id` ile) gelebilir; Echo onu bu alanlarla ya da daha önce
+numarasıyla birlikte gördüğü BSUID ile (SQLite `user_ids`) tanır ve Hermes'e iletirken
+numarasını `from` ve `wa_id` alanlarına koyar. Numarası olmayan kişiye BSUID'ye
+(`recipient` alanı) yazılır. (2) Hermes: `/opt/hermes/data/.env`
 içindeki satırı virgülle genişlet: `WHATSAPP_CLOUD_ALLOWED_USERS=905418557902,905xxxxxxxxx`
 (ülke kodu, `+` ve boşluk yok). Sonra `bash /opt/echo/app/deploy/oracle/update.sh`.
 

@@ -11,7 +11,7 @@ import { createEcho } from '../src/core.js';
 import { createStore, openDatabase } from '../src/db.js';
 import { createTryPostProject, fingerprint, sameVersion, versionTag } from '../src/projects/trypost.js';
 import { createHttpServer } from '../src/server.js';
-import { WhatsAppError, parseWebhook, verifySignature } from '../src/whatsapp.js';
+import { WhatsAppError, parseWebhook, toPayload, verifySignature } from '../src/whatsapp.js';
 
 const PHONES = { yasir: '905550000001', ayse: '905550000002', mehmet: '905550000003' };
 
@@ -19,7 +19,7 @@ const baseConfig = (extra = {}) =>
     normalizeConfig({
         ...extra,
         whatsapp: { phoneNumberId: '1', accessToken: 't', appSecret: 'app-secret', verifyToken: 'verify' },
-        people: [
+        people: extra.people ?? [
             { id: 'yasir', name: 'Yasir', phone: `+${PHONES.yasir}` },
             { id: 'ayse', name: 'Ayşe', phone: PHONES.ayse },
             { id: 'mehmet', name: 'Mehmet', phone: PHONES.mehmet },
@@ -1485,5 +1485,94 @@ describe('assistant (Hermes) behind Echo', () => {
         await t.user.say(PHONES.yasir, 'selam');
         assert.equal(hermes.accepted.length, 0);
         assert.match(t.whatsapp.last(PHONES.yasir).text.body, /o mesajı yanıtla/);
+    });
+});
+
+describe('senders without a phone number (WhatsApp usernames, BSUIDs)', () => {
+    const BSUID = 'TR.13491208655302741918';
+    /** A Meta webhook body with one text message; `from`, `from_user_id` and the contact fields only when given. */
+    const metaBody = ({ id, from, userId, waId, contactUserId, username, text = 'selam' }) => ({
+        object: 'whatsapp_business_account',
+        entry: [{
+            id: 'waba-1',
+            changes: [{
+                field: 'messages',
+                value: {
+                    messaging_product: 'whatsapp',
+                    metadata: { display_phone_number: '908500000000', phone_number_id: '1' },
+                    contacts: [{
+                        profile: { name: 'Ayşe K.', ...(username ? { username } : {}) },
+                        ...(waId ? { wa_id: waId } : {}),
+                        ...(contactUserId ? { user_id: contactUserId } : {}),
+                    }],
+                    messages: [{ ...(from ? { from } : {}), ...(userId ? { from_user_id: userId } : {}), id, timestamp: '1762862400', type: 'text', text: { body: text } }],
+                },
+            }],
+        }],
+    });
+    const receive = (t, fields) => t.echo.handleWebhook(parseWebhook(metaBody(fields)));
+
+    it('takes the number from contacts[].wa_id when the message has no `from`', async () => {
+        const t = setup();
+        const parsed = parseWebhook(metaBody({ id: 'm1', waId: PHONES.ayse, userId: BSUID, contactUserId: BSUID }));
+        assert.equal(parsed.messages[0].from, PHONES.ayse);
+        assert.equal(parsed.messages[0].userId, BSUID);
+        await t.echo.handleWebhook(parsed);
+        assert.equal(t.store.inbox('m1').phone, PHONES.ayse);
+        assert.match(t.whatsapp.last(PHONES.ayse).text.body, /o mesajı yanıtla/);
+    });
+
+    it('learns the BSUID seen with a known number and finds the person by it later', async () => {
+        const t = setup();
+        await receive(t, { id: 'm1', from: PHONES.ayse, waId: PHONES.ayse, userId: BSUID, contactUserId: BSUID });
+        assert.equal(t.store.phoneForUserId(BSUID), PHONES.ayse);
+        await receive(t, { id: 'm2', userId: BSUID, contactUserId: BSUID, username: 'ayse.k' });
+        assert.equal(t.store.inbox('m2').phone, PHONES.ayse);
+        assert.equal(t.whatsapp.to(PHONES.ayse).length, 2); // replies still go to the number
+        assert.ok(t.logs.some((entry) => entry[0] === 'info' && /without a phone number/.test(entry[1])));
+    });
+
+    it('finds people by a configured whatsappUserId or whatsappUsername, and writes to a BSUID with `recipient`', async () => {
+        const t = setup({
+            people: [
+                { id: 'yasir', name: 'Yasir', phone: PHONES.yasir, whatsappUsername: '@HasanVural1' },
+                { id: 'ayse', name: 'Ayşe', whatsappUserId: BSUID },
+                { id: 'mehmet', name: 'Mehmet', phone: PHONES.mehmet },
+            ],
+        });
+        await receive(t, { id: 'm1', userId: 'TR.999000111222', contactUserId: 'TR.999000111222', username: 'hasanvural1' });
+        assert.equal(t.store.inbox('m1').phone, PHONES.yasir);
+        await receive(t, { id: 'm2', userId: BSUID, contactUserId: BSUID });
+        assert.equal(t.store.inbox('m2').phone, BSUID);
+        const reply = t.whatsapp.sent.find((message) => message.recipient === BSUID);
+        assert.ok(reply && reply.to === undefined);
+        assert.deepEqual(Object.keys(toPayload(PHONES.yasir, { text: 'x' })).slice(0, 1), ['to']);
+    });
+
+    it('logs which identifiers an ignored message carried, never its text', async () => {
+        const t = setup();
+        await receive(t, { id: 'm1', userId: 'TR.555666777888', contactUserId: 'TR.555666777888', text: 'gizli metin' });
+        const entry = t.logs.find((line) => line[0] === 'warn' && /unknown number/.test(line[1]));
+        assert.deepEqual(entry.slice(2), ['-', 'user=TR.*********888', 'username=no', 'keys=from_user_id,id,timestamp,type,text']);
+        assert.ok(!JSON.stringify(t.logs).includes('gizli metin'));
+        assert.equal(t.store.inbox('m1'), null);
+    });
+
+    it('gives Hermes the resolved number in `from` and `wa_id` when Meta left it out', async () => {
+        const hermes = await fakeHermes();
+        try {
+            const t = setup({ assistant: { url: hermes.url } });
+            t.store.learnUserId(BSUID, PHONES.ayse);
+            await receive(t, { id: 'm1', userId: BSUID, contactUserId: BSUID, username: 'ayse.k', text: 'merhaba' });
+            const value = hermes.accepted[0].entry[0].changes[0].value;
+            assert.equal(value.messages[0].from, PHONES.ayse);
+            assert.equal(value.messages[0].from_user_id, BSUID);
+            assert.deepEqual(value.contacts[0], { profile: { name: 'Ayşe K.', username: 'ayse.k' }, user_id: BSUID, wa_id: PHONES.ayse });
+            // A status of Hermes' message addressed by BSUID only is still forwarded.
+            await t.echo.handleWebhook({ messages: [], statuses: [{ id: 'wamid.h1', status: 'read', recipient: null, recipientUserId: BSUID }] });
+            assert.equal(hermes.statuses().length, 1);
+        } finally {
+            await hermes.close();
+        }
     });
 });

@@ -1,5 +1,5 @@
 {
-  "_DUZENLE": "Duzenleme gerekmez: ${...} degerleri /opt/echo/.env dosyasindan gelir (install.sh sorar). Yeni kisi eklemek icin people ve members listesine ekle.",
+  "_DUZENLE": "Duzenleme gerekmez: ${...} degerleri /opt/echo/.env dosyasindan gelir (install.sh sorar). Yeni kisi eklemek icin people ve members listesine ekle. Kisi alanlari: id, name, phone (ulke koduyla, + yok); istege bagli whatsappUsername (WhatsApp kullanici adi, @ olmadan da olur) ve whatsappUserId (Meta BSUID, or. TR.1234...). Kullanici adi olan kisiler numarasiz yazabilir; Echo onlari bu alanlarla ya da daha once numarayla birlikte gordugu BSUID ile tanir.",
   "publicUrl": "https://${ECHO_HOST}",
   "timeZone": "Europe/Istanbul",
   "whatsapp": {
@@ -12,7 +12,8 @@
     {
       "id": "yasir",
       "name": "Yasir",
-      "phone": "905418557902"
+      "phone": "905418557902",
+      "whatsappUsername": ""
     }
   ],
   "projects": [

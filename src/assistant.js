@@ -1,4 +1,5 @@
 import { createHmac } from 'node:crypto';
+import { isUserId } from './whatsapp.js';
 
 /**
  * The conversational assistant behind Echo (Hermes Agent's WhatsApp Cloud
@@ -32,10 +33,19 @@ export function createAssistant(config, { phoneNumberId, fetchImpl = globalThis.
         throw Object.assign(new Error(`assistant: HTTP ${response.status}`), { retryable });
     }
 
-    /** One stored inbound message (see parseWebhook), as the webhook Meta sent it. */
+    /**
+     * One stored inbound message (see parseWebhook), as the webhook Meta sent it.
+     * Hermes knows people only by phone number (`from`, `contacts[].wa_id`): when
+     * Meta left it out (a user with a username, see whatsapp.js isUserId), Echo
+     * puts in the number of the person it resolved the sender to.
+     */
     function messageBody(message, person) {
-        const contact = message.contact ?? { profile: { name: person?.name ?? '' }, wa_id: message.from };
-        return envelope(message, { contacts: [contact], messages: [rawMessage(message)] });
+        let raw = rawMessage(message);
+        let contact = message.contact ?? { profile: { name: person?.name ?? '' }, wa_id: message.from };
+        const phone = person?.phone && !isUserId(person.phone) ? person.phone : null;
+        if (phone && !raw.from) raw = { ...raw, from: phone };
+        if (phone && !contact.wa_id) contact = { ...contact, wa_id: phone };
+        return envelope(message, { contacts: [contact], messages: [raw] });
     }
 
     /** One delivery status of a message the assistant sent. */

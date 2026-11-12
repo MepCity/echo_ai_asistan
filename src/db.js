@@ -25,6 +25,9 @@ import { DatabaseSync } from 'node:sqlite';
  *              (WhatsApp keeps them 30 days; Echo reuses them for 25)
  * - state:     small named values that must survive restarts (the day each
  *              person last got their digest)
+ * - user_ids:  WhatsApp business-scoped user ids (BSUIDs) seen with a known
+ *              person's phone number, so a later message that carries only
+ *              the BSUID (a user with a username) still finds the person
  * - forwards:  delivery statuses of messages Echo did not send (the assistant
  *              sent them), waiting to be passed on to the assistant; retried
  *              with backoff, removed once it took them
@@ -110,6 +113,12 @@ export function openDatabase(dataDir) {
         CREATE TABLE IF NOT EXISTS state (
             key        TEXT PRIMARY KEY,
             value      TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS user_ids (
+            user_id    TEXT PRIMARY KEY,
+            phone      TEXT NOT NULL,
             updated_at INTEGER NOT NULL
         );
 
@@ -227,6 +236,10 @@ export function createStore(db, now = () => Date.now()) {
         forwardRetry: q(`UPDATE forwards SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ?`),
         forwardFail: q(`UPDATE forwards SET status = 'failed', attempts = attempts + 1, last_error = ?, updated_at = ? WHERE id = ?`),
         forwardStats: q(`SELECT status, COUNT(*) AS count FROM forwards GROUP BY status`),
+        learnUserId: q(`INSERT INTO user_ids (user_id, phone, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET phone = excluded.phone, updated_at = excluded.updated_at
+            WHERE user_ids.phone != excluded.phone`),
+        phoneForUserId: q(`SELECT phone FROM user_ids WHERE user_id = ?`),
     };
 
     const parseInbox = (row) =>
@@ -336,5 +349,8 @@ export function createStore(db, now = () => Date.now()) {
         forwardRetry: (id, delayMs, error) => statements.forwardRetry.run(now() + delayMs, error, now(), id),
         forwardFail: (id, error) => statements.forwardFail.run(error, now(), id),
         forwardStats: () => Object.fromEntries(statements.forwardStats.all().map((row) => [row.status, row.count])),
+        /** Remembers that this BSUID belongs to this phone number. @returns {boolean} true when it was new or changed */
+        learnUserId: (userId, phone) => statements.learnUserId.run(userId, phone, now()).changes === 1,
+        phoneForUserId: (userId) => statements.phoneForUserId.get(userId)?.phone ?? null,
     };
 }

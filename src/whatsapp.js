@@ -75,6 +75,18 @@ export function createWhatsAppClient(config, fetchImpl = globalThis.fetch) {
     return { send, uploadMedia };
 }
 
+/**
+ * A WhatsApp business-scoped user id (BSUID): a two-letter country code, a
+ * period and the id, e.g. "US.13491208655302741918" (a parent BSUID has "ENT."
+ * after the country). Users with a WhatsApp username may reach us with only
+ * this id: Meta then leaves out `messages[].from` and `contacts[].wa_id`.
+ * https://developers.facebook.com/documentation/business-messaging/whatsapp/business-scoped-user-ids
+ */
+export const isUserId = (address) => /^[A-Z]{2}\.[A-Z0-9.]+$/i.test(String(address ?? ''));
+
+/** Who a message goes to: a phone number in `to`, a BSUID in `recipient` (Meta takes `to` when both are set). */
+const addressee = (address) => (isUserId(address) ? { recipient: String(address) } : { to: address });
+
 /** A resolved media: { type: 'image' | 'video', link } or { type, id } (an uploaded media id). */
 const mediaObject = (media, extra = {}) => ({ ...(media.id ? { id: media.id } : { link: media.link }), ...extra });
 
@@ -89,7 +101,7 @@ export function toPayload(to, message, media = null) {
     const header = media ? { header: { type: media.type, [media.type]: mediaObject(media) } } : {};
     if (message.buttons?.length) {
         return {
-            to,
+            ...addressee(to),
             type: 'interactive',
             ...context,
             interactive: {
@@ -107,7 +119,7 @@ export function toPayload(to, message, media = null) {
     }
     if (message.cta?.url) {
         return {
-            to,
+            ...addressee(to),
             type: 'interactive',
             ...context,
             interactive: {
@@ -120,9 +132,9 @@ export function toPayload(to, message, media = null) {
     }
     if (media) {
         const caption = message.text ? { caption: truncate(message.text, 1024) } : {};
-        return { to, type: media.type, ...context, [media.type]: mediaObject(media, caption) };
+        return { ...addressee(to), type: media.type, ...context, [media.type]: mediaObject(media, caption) };
     }
-    return { to, type: 'text', ...context, text: { body: truncate(message.text, 4096), preview_url: false } };
+    return { ...addressee(to), type: 'text', ...context, text: { body: truncate(message.text, 4096), preview_url: false } };
 }
 
 /**
@@ -133,7 +145,7 @@ export function toPayload(to, message, media = null) {
 export function toTemplatePayload(to, template, buttons = [], media = null) {
     const param = (text) => ({ type: 'text', text: truncate(String(text).replace(/\s+/g, ' ').trim() || '-', 900) });
     return {
-        to,
+        ...addressee(to),
         type: 'template',
         template: {
             name: template.name,
@@ -172,17 +184,24 @@ export function parseWebhook(body) {
         for (const change of entry.changes ?? []) {
             const value = change.value ?? {};
             const origin = { metadata: value.metadata ?? null, entryId: entry.id ?? null };
+            const contacts = value.contacts ?? [];
             for (const message of value.messages ?? []) {
+                // A sender with a username may come without a phone number (`from`, `wa_id`), only with a BSUID.
+                const contact =
+                    contacts.find((item) => (message.from && item.wa_id === message.from) || (message.from_user_id && item.user_id === message.from_user_id)) ??
+                    (contacts.length === 1 ? contacts[0] : null);
                 messages.push({
                     id: message.id,
-                    from: message.from,
+                    from: message.from ?? contact?.wa_id ?? null,
+                    userId: message.from_user_id ?? contact?.user_id ?? null,
+                    username: contact?.profile?.username ?? null,
                     type: message.type,
                     text: message.text?.body ?? null,
                     buttonId: message.interactive?.button_reply?.id ?? message.button?.payload ?? null,
                     contextId: message.context?.id ?? null,
                     timestamp: Number(message.timestamp ?? 0) * 1000,
                     raw: message,
-                    contact: (value.contacts ?? []).find((contact) => contact.wa_id === message.from) ?? null,
+                    contact,
                     ...origin,
                 });
             }
@@ -190,7 +209,8 @@ export function parseWebhook(body) {
                 statuses.push({
                     id: status.id,
                     status: status.status,
-                    recipient: status.recipient_id,
+                    recipient: status.recipient_id ?? null,
+                    recipientUserId: status.recipient_user_id ?? null,
                     code: status.errors?.[0]?.code ?? null,
                     error: status.errors?.[0] ? `${status.errors[0].code}: ${status.errors[0].title ?? status.errors[0].message ?? ''}` : null,
                     raw: status,

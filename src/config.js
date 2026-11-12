@@ -10,7 +10,8 @@ import { readFileSync } from 'node:fs';
  *   "publicUrl": "https://echo.example.com",
  *   "whatsapp": { "phoneNumberId": "...", "accessToken": "${WA_ACCESS_TOKEN}",
  *                 "appSecret": "${WA_APP_SECRET}", "verifyToken": "${WA_VERIFY_TOKEN}" },
- *   "people": [ { "id": "yasir", "name": "Yasir", "phone": "905xxxxxxxxx" } ],
+ *   "people": [ { "id": "yasir", "name": "Yasir", "phone": "905xxxxxxxxx",
+ *                 "whatsappUsername": "yasir", "whatsappUserId": "TR.1234..." } ],
  *   "projects": [ { "id": "marmara", "type": "trypost", "name": "Marmara AI Sosyal",
  *                   "apiUrl": "https://sosyal.marmaraai.com/api", "publicUrl": "https://sosyal.marmaraai.com",
  *                   "apiToken": "${TRYPOST_API_TOKEN}", "webhookSecret": "${TRYPOST_WEBHOOK_SECRET}",
@@ -18,6 +19,13 @@ import { readFileSync } from 'node:fs';
  *                   "members": [ { "person": "yasir", "userId": "<TryPost user id>", "roles": ["reviewer", "approver"] } ] } ],
  *   "assistant": { "url": "http://hermes:8090/whatsapp/webhook", "enabled": true }
  * }
+ *
+ * A person needs `phone` or `whatsappUserId`. People with a WhatsApp username
+ * may write with only their business-scoped user id (BSUID) and no phone
+ * number; Echo then finds them by `whatsappUserId` (optional), by
+ * `whatsappUsername` (optional, any case, with or without "@"), or by the
+ * BSUID it saw earlier together with their phone number. A person without a
+ * phone is written to at their BSUID.
  *
  * `assistant` (optional): where messages from known people that Echo does not
  * handle itself are forwarded, as signed WhatsApp webhooks (Hermes Agent's
@@ -46,6 +54,7 @@ function interpolate(value, env) {
 }
 
 export const normalizePhone = (phone) => String(phone ?? '').replace(/\D/g, '');
+export const normalizeUsername = (username) => String(username ?? '').trim().replace(/^@/, '').toLowerCase();
 
 export function normalizeConfig(config) {
     const required = (object, keys, where) => {
@@ -56,8 +65,13 @@ export function normalizeConfig(config) {
     required(config.whatsapp, ['phoneNumberId', 'accessToken', 'appSecret', 'verifyToken'], 'whatsapp');
 
     const people = config.people.map((person) => {
-        required(person, ['id', 'name', 'phone'], `people[${person.id ?? '?'}]`);
-        return { ...person, phone: normalizePhone(person.phone) };
+        required(person, ['id', 'name'], `people[${person.id ?? '?'}]`);
+        const phone = normalizePhone(person.phone);
+        const whatsappUserId = person.whatsappUserId ? String(person.whatsappUserId).trim() : null;
+        if (!phone && !whatsappUserId) throw new Error(`Config: people[${person.id}].phone (or whatsappUserId) is required`);
+        const whatsappUsername = normalizeUsername(person.whatsappUsername) || null;
+        // `phone` is the person's address: their number, or their BSUID when no number is known.
+        return { ...person, phone: phone || whatsappUserId, whatsappUserId, whatsappUsername };
     });
     const peopleById = new Map(people.map((person) => [person.id, person]));
 
