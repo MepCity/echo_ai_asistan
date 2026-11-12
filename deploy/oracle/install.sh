@@ -80,7 +80,7 @@ ask_secret MARMARA_TRYPOST_TOKEN
 ask_secret MARMARA_TRYPOST_WEBHOOK_SECRET
 ask_plain WA_PHONE_NUMBER_ID 1442742612259733
 while [ -z "$(env_get YASIR_TRYPOST_USER_ID)" ]; do
-  read -rp "YASIR_TRYPOST_USER_ID (TryPost user UUID): " value </dev/tty
+  read -rp "YASIR_TRYPOST_USER_ID (production TryPost user UUID): " value </dev/tty
   [ -n "$value" ] && env_set YASIR_TRYPOST_USER_ID "$value"
 done
 [ -n "$(env_get WA_VERIFY_TOKEN)" ] || env_set WA_VERIFY_TOKEN "$(openssl rand -hex 16)"

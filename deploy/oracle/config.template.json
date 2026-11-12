@@ -20,8 +20,8 @@
       "id": "marmara",
       "type": "trypost",
       "name": "Marmara AI Sosyal",
-      "apiUrl": "https://sosyal-stage.marmaraai.com/api",
-      "publicUrl": "https://sosyal-stage.marmaraai.com",
+      "apiUrl": "https://sosyal.marmaraai.com/api",
+      "publicUrl": "https://sosyal.marmaraai.com",
       "apiToken": "${MARMARA_TRYPOST_TOKEN}",
       "webhookSecret": "${MARMARA_TRYPOST_WEBHOOK_SECRET}",
       "templates": {
