@@ -365,6 +365,7 @@ describe('approval requests', () => {
     it('ignores unknown numbers', async () => {
         await t.user.say('905559999999', 'selam');
         assert.equal(t.whatsapp.sent.length, 0);
+        assert.ok(t.logs.some((entry) => entry[0] === 'warn' && /unknown number/.test(entry[1]) && entry[2] === '90555****999'));
     });
 
     it('saves a free-text reply to a request as a comment', async () => {

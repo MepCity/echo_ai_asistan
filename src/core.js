@@ -150,9 +150,10 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
             store.transaction(() => {
                 for (const status of statuses) onStatus(status);
                 for (const message of messages) {
-                    const person = people.get(normalizePhone(message.from));
+                    const phone = normalizePhone(message.from);
+                    const person = people.get(phone);
                     if (!person) {
-                        log('warn', 'message from an unknown number ignored');
+                        log('warn', 'message from an unknown number ignored', maskPhone(phone));
                         continue;
                     }
                     // A retried Meta webhook finds the id already stored and adds nothing.
@@ -520,4 +521,11 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
     }
 
     return echo;
+}
+
+/** Keeps the country/operator prefix and the last 3 digits: 905326223863 -> 90532****863. */
+function maskPhone(phone) {
+    const digits = String(phone ?? '');
+    if (digits.length > 8) return digits.slice(0, 5) + '*'.repeat(digits.length - 8) + digits.slice(-3);
+    return '*'.repeat(Math.max(digits.length - 3, 0)) + digits.slice(-3);
 }
