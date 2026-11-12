@@ -97,7 +97,7 @@ else
   echo "SOUL.md senin duzenledigin haliyle birakildi."
 fi
 python3 -I "$HERE/configure.py" "$DATA/config.yaml"
-echo "config.yaml: saglayici openai-codex (secilen model korunur), TryPost MCP (OAuth, yazma araclari onayli), riskli araclar kapali."
+echo "config.yaml: saglayici openai-codex (secilen model korunur), TryPost MCP (OAuth, yazma araclari onayli), riskli araclar kapali, profil teklifi ve komut ipuclari kapali, dil tr."
 
 # --- Start Hermes -----------------------------------------------------------------------------
 say "Hermes imaji indiriliyor ve baslatiliyor (ilk sefer birkac dakika surebilir)"
@@ -167,6 +167,13 @@ fi
 # --- Config again (Hermes may have migrated it on first start), restart --------------------------
 python3 -I "$HERE/configure.py" "$DATA/config.yaml"
 compose restart hermes
+# Ongoing chats replay the system prompt stored when they began; this makes each one rebuild it
+# once from the new SOUL.md on its next message (history is kept).
+if compose exec -T hermes hermes sessions refresh-prompts >/dev/null 2>&1; then
+  echo "Acik sohbetler bir sonraki mesajda yeni SOUL.md ile devam edecek."
+else
+  echo "UYARI: sohbet istemleri yenilenemedi; sonra tekrar: bash $HERE/hermes.sh sessions refresh-prompts"
+fi
 
 # --- Echo forwards to Hermes ------------------------------------------------------------------------
 say "Echo -> Hermes yonlendirmesi"
@@ -197,5 +204,6 @@ cat <<EOF
    TryPost girisi: bash $HERE/hermes.sh mcp login trypost
    Model degistir: bash $HERE/hermes.sh model
    Ayarlari yenile: bash $HERE/setup-hermes.sh --skip-login
+   Sohbeti sifirla: WhatsApp'ta /new yaz (gecmis silinir, yeni sohbet baslar)
 ================================================================
 EOF

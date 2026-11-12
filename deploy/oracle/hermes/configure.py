@@ -43,6 +43,13 @@ DISABLED_TOOLSETS = [
     "video_gen",
 ]
 
+# onboarding.seen flags (Hermes agent/onboarding.py) marked as already shown.
+ONBOARDING_SEEN_FLAGS = [
+    "profile_build_offered",
+    "busy_input_prompt",
+    "tool_progress_prompt",
+]
+
 
 def main(path):
     config = {}
@@ -92,6 +99,24 @@ def main(path):
         disabled = [disabled]
     agent["disabled_toolsets"] = disabled + [name for name in DISABLED_TOOLSETS if name not in disabled]
     config["agent"] = agent
+
+    # First-contact onboarding (agent/onboarding.py): profile_build "off" drops the
+    # "build a short profile of you" offer; the latched `seen` flags keep Hermes from
+    # adding its one-time "/busy ..." and "/verbose ..." tips to WhatsApp replies.
+    onboarding = config.get("onboarding") if isinstance(config.get("onboarding"), dict) else {}
+    onboarding["profile_build"] = "off"
+    seen = onboarding.get("seen") if isinstance(onboarding.get("seen"), dict) else {}
+    for flag in ONBOARDING_SEEN_FLAGS:
+        seen[flag] = True
+    onboarding["seen"] = seen
+    config["onboarding"] = onboarding
+
+    # Hermes' own fixed messages (approval prompts, busy notices) in Turkish; another
+    # language the user picked is kept.
+    display = config.get("display") if isinstance(config.get("display"), dict) else {}
+    if display.get("language") in (None, "", "en"):
+        display["language"] = "tr"
+    config["display"] = display
 
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
