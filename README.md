@@ -127,6 +127,29 @@ npm test
 
 Docker: `docker build -t echo . && docker run -p 8080:8080 -v echo-data:/data -e ECHO_CONFIG_JSON="$(cat config.json)" ... echo`
 
+## Oracle Cloud'a kurulum (Always Free)
+
+Dosyalar `deploy/oracle/` altında. Her şey Always Free içinde kalır (A1.Flex 1 OCPU/6 GB,
+yer yoksa E2.1.Micro; varsayılan boot disk; load balancer yok). HTTPS, Caddy ve
+`echo-<ip>.sslip.io` adıyla otomatik gelir.
+
+1. **VM'yi oluştur** (OCI Cloud Shell): `provision.sh` içeriğini Cloud Shell'de bir
+   dosyaya yapıştır, `bash provision.sh` çalıştır. VCN, internet gateway, 22/80/443
+   kuralları, alt ağ ve VM'yi oluşturur (tekrar çalıştırılabilir; yer yoksa birkaç
+   dakika sonra yeniden dene). Sonda IP, SSH komutu ve HTTPS adı yazılır.
+2. **Echo'yu kur** (VM'de, `ssh -i ~/.ssh/echo_vm ubuntu@<IP>`): `install.sh`
+   içeriğini bir dosyaya yapıştır, `bash install.sh` çalıştır. Yazdığı deploy
+   key'in GitHub repoya read-only olarak eklenmesini bekler, repoyu
+   `/opt/echo/app`'e klonlar, gizli değerleri sorar (`/opt/echo/.env`, bir kez),
+   `config.template.json`'u `/opt/echo/config.json`'a kopyalar, Docker ile başlatır
+   ve Meta callback URL'sini, verify token'ı ve TryPost webhook URL'sini yazar.
+   WhatsApp şablonları için: `bash /opt/echo/app/deploy/oracle/create-templates.sh`
+   (durum: `... create-templates.sh --status`).
+3. **Güncelle**: `bash /opt/echo/app/deploy/oracle/update.sh` (git pull, yeniden
+   build, `config.json`/`.env` değişikliklerini de alır, health kontrolü).
+
+Loglar: `cd /opt/echo/app/deploy/oracle && docker compose --env-file /opt/echo/.env logs -f echo`
+
 ## Endpoints
 
 - `GET /whatsapp`: Meta webhook verification

@@ -1,0 +1,44 @@
+{
+  "_DUZENLE": "Duzenleme gerekmez: ${...} degerleri /opt/echo/.env dosyasindan gelir (install.sh sorar). Yeni kisi eklemek icin people ve members listesine ekle.",
+  "publicUrl": "https://${ECHO_HOST}",
+  "timeZone": "Europe/Istanbul",
+  "whatsapp": {
+    "phoneNumberId": "${WA_PHONE_NUMBER_ID}",
+    "accessToken": "${WA_ACCESS_TOKEN}",
+    "appSecret": "${WA_APP_SECRET}",
+    "verifyToken": "${WA_VERIFY_TOKEN}"
+  },
+  "people": [
+    {
+      "id": "yasir",
+      "name": "Yasir",
+      "phone": "905418557902"
+    }
+  ],
+  "projects": [
+    {
+      "id": "marmara",
+      "type": "trypost",
+      "name": "Marmara AI Sosyal",
+      "apiUrl": "https://sosyal-stage.marmaraai.com/api",
+      "publicUrl": "https://sosyal-stage.marmaraai.com",
+      "apiToken": "${MARMARA_TRYPOST_TOKEN}",
+      "webhookSecret": "${MARMARA_TRYPOST_WEBHOOK_SECRET}",
+      "templates": {
+        "language": "tr",
+        "approval": "onay_bekliyor",
+        "feedback": "gorus_istegi"
+      },
+      "members": [
+        {
+          "person": "yasir",
+          "userId": "${YASIR_TRYPOST_USER_ID}",
+          "roles": [
+            "reviewer",
+            "approver"
+          ]
+        }
+      ]
+    }
+  ]
+}

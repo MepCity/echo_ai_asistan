@@ -1,0 +1,45 @@
+# Echo on one VM: Echo (no published port) behind Caddy (HTTPS via Let's Encrypt).
+# Run: docker compose -f /opt/echo/app/deploy/oracle/docker-compose.yml --env-file /opt/echo/.env up -d --build
+name: echo
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  echo:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: echo:local
+    env_file: /opt/echo/.env
+    environment:
+      ECHO_CONFIG: /config/config.json
+    volumes:
+      - /opt/echo/config.json:/config/config.json:ro
+      - echo-data:/data
+    restart: unless-stopped
+    logging: *logging
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - echo
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      ECHO_HOST: ${ECHO_HOST:?set ECHO_HOST in /opt/echo/.env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  echo-data:
+  caddy-data:
+  caddy-config:

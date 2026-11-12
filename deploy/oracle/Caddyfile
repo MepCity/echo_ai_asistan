@@ -1,0 +1,4 @@
+{$ECHO_HOST} {
+	encode gzip
+	reverse_proxy echo:8080
+}
