@@ -251,23 +251,29 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
      * multipart field `media`). TryPost keeps it 24 hours; its `upload_token`
      * is spent by the first post that takes it as a media item.
      * `file` is a Blob (e.g. fs.openAsBlob, so a large video streams from disk).
+     * The whole call (sending the file and reading the answer) is limited to `timeoutMs`;
+     * running out of time is a retryable error.
      * @returns {Promise<{ uploadToken: string, type: string|null, expiresAt: string|null }>}
      */
-    async function uploadMedia({ file, filename, mimeType }) {
+    async function uploadMedia({ file, filename, mimeType, timeoutMs = 180_000 }) {
         const form = new FormData();
         form.append('media', file, filename);
         const path = '/uploads';
+        const signal = AbortSignal.timeout(timeoutMs);
         let response;
+        let text;
         try {
             response = await fetchImpl(`${project.apiUrl.replace(/\/$/, '')}${path}`, {
                 method: 'POST',
                 headers: { Authorization: `Bearer ${project.apiToken}`, Accept: 'application/json' },
                 body: form,
+                signal,
             });
+            text = await response.text();
         } catch (cause) {
-            throw Object.assign(new Error(`TryPost POST ${path} -> ${cause.message}`), { status: null, retryable: true });
+            const reason = signal.aborted ? `timed out after ${timeoutMs} ms` : cause.message;
+            throw Object.assign(new Error(`TryPost POST ${path} -> ${reason}`), { status: null, retryable: true, timedOut: signal.aborted });
         }
-        const text = await response.text();
         let json = null;
         try {
             json = text ? JSON.parse(text) : null;

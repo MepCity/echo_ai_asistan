@@ -29,9 +29,12 @@ import { DatabaseSync } from 'node:sqlite';
  *              person's phone number, so a later message that carries only
  *              the BSUID (a user with a username) still finds the person
  * - media_bridge: WhatsApp media people sent to the assistant, uploaded to
- *              a TryPost workspace (keyed by the WhatsApp media id, so a
- *              retried forward never uploads twice): the upload token, or
- *              'failed' after bounded retries; attempts count the retries
+ *              a TryPost workspace. Keyed by the inbound message, the media,
+ *              the project and its target (API URL + token fingerprint): a
+ *              retry or redelivery of the same message never uploads twice,
+ *              while a new message (even with the same media id) or another
+ *              workspace always gets its own, unspent upload token. 'pending'
+ *              rows wait for their next try (bounded), then 'uploaded' or 'failed'
  * - forwards:  delivery statuses of messages Echo did not send (the assistant
  *              sent them), waiting to be passed on to the assistant; retried
  *              with backoff, removed once it took them
@@ -43,6 +46,10 @@ export function openDatabase(dataDir) {
         file = join(dataDir, 'echo.db');
     }
     const db = new DatabaseSync(file);
+    // The first media_bridge was keyed by media id only, which could hand out a spent upload token: it is
+    // only a cache of 24-hour uploads, so it is dropped and created again with the full key.
+    const bridgeColumns = db.prepare('PRAGMA table_info(media_bridge)').all().map((column) => column.name);
+    if (bridgeColumns.length && !bridgeColumns.includes('wa_message_id')) db.exec('DROP TABLE media_bridge;');
     db.exec(`
         PRAGMA journal_mode = WAL;
         PRAGMA busy_timeout = 5000;
@@ -127,15 +134,19 @@ export function openDatabase(dataDir) {
         );
 
         CREATE TABLE IF NOT EXISTS media_bridge (
-            wa_media_id  TEXT PRIMARY KEY,
-            project      TEXT NOT NULL,
-            status       TEXT NOT NULL DEFAULT 'pending',
-            upload_token TEXT,
-            media_type   TEXT,
-            attempts     INTEGER NOT NULL DEFAULT 0,
-            last_error   TEXT,
-            created_at   INTEGER NOT NULL,
-            updated_at   INTEGER NOT NULL
+            wa_message_id   TEXT NOT NULL,
+            wa_media_id     TEXT NOT NULL,
+            project         TEXT NOT NULL,
+            target          TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            upload_token    TEXT,
+            media_type      TEXT,
+            attempts        INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL DEFAULT 0,
+            last_error      TEXT,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
+            PRIMARY KEY (wa_message_id, wa_media_id, project, target)
         );
 
         CREATE TABLE IF NOT EXISTS forwards (
@@ -182,6 +193,8 @@ function migrate(db) {
     }
     db.exec('CREATE INDEX IF NOT EXISTS outbox_item ON outbox (project, item_id, kind);');
 }
+
+const bridgeKey = ({ messageId, mediaId, project, target }) => [String(messageId), String(mediaId), String(project), String(target)];
 
 export function createStore(db, now = () => Date.now()) {
     const q = (sql) => db.prepare(sql);
@@ -256,19 +269,22 @@ export function createStore(db, now = () => Date.now()) {
             ON CONFLICT(user_id) DO UPDATE SET phone = excluded.phone, updated_at = excluded.updated_at
             WHERE user_ids.phone != excluded.phone`),
         phoneForUserId: q(`SELECT phone FROM user_ids WHERE user_id = ?`),
-        bridged: q(`SELECT * FROM media_bridge WHERE wa_media_id = ?`),
-        bridgeAttempt: q(`INSERT INTO media_bridge (wa_media_id, project, status, attempts, last_error, created_at, updated_at)
-            VALUES (?, ?, 'pending', 1, ?, ?, ?)
-            ON CONFLICT(wa_media_id) DO UPDATE SET status = 'pending', attempts = media_bridge.attempts + 1,
-                last_error = excluded.last_error, updated_at = excluded.updated_at
+        bridged: q(`SELECT * FROM media_bridge WHERE wa_message_id = ? AND wa_media_id = ? AND project = ? AND target = ?`),
+        bridgeAttempt: q(`INSERT INTO media_bridge (wa_message_id, wa_media_id, project, target, status, attempts, next_attempt_at, last_error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'pending', 1, ?, ?, ?, ?)
+            ON CONFLICT(wa_message_id, wa_media_id, project, target) DO UPDATE SET status = 'pending', attempts = media_bridge.attempts + 1,
+                next_attempt_at = excluded.next_attempt_at, last_error = excluded.last_error, updated_at = excluded.updated_at
             RETURNING attempts`),
-        bridgeDone: q(`INSERT INTO media_bridge (wa_media_id, project, status, upload_token, media_type, created_at, updated_at)
-            VALUES (?, ?, 'uploaded', ?, ?, ?, ?)
-            ON CONFLICT(wa_media_id) DO UPDATE SET project = excluded.project, status = 'uploaded', upload_token = excluded.upload_token,
+        bridgeDone: q(`INSERT INTO media_bridge (wa_message_id, wa_media_id, project, target, status, upload_token, media_type, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'uploaded', ?, ?, ?, ?)
+            ON CONFLICT(wa_message_id, wa_media_id, project, target) DO UPDATE SET status = 'uploaded', upload_token = excluded.upload_token,
                 media_type = excluded.media_type, last_error = NULL, updated_at = excluded.updated_at`),
-        bridgeFailed: q(`INSERT INTO media_bridge (wa_media_id, project, status, last_error, created_at, updated_at)
-            VALUES (?, ?, 'failed', ?, ?, ?)
-            ON CONFLICT(wa_media_id) DO UPDATE SET status = 'failed', last_error = excluded.last_error, updated_at = excluded.updated_at`),
+        bridgeFailed: q(`INSERT INTO media_bridge (wa_message_id, wa_media_id, project, target, status, last_error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'failed', ?, ?, ?)
+            ON CONFLICT(wa_message_id, wa_media_id, project, target) DO UPDATE SET status = 'failed', last_error = excluded.last_error, updated_at = excluded.updated_at`),
+        // A deferred message: back to pending without counting a try (it was waiting, not failing).
+        inboxDefer: q(`UPDATE inbox SET status = 'pending', attempts = MAX(attempts - 1, 0), next_attempt_at = ?, updated_at = ? WHERE wa_message_id = ?`),
+        inboxDue: q(`UPDATE inbox SET next_attempt_at = 0 WHERE wa_message_id = ? AND status = 'pending'`),
     };
 
     const parseInbox = (row) =>
@@ -381,11 +397,18 @@ export function createStore(db, now = () => Date.now()) {
         /** Remembers that this BSUID belongs to this phone number. @returns {boolean} true when it was new or changed */
         learnUserId: (userId, phone) => statements.learnUserId.run(userId, phone, now()).changes === 1,
         phoneForUserId: (userId) => statements.phoneForUserId.get(userId)?.phone ?? null,
-        /** What the media bridge did with this WhatsApp media id: { status: 'pending'|'uploaded'|'failed', upload_token, attempts, ... } or null. */
-        bridged: (mediaId) => statements.bridged.get(mediaId) ?? null,
-        /** Records a failed (retryable) try. @returns {number} the tries so far */
-        bridgeAttempt: (mediaId, project, error) => Number(statements.bridgeAttempt.get(mediaId, project, error, now(), now()).attempts),
-        bridgeDone: (mediaId, project, uploadToken, mediaType) => statements.bridgeDone.run(mediaId, project, uploadToken, mediaType, now(), now()),
-        bridgeFailed: (mediaId, project, error) => statements.bridgeFailed.run(mediaId, project, error, now(), now()),
+        /**
+         * What the media bridge did for one key { messageId, mediaId, project, target }:
+         * { status: 'pending'|'uploaded'|'failed', upload_token, attempts, next_attempt_at, ... } or null.
+         */
+        bridged: (key) => statements.bridged.get(...bridgeKey(key)) ?? null,
+        /** Records a failed (retryable) try, the next one not before `delayMs`. @returns {number} the tries so far */
+        bridgeAttempt: (key, error, delayMs = 0) => Number(statements.bridgeAttempt.get(...bridgeKey(key), now() + delayMs, error, now(), now()).attempts),
+        bridgeDone: (key, uploadToken, mediaType) => statements.bridgeDone.run(...bridgeKey(key), uploadToken, mediaType, now(), now()),
+        bridgeFailed: (key, error) => statements.bridgeFailed.run(...bridgeKey(key), error, now(), now()),
+        /** Puts a message back to wait (e.g. for its media upload) without counting a try. */
+        inboxDefer: (waId, delayMs) => statements.inboxDefer.run(now() + delayMs, now(), waId),
+        /** Makes a waiting message due now (its media upload finished). */
+        inboxDue: (waId) => statements.inboxDue.run(waId),
     };
 }

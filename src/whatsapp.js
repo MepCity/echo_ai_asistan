@@ -76,16 +76,23 @@ export function createWhatsAppClient(config, fetchImpl = globalThis.fetch) {
      * Where an inbound media can be downloaded (GET /{media-id}): { url, mimeType, size, sha256 }.
      * The URL is valid for about 5 minutes and needs the access token (see downloadMedia).
      */
-    async function mediaInfo(mediaId) {
+    async function mediaInfo(mediaId, { timeoutMs = 20_000 } = {}) {
+        const signal = AbortSignal.timeout(timeoutMs);
         let response;
+        let json;
         try {
             response = await fetchImpl(`${config.graphUrl}/${config.graphVersion}/${encodeURIComponent(mediaId)}`, {
                 headers: { Authorization: `Bearer ${config.accessToken}` },
+                signal,
+            });
+            json = await response.json().catch((error) => {
+                if (signal.aborted) throw error;
+                return {};
             });
         } catch (error) {
-            throw new WhatsAppError(`network: ${error.message}`, { retryable: true });
+            const reason = signal.aborted ? `timed out after ${timeoutMs} ms` : error.message;
+            throw Object.assign(new WhatsAppError(`media lookup: ${reason}`, { retryable: true }), { timedOut: signal.aborted });
         }
-        const json = await response.json().catch(() => ({}));
         if (!response.ok || !json?.url) {
             const code = json?.error?.code ?? null;
             throw new WhatsAppError(json?.error?.message ?? `media lookup: HTTP ${response.status}`, {
@@ -102,13 +109,16 @@ export function createWhatsAppClient(config, fetchImpl = globalThis.fetch) {
         };
     }
 
-    /** Starts the download of a media URL from mediaInfo; returns the fetch Response (the caller reads its body). */
-    async function downloadMedia(url) {
+    /**
+     * Starts the download of a media URL from mediaInfo; returns the fetch Response (the caller reads its
+     * body). `signal` aborts the request and the body (the caller's total and idle time limits).
+     */
+    async function downloadMedia(url, { signal } = {}) {
         let response;
         try {
-            response = await fetchImpl(url, { headers: { Authorization: `Bearer ${config.accessToken}` } });
+            response = await fetchImpl(url, { headers: { Authorization: `Bearer ${config.accessToken}` }, signal });
         } catch (error) {
-            throw new WhatsAppError(`media download: ${error.message}`, { retryable: true });
+            throw new WhatsAppError(`media download: ${signal?.aborted ? 'timed out' : error.message}`, { retryable: true });
         }
         if (!response.ok) {
             await response.arrayBuffer().catch(() => null);

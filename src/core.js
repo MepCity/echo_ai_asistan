@@ -28,8 +28,15 @@ const ASSISTANT_TEXTS = {
 };
 // Media bridge: what people send the assistant is uploaded to TryPost first.
 const BRIDGE_KINDS = new Set(['image', 'video', 'document']);
-// Tries before a media is forwarded without its upload (with a note saying so).
+// Tries before a media is forwarded without its upload (with a note saying so), and the wait before each retry.
 const BRIDGE_ATTEMPTS = 3;
+const BRIDGE_BACKOFF_MS = [15_000, 60_000];
+// Upload jobs run beside the worker (never inside it): at most this many at once.
+const BRIDGE_JOBS = 2;
+// How long a message waiting for its running upload is put back for (the job wakes it when it ends).
+const BRIDGE_POLL_MS = 30_000;
+// Time limits of one try: the Graph lookup, the download (in all, and without a byte arriving) and the upload.
+const BRIDGE_TIMEOUTS_MS = { lookup: 20_000, download: 180_000, idle: 30_000, upload: 180_000 };
 // TryPost keeps an upload 24 hours: an older one is uploaded again before a (late) forward.
 const BRIDGE_FRESH_MS = 20 * 60 * 60_000;
 // What TryPost accepts (PostMediaRequestRules::file), with a file extension for each.
@@ -83,9 +90,13 @@ const CANCEL = /^\s*(iptal|vazgeç|vazgec)\s*$/i;
  * and uploaded to that TryPost workspace before it is forwarded; the forwarded
  * caption then ends with "[TryPost medya: upload_token=…, tür=…]" so the
  * assistant can attach it to a post it creates (it cannot fetch WhatsApp media
- * into TryPost itself). The upload is kept per WhatsApp media id, so a retried
- * forward never uploads twice. When the upload keeps failing, the message is
- * forwarded anyway with "[TryPost medya yüklenemedi: …]".
+ * into TryPost itself). The upload is kept per inbound message, media,
+ * project and target, so a retried forward never uploads twice and a new
+ * message always gets a fresh (unspent) token. The upload runs as a background
+ * job with time limits; meanwhile the message waits (the person's later
+ * messages behind it), and the worker goes on with approvals and deliveries.
+ * When the upload keeps failing (3 tries), the message is forwarded anyway
+ * with "[TryPost medya yüklenemedi: …]".
  *
  * With `config.assistant`, a message from a known person that no project
  * handles (no Echo button, no open session, no quote-reply to a request, not
@@ -94,7 +105,10 @@ const CANCEL = /^\s*(iptal|vazgeç|vazgec)\s*$/i;
  * person is told when it finally fails. Delivery statuses of messages Echo
  * did not send are the assistant's too, and are forwarded from `forwards`.
  */
-export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl = globalThis.fetch }) {
+export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl = globalThis.fetch, mediaTimeouts = {} }) {
+    const timeouts = { ...BRIDGE_TIMEOUTS_MS, ...mediaTimeouts };
+    // Running upload jobs, by bridge key.
+    const jobs = new Map();
     const adapters = new Map();
     const people = new Map(config.people.map((person) => [person.phone, person]));
     const peopleByUserId = new Map(config.people.filter((person) => person.whatsappUserId).map((person) => [person.whatsappUserId, person]));
@@ -210,6 +224,12 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
             echo.ingest(parsed);
             await echo.tick();
         },
+
+        /** Waits until no media upload job is running and the worker has passed after them (tests, shutdown). */
+        async settled() {
+            while (jobs.size) await Promise.allSettled([...jobs.values()]);
+            await echo.tick();
+        },
     };
 
     /**
@@ -257,12 +277,19 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
             const backoff = forAssistant ? ASSISTANT_BACKOFF_MS : BACKOFF_MS;
             const about = route?.outboxId ?? null;
             const project = route?.project ?? '_echo';
+            if (error.deferMs !== undefined) {
+                // Waiting for its media upload (a background job): not a failed try, and nothing to tell the person.
+                saveProgress();
+                store.inboxDefer(message.id, error.deferMs);
+                // The job may have finished meanwhile: then the message is due at once.
+                if (!error.waiting()) store.inboxDue(message.id);
+                return;
+            }
             if (error.retryable && attempts < backoff.length + 1) {
                 saveProgress();
                 store.inboxRetry(message.id, backoff[attempts - 1], error.message);
                 log('warn', 'inbound retrying', message.id, error.message);
-                // A media upload being retried is not worth a message; the assistant being down is.
-                if (person && !error.quiet && store.inboxNotified(message.id)) {
+                if (person && store.inboxNotified(message.id)) {
                     echo.reply(person, texts.retrying ?? 'Şu an işleyemiyorum, cevabını kaydettim; bağlantı gelince işleyeceğim.', message.id, project, about);
                 }
                 return;
@@ -516,11 +543,20 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
 
     const bridgeError = (reason, detail) => Object.assign(new Error(detail), { reason, retryable: false });
 
+    const timedOutError = (what) => Object.assign(new Error(`${what}: timed out`), { retryable: true, timedOut: true });
+
+    /** The TryPost workspace an upload belongs to: the API URL and a fingerprint of the token (never the token). */
+    function bridgeTarget(projectId) {
+        const project = config.projects.find((item) => item.id === projectId) ?? {};
+        const token = createHash('sha256').update(String(project.apiToken ?? '')).digest('hex').slice(0, 12);
+        return `${String(project.apiUrl ?? '').replace(/\/+$/, '')}#${token}`;
+    }
+
     /**
-     * Uploads the media of a message to the media bridge's TryPost project
-     * (once per WhatsApp media id) and returns the message to forward, its
-     * caption ending with a note on the upload. Throws a retryable (quiet)
-     * error while tries are left; after them the message goes with a failure note.
+     * Returns the message to forward, its caption ending with a note on its
+     * media's upload to the media bridge's TryPost project. The upload runs as
+     * a background job: until it ended, this throws a "defer" error that puts
+     * the message back to wait (no try counted, nothing told to the person).
      */
     async function bridgeMedia(message) {
         const projectId = config.mediaBridge;
@@ -531,38 +567,61 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
         const mediaId = raw[kind]?.id ? String(raw[kind].id) : null;
         if (!mediaId) return message;
 
-        let row = store.bridged(mediaId);
-        if (row?.status === 'uploaded' && store.now() - row.updated_at > BRIDGE_FRESH_MS) row = null;
-        if (!row || row.status === 'pending') {
-            try {
-                const upload = await uploadToProject(adapter, projectId, mediaId, raw[kind]);
-                store.bridgeDone(mediaId, projectId, upload.uploadToken, upload.type ?? kind);
-                log('info', 'media uploaded to TryPost', message.id, kind);
-            } catch (error) {
-                const detail = String(error.message ?? error).slice(0, 300);
-                if (error.retryable && store.bridgeAttempt(mediaId, projectId, detail) < BRIDGE_ATTEMPTS) {
-                    throw Object.assign(new Error(`media bridge: ${detail}`), { retryable: true, quiet: true });
-                }
-                const reason = error.reason ?? (error.retryable ? 'bağlantı sorunu' : 'TryPost dosyayı kabul etmedi');
-                store.bridgeFailed(mediaId, projectId, reason);
-                log('warn', 'media not uploaded to TryPost', message.id, detail);
-            }
-            row = store.bridged(mediaId);
+        const key = { messageId: message.id, mediaId, project: projectId, target: bridgeTarget(projectId) };
+        const jobKey = JSON.stringify(key);
+        const defer = (ms) => {
+            throw Object.assign(new Error('waiting for the media upload'), { deferMs: Math.max(ms, 0), waiting: () => jobs.has(jobKey) });
+        };
+        const row = store.bridged(key);
+        // An upload kept longer than TryPost keeps it (a forward delayed by an outage) is made again.
+        const stale = row?.status === 'uploaded' && store.now() - row.updated_at > BRIDGE_FRESH_MS;
+        if (row && row.status !== 'pending' && !stale) {
+            const note =
+                row.status === 'uploaded'
+                    ? `[TryPost medya: upload_token=${row.upload_token}, tür=${row.media_type ?? kind}]`
+                    : `[TryPost medya yüklenemedi: ${row.last_error ?? 'bilinmeyen hata'}]`;
+            const block = raw[kind] ?? {};
+            const caption = block.caption ? `${block.caption}\n\n${note}` : note;
+            return { ...message, raw: { ...raw, [kind]: { ...block, caption } } };
         }
-        const note =
-            row.status === 'uploaded'
-                ? `[TryPost medya: upload_token=${row.upload_token}, tür=${row.media_type ?? kind}]`
-                : `[TryPost medya yüklenemedi: ${row.last_error ?? 'bilinmeyen hata'}]`;
-        const block = raw[kind] ?? {};
-        const caption = block.caption ? `${block.caption}\n\n${note}` : note;
-        return { ...message, raw: { ...raw, [kind]: { ...block, caption } } };
+        if (jobs.has(jobKey)) defer(BRIDGE_POLL_MS);
+        if (row?.status === 'pending' && row.next_attempt_at > store.now()) defer(row.next_attempt_at - store.now());
+        if (jobs.size >= BRIDGE_JOBS) defer(BRIDGE_POLL_MS);
+        const job = runBridgeJob(adapter, key, raw[kind], kind).finally(() => {
+            jobs.delete(jobKey);
+            store.inboxDue(message.id);
+            echo.tick().catch((error) => log('error', 'tick failed', error.message));
+        });
+        jobs.set(jobKey, job);
+        defer(BRIDGE_POLL_MS);
+    }
+
+    /** One try of an upload, stored as done, as a retry for later (bounded) or as failed. Never throws. */
+    async function runBridgeJob(adapter, key, media, kind) {
+        try {
+            const upload = await uploadToProject(adapter, key.project, key.mediaId, media);
+            store.bridgeDone(key, upload.uploadToken, upload.type ?? kind);
+            log('info', 'media uploaded to TryPost', key.messageId, kind);
+        } catch (error) {
+            const detail = String(error.message ?? error).slice(0, 300);
+            if (error.retryable) {
+                const attempts = store.bridgeAttempt(key, detail, BRIDGE_BACKOFF_MS[Math.min(store.bridged(key)?.attempts ?? 0, BRIDGE_BACKOFF_MS.length - 1)]);
+                if (attempts < BRIDGE_ATTEMPTS) {
+                    log('warn', 'media upload to TryPost will be retried', key.messageId, detail);
+                    return;
+                }
+            }
+            const reason = error.reason ?? (error.timedOut ? 'zaman aşımı' : error.retryable ? 'bağlantı sorunu' : 'TryPost dosyayı kabul etmedi');
+            store.bridgeFailed(key, reason);
+            log('warn', 'media not uploaded to TryPost', key.messageId, detail);
+        }
     }
 
     /** Downloads one WhatsApp media to a temporary file (size-capped, checksum-verified) and uploads it to TryPost. */
     async function uploadToProject(adapter, projectId, mediaId, media) {
         let info;
         try {
-            info = await whatsapp.mediaInfo(mediaId);
+            info = await whatsapp.mediaInfo(mediaId, { timeoutMs: timeouts.lookup });
         } catch (error) {
             if (error.retryable) throw error;
             throw bridgeError('WhatsApp medyası alınamadı', `media lookup: ${error.message}`);
@@ -579,29 +638,50 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
         const dir = await mkdtemp(join(tmpdir(), 'echo-media-'));
         try {
             const file = join(dir, `media.${extension}`);
-            let response;
-            try {
-                response = await whatsapp.downloadMedia(info.url);
-            } catch (error) {
-                if (error.retryable) throw error;
-                throw bridgeError('WhatsApp medyası indirilemedi', error.message);
-            }
-            if (!response.body) throw Object.assign(new Error('media download: empty body'), { retryable: true });
+            // The download is limited in all and per stall: a hung connection is cut, and the try counts as failed.
+            const controller = new AbortController();
+            let timedOut = false;
+            const cut = () => {
+                timedOut = true;
+                controller.abort();
+                body?.destroy(timedOutError('media download'));
+            };
+            const total = setTimeout(cut, timeouts.download);
+            let idle = setTimeout(cut, timeouts.idle);
+            let body = null;
             let size = 0;
             const hash = createHash('sha256');
-            const count = new Transform({
-                transform(chunk, _encoding, done) {
-                    size += chunk.length;
-                    if (size > limit) return done(tooLarge(size));
-                    hash.update(chunk);
-                    done(null, chunk);
-                },
-            });
             try {
-                await pipeline(Readable.fromWeb(response.body), count, createWriteStream(file));
+                let response;
+                try {
+                    response = await whatsapp.downloadMedia(info.url, { signal: controller.signal });
+                } catch (error) {
+                    if (timedOut) throw timedOutError('media download');
+                    if (error.retryable) throw error;
+                    throw bridgeError('WhatsApp medyası indirilemedi', error.message);
+                }
+                if (!response.body) throw Object.assign(new Error('media download: empty body'), { retryable: true });
+                body = Readable.fromWeb(response.body);
+                if (timedOut) body.destroy(timedOutError('media download'));
+                const count = new Transform({
+                    transform(chunk, _encoding, done) {
+                        clearTimeout(idle);
+                        idle = setTimeout(cut, timeouts.idle);
+                        size += chunk.length;
+                        if (size > limit) return done(tooLarge(size));
+                        hash.update(chunk);
+                        done(null, chunk);
+                    },
+                });
+                await pipeline(body, count, createWriteStream(file));
             } catch (error) {
                 if (error.reason) throw error;
+                if (timedOut) throw timedOutError('media download');
+                if (error.retryable) throw error;
                 throw Object.assign(new Error(`media download: ${error.message}`), { retryable: true });
+            } finally {
+                clearTimeout(total);
+                clearTimeout(idle);
             }
             if (info.sha256 && hash.digest('hex') !== String(info.sha256).toLowerCase()) {
                 throw Object.assign(new Error('media download: checksum mismatch'), { retryable: true });
@@ -609,7 +689,7 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
             const name = String(media.filename ?? '').replace(/[\\/\u0000-\u001f]/g, '_').trim().slice(-120);
             const filename = name || `whatsapp-${mediaId}.${extension}`;
             try {
-                return await adapter.uploadMedia({ file: await openAsBlob(file, { type: mime }), filename, mimeType: mime });
+                return await adapter.uploadMedia({ file: await openAsBlob(file, { type: mime }), filename, mimeType: mime, timeoutMs: timeouts.upload });
             } catch (error) {
                 if (error.retryable) throw error;
                 const reason = error.status === 401 || error.status === 403 ? 'TryPost yetkisi yok' : error.status === 422 ? 'TryPost dosyayı kabul etmedi' : 'TryPost hatası';
