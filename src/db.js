@@ -28,6 +28,10 @@ import { DatabaseSync } from 'node:sqlite';
  * - user_ids:  WhatsApp business-scoped user ids (BSUIDs) seen with a known
  *              person's phone number, so a later message that carries only
  *              the BSUID (a user with a username) still finds the person
+ * - media_bridge: WhatsApp media people sent to the assistant, uploaded to
+ *              a TryPost workspace (keyed by the WhatsApp media id, so a
+ *              retried forward never uploads twice): the upload token, or
+ *              'failed' after bounded retries; attempts count the retries
  * - forwards:  delivery statuses of messages Echo did not send (the assistant
  *              sent them), waiting to be passed on to the assistant; retried
  *              with backoff, removed once it took them
@@ -120,6 +124,18 @@ export function openDatabase(dataDir) {
             user_id    TEXT PRIMARY KEY,
             phone      TEXT NOT NULL,
             updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS media_bridge (
+            wa_media_id  TEXT PRIMARY KEY,
+            project      TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'pending',
+            upload_token TEXT,
+            media_type   TEXT,
+            attempts     INTEGER NOT NULL DEFAULT 0,
+            last_error   TEXT,
+            created_at   INTEGER NOT NULL,
+            updated_at   INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS forwards (
@@ -240,6 +256,19 @@ export function createStore(db, now = () => Date.now()) {
             ON CONFLICT(user_id) DO UPDATE SET phone = excluded.phone, updated_at = excluded.updated_at
             WHERE user_ids.phone != excluded.phone`),
         phoneForUserId: q(`SELECT phone FROM user_ids WHERE user_id = ?`),
+        bridged: q(`SELECT * FROM media_bridge WHERE wa_media_id = ?`),
+        bridgeAttempt: q(`INSERT INTO media_bridge (wa_media_id, project, status, attempts, last_error, created_at, updated_at)
+            VALUES (?, ?, 'pending', 1, ?, ?, ?)
+            ON CONFLICT(wa_media_id) DO UPDATE SET status = 'pending', attempts = media_bridge.attempts + 1,
+                last_error = excluded.last_error, updated_at = excluded.updated_at
+            RETURNING attempts`),
+        bridgeDone: q(`INSERT INTO media_bridge (wa_media_id, project, status, upload_token, media_type, created_at, updated_at)
+            VALUES (?, ?, 'uploaded', ?, ?, ?, ?)
+            ON CONFLICT(wa_media_id) DO UPDATE SET project = excluded.project, status = 'uploaded', upload_token = excluded.upload_token,
+                media_type = excluded.media_type, last_error = NULL, updated_at = excluded.updated_at`),
+        bridgeFailed: q(`INSERT INTO media_bridge (wa_media_id, project, status, last_error, created_at, updated_at)
+            VALUES (?, ?, 'failed', ?, ?, ?)
+            ON CONFLICT(wa_media_id) DO UPDATE SET status = 'failed', last_error = excluded.last_error, updated_at = excluded.updated_at`),
     };
 
     const parseInbox = (row) =>
@@ -352,5 +381,11 @@ export function createStore(db, now = () => Date.now()) {
         /** Remembers that this BSUID belongs to this phone number. @returns {boolean} true when it was new or changed */
         learnUserId: (userId, phone) => statements.learnUserId.run(userId, phone, now()).changes === 1,
         phoneForUserId: (userId) => statements.phoneForUserId.get(userId)?.phone ?? null,
+        /** What the media bridge did with this WhatsApp media id: { status: 'pending'|'uploaded'|'failed', upload_token, attempts, ... } or null. */
+        bridged: (mediaId) => statements.bridged.get(mediaId) ?? null,
+        /** Records a failed (retryable) try. @returns {number} the tries so far */
+        bridgeAttempt: (mediaId, project, error) => Number(statements.bridgeAttempt.get(mediaId, project, error, now(), now()).attempts),
+        bridgeDone: (mediaId, project, uploadToken, mediaType) => statements.bridgeDone.run(mediaId, project, uploadToken, mediaType, now(), now()),
+        bridgeFailed: (mediaId, project, error) => statements.bridgeFailed.run(mediaId, project, error, now(), now()),
     };
 }

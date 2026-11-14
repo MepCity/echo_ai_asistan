@@ -27,6 +27,11 @@ import { readFileSync } from 'node:fs';
  * BSUID it saw earlier together with their phone number. A person without a
  * phone is written to at their BSUID.
  *
+ * A TryPost project may set "mediaBridge": true (or false). With an assistant,
+ * images, videos and PDFs people send are uploaded to that project's TryPost
+ * workspace before they are forwarded, so the assistant can attach them to a
+ * post. With a single TryPost project it is on unless set to false.
+ *
  * `assistant` (optional): where messages from known people that Echo does not
  * handle itself are forwarded, as signed WhatsApp webhooks (Hermes Agent's
  * WhatsApp Cloud adapter). Optional keys: "appSecret" (defaults to
@@ -98,7 +103,25 @@ export function normalizeConfig(config) {
         people,
         projects,
         assistant: normalizeAssistant(config.assistant, config.whatsapp),
+        mediaBridge: mediaBridgeProject(projects),
     };
+}
+
+/**
+ * The TryPost project that images, videos and PDFs sent to the assistant are
+ * uploaded to (see core.js, media bridge): the one with "mediaBridge": true;
+ * without one, the only TryPost project unless it says "mediaBridge": false.
+ */
+function mediaBridgeProject(projects) {
+    const trypost = projects.filter((project) => project.type === 'trypost');
+    const chosen = trypost.filter((project) => project.mediaBridge === true);
+    if (projects.some((project) => project.mediaBridge === true && project.type !== 'trypost')) {
+        throw new Error('Config: mediaBridge is only supported on trypost projects');
+    }
+    if (chosen.length > 1) throw new Error(`Config: only one project may set mediaBridge: true (${chosen.map((project) => project.id).join(', ')})`);
+    if (chosen.length === 1) return chosen[0].id;
+    if (trypost.length === 1 && trypost[0].mediaBridge !== false) return trypost[0].id;
+    return null;
 }
 
 function normalizeAssistant(assistant, whatsapp) {

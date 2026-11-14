@@ -11,7 +11,7 @@ import { createEcho } from '../src/core.js';
 import { createStore, openDatabase } from '../src/db.js';
 import { createTryPostProject, fingerprint, sameVersion, versionTag } from '../src/projects/trypost.js';
 import { createHttpServer } from '../src/server.js';
-import { WhatsAppError, parseWebhook, toPayload, verifySignature } from '../src/whatsapp.js';
+import { WhatsAppError, createWhatsAppClient, parseWebhook, toPayload, verifySignature } from '../src/whatsapp.js';
 
 const PHONES = { yasir: '905550000001', ayse: '905550000002', mehmet: '905550000003' };
 
@@ -39,6 +39,7 @@ const baseConfig = (extra = {}) =>
                     { person: 'ayse', userId: 'u-ayse', roles: ['reviewer', 'approver'] },
                     { person: 'mehmet', userId: 'u-mehmet', roles: ['reviewer'] },
                 ],
+                ...(extra.projectExtra ?? {}),
             },
         ],
     });
@@ -89,6 +90,8 @@ function fakeTryPost(clock) {
     const calls = [];
     const requests = [];
     const hooks = { afterGet: null };
+    const uploads = [];
+    const uploadAnswers = []; // queued answers for POST /uploads: a status code or 'network'
     const decided = new Map(); // "<post id> <request_id>" -> action
     let legacy = false;
     let down = false;
@@ -140,9 +143,24 @@ function fakeTryPost(clock) {
         return json(404, {});
     }
 
+    /** POST /uploads (multipart `media`): a temporary upload with a single-use token, like UploadController::create. */
+    async function upload(init) {
+        const answer = uploadAnswers.shift();
+        if (answer === 'network') throw new TypeError('fetch failed');
+        if (answer) return json(answer, answer === 422 ? { message: 'invalid', errors: { media: ['The media field must be a file of type: jpg.'] } } : { message: 'error' });
+        const file = init.body.get('media');
+        const bytes = Buffer.from(await file.arrayBuffer());
+        const token = `00000000-0000-4000-8000-${String(uploads.length + 1).padStart(12, '0')}`;
+        uploads.push({ token, name: file.name, type: file.type, bytes, auth: init.headers.Authorization });
+        const type = file.type.startsWith('image/') ? 'image' : file.type.startsWith('video/') ? 'video' : 'document';
+        return json(201, { upload_token: token, type, mime_type: file.type, size: bytes.length, expires_at: '2026-11-12T12:00:00+00:00' });
+    }
+
     return {
         posts,
         notes,
+        uploads,
+        uploadAnswers,
         calls,
         requests,
         hooks,
@@ -161,6 +179,7 @@ function fakeTryPost(clock) {
         fetch: async (url, init) => {
             const path = new URL(url).pathname.replace(/^\/api/, '');
             calls.push(`${init.method} ${path}`);
+            if (init.method === 'POST' && path === '/uploads') return upload(init);
             const body = init.body ? JSON.parse(init.body) : null;
             requests.push({ method: init.method, path, body });
             if (crash && crash.call === `${init.method} ${path}`) {
@@ -1250,6 +1269,20 @@ describe('http', () => {
 });
 
 describe('whatsapp helpers', () => {
+    it('looks up and downloads inbound media with the access token', async () => {
+        const calls = [];
+        const client = createWhatsAppClient({ graphUrl: 'https://graph.test', graphVersion: 'v23.0', phoneNumberId: '1', accessToken: 'wa-token' }, async (url, init) => {
+            calls.push({ url, auth: init.headers.Authorization });
+            if (url.endsWith('/v23.0/img-1')) return Response.json({ url: 'https://lookaside.test/x', mime_type: 'image/jpeg; q=1', file_size: 8, sha256: 'ab', id: 'img-1' });
+            if (url === 'https://lookaside.test/x') return new Response('12345678');
+            return Response.json({ error: { code: 100, message: 'bad id' } }, { status: 400 });
+        });
+        assert.deepEqual(await client.mediaInfo('img-1'), { url: 'https://lookaside.test/x', mimeType: 'image/jpeg', size: 8, sha256: 'ab' });
+        assert.equal(await (await client.downloadMedia('https://lookaside.test/x')).text(), '12345678');
+        await assert.rejects(client.mediaInfo('nope'), (error) => error.code === 100 && !error.retryable);
+        assert.ok(calls.every((call) => call.auth === 'Bearer wa-token'));
+    });
+
     it('parses button replies, template quick replies and statuses', () => {
         const parsed = parseWebhook({
             entry: [
@@ -1574,5 +1607,192 @@ describe('senders without a phone number (WhatsApp usernames, BSUIDs)', () => {
         } finally {
             await hermes.close();
         }
+    });
+});
+
+/**
+ * Gives the fake WhatsApp client Meta's media endpoints: GET /{media-id} and
+ * the authenticated download. `files` maps a media id to { bytes, mime, size?, sha256? }.
+ */
+function fakeMedia(t, files) {
+    const lookups = [];
+    const downloads = [];
+    const answers = []; // queued answers for the lookup: a WhatsAppError to throw
+    t.whatsapp.mediaInfo = async (id) => {
+        lookups.push(id);
+        if (answers.length) throw answers.shift();
+        const file = files[id];
+        if (!file) throw new WhatsAppError('Unsupported get request', { code: 100, status: 400 });
+        return {
+            url: `https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=${id}&sig=secret`,
+            mimeType: file.mime,
+            size: file.size ?? file.bytes.length,
+            sha256: file.sha256 ?? createHash('sha256').update(file.bytes).digest('hex'),
+        };
+    };
+    t.whatsapp.downloadMedia = async (url) => {
+        const id = new URL(url).searchParams.get('mid');
+        downloads.push(id);
+        return new Response(files[id].bytes, { status: 200, headers: { 'Content-Type': files[id].mime } });
+    };
+    return { lookups, downloads, answers };
+}
+
+describe('media bridge: WhatsApp media to TryPost for the assistant', () => {
+    let t;
+    let hermes;
+    let media;
+    const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]);
+    const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 5, 6, 7]);
+    const MP4 = Buffer.alloc(64, 7);
+    let inbound = 1;
+    const send = (type, block, id = `wamid.media${inbound++}`, from = PHONES.yasir) =>
+        t.echo.handleWebhook({ messages: [{ id, from, type, text: null, raw: { from, id, timestamp: '1762862400', type, [type]: block } }], statuses: [] });
+    const captions = () => hermes.messages().map((message) => message[message.type]?.caption ?? message.text?.body);
+
+    after(() => hermes?.close());
+    beforeEach(async () => {
+        await hermes?.close();
+        hermes = await fakeHermes();
+        t = setup({ assistant: { url: hermes.url, enabled: true } });
+        media = fakeMedia(t, {
+            'img-1': { bytes: JPEG, mime: 'image/jpeg' },
+            'img-2': { bytes: PNG, mime: 'image/png' },
+            'vid-1': { bytes: MP4, mime: 'video/mp4' },
+            'pdf-1': { bytes: Buffer.from('%PDF-1.4'), mime: 'application/pdf' },
+            'big-1': { bytes: JPEG, mime: 'image/jpeg', size: 11 * 1024 * 1024 },
+            'gif-sticker': { bytes: JPEG, mime: 'image/webp; codecs=x' },
+            'doc-1': { bytes: Buffer.from('PK'), mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
+        });
+    });
+
+    it('chooses the TryPost project from the config', () => {
+        assert.equal(t.config.mediaBridge, 'marmara');
+        const projects = (extra) => [{ id: 'a', type: 'trypost', ...extra }, { id: 'b', type: 'trypost' }];
+        const config = (list) => normalizeConfig({ whatsapp: { phoneNumberId: '1', accessToken: 't', appSecret: 's', verifyToken: 'v' }, people: [{ id: 'y', name: 'Y', phone: '905550000001' }], projects: list });
+        assert.equal(config([{ id: 'a', type: 'trypost', mediaBridge: false }]).mediaBridge, null);
+        assert.equal(config(projects({})).mediaBridge, null); // two projects, none chosen: off
+        assert.equal(config(projects({ mediaBridge: true })).mediaBridge, 'a');
+        assert.throws(() => config([{ id: 'a', type: 'trypost', mediaBridge: true }, { id: 'b', type: 'trypost', mediaBridge: true }]), /only one project/);
+    });
+
+    it('downloads an image, uploads it to TryPost and forwards it with the upload token in its caption', async () => {
+        await send('image', { id: 'img-1', mime_type: 'image/jpeg', sha256: 'x', caption: 'Bunu şu metinle paylaş: Atölye cuma!' }, 'wamid.a');
+        assert.equal(t.trypost.uploads.length, 1);
+        const [upload] = t.trypost.uploads;
+        assert.deepEqual(upload.bytes, JPEG);
+        assert.equal(upload.type, 'image/jpeg');
+        assert.equal(upload.name, 'whatsapp-img-1.jpg');
+        assert.equal(upload.auth, 'Bearer token');
+        const [message] = hermes.messages();
+        assert.equal(message.id, 'wamid.a');
+        assert.equal(message.image.id, 'img-1'); // Hermes can still look at the image itself
+        assert.equal(message.image.caption, `Bunu şu metinle paylaş: Atölye cuma!\n\n[TryPost medya: upload_token=${upload.token}, tür=image]`);
+        assert.equal(t.store.inbox('wamid.a').status, 'done');
+        assert.equal(t.whatsapp.sent.length, 0);
+        // Nothing secret in the logs: no token, no download URL.
+        assert.ok(!JSON.stringify(t.logs).includes(upload.token));
+        assert.ok(!JSON.stringify(t.logs).includes('sig=secret'));
+    });
+
+    it('gives a caption to media sent without one, and bridges videos, PDFs and several images in a row', async () => {
+        await send('image', { id: 'img-1', mime_type: 'image/jpeg' });
+        await send('image', { id: 'img-2', mime_type: 'image/png' });
+        await send('video', { id: 'vid-1', mime_type: 'video/mp4', caption: 'video' });
+        await send('document', { id: 'pdf-1', mime_type: 'application/pdf', filename: 'sunum/../kulup.pdf' });
+        const [one, two, video, pdf] = t.trypost.uploads;
+        assert.equal(t.trypost.uploads.length, 4);
+        assert.equal(pdf.name, 'sunum_.._kulup.pdf');
+        assert.equal(video.type, 'video/mp4');
+        assert.deepEqual(captions(), [
+            `[TryPost medya: upload_token=${one.token}, tür=image]`,
+            `[TryPost medya: upload_token=${two.token}, tür=image]`,
+            `video\n\n[TryPost medya: upload_token=${video.token}, tür=video]`,
+            `[TryPost medya: upload_token=${pdf.token}, tür=document]`,
+        ]);
+    });
+
+    it('uploads once: a forward retried while the assistant is down and a redelivered webhook reuse the upload', async () => {
+        hermes.respond(503);
+        await send('image', { id: 'img-1', mime_type: 'image/jpeg' }, 'wamid.a');
+        assert.equal(t.store.inbox('wamid.a').status, 'pending');
+        hermes.respond(200);
+        await later(t, 16_000);
+        await send('image', { id: 'img-1', mime_type: 'image/jpeg' }, 'wamid.a'); // Meta sends the webhook again
+        assert.equal(t.trypost.uploads.length, 1);
+        assert.equal(media.downloads.length, 1);
+        assert.deepEqual(captions(), [`[TryPost medya: upload_token=${t.trypost.uploads[0].token}, tür=image]`]);
+        assert.equal(t.store.bridged('img-1').status, 'uploaded');
+    });
+
+    it('retries a failing upload a bounded number of times, quietly, then forwards with a failure note', async () => {
+        t.trypost.uploadAnswers.push(503, 'network', 503);
+        await send('image', { id: 'img-1', mime_type: 'image/jpeg', caption: 'paylaş' }, 'wamid.a');
+        assert.equal(hermes.messages().length, 0);
+        await later(t, 16_000);
+        assert.equal(hermes.messages().length, 0);
+        await later(t, 61_000);
+        assert.deepEqual(captions(), ['paylaş\n\n[TryPost medya yüklenemedi: bağlantı sorunu]']);
+        assert.equal(t.store.inbox('wamid.a').status, 'done');
+        assert.equal(t.store.bridged('img-1').attempts, 3);
+        assert.equal(t.whatsapp.sent.length, 0); // no "Asistana ulaşamıyorum" for a media retry
+    });
+
+    it('recovers when a retry succeeds', async () => {
+        t.trypost.uploadAnswers.push(502);
+        await send('image', { id: 'img-1', mime_type: 'image/jpeg' }, 'wamid.a');
+        await later(t, 16_000);
+        assert.deepEqual(captions(), [`[TryPost medya: upload_token=${t.trypost.uploads[0].token}, tür=image]`]);
+    });
+
+    it('does not retry what cannot succeed: refused by TryPost, too large, unsupported or unknown media', async () => {
+        t.trypost.uploadAnswers.push(422);
+        await send('image', { id: 'img-1', mime_type: 'image/jpeg' });
+        await send('image', { id: 'big-1', mime_type: 'image/jpeg' });
+        await send('document', { id: 'doc-1', mime_type: 'application/msword', filename: 'a.docx' });
+        await send('image', { id: 'missing', mime_type: 'image/jpeg' });
+        assert.deepEqual(captions(), [
+            '[TryPost medya yüklenemedi: TryPost dosyayı kabul etmedi]',
+            '[TryPost medya yüklenemedi: dosya çok büyük (11.0 MB, sınır 10 MB)]',
+            '[TryPost medya yüklenemedi: desteklenmeyen dosya türü (application/vnd.openxmlformats-officedocument.wordprocessingml.document)]',
+            '[TryPost medya yüklenemedi: WhatsApp medyası alınamadı]',
+        ]);
+        assert.deepEqual(media.downloads, ['img-1']); // the large one was refused from its announced size
+        assert.equal(t.trypost.uploads.length, 0);
+    });
+
+    it('retries when WhatsApp\'s media lookup is temporarily down', async () => {
+        media.answers.push(new WhatsAppError('busy', { status: 500, retryable: true }));
+        await send('image', { id: 'img-1', mime_type: 'image/jpeg' }, 'wamid.a');
+        assert.equal(hermes.messages().length, 0);
+        await later(t, 16_000);
+        assert.equal(t.trypost.uploads.length, 1);
+        assert.equal(hermes.messages().length, 1);
+    });
+
+    it('leaves other messages as they were: text, audio, and media when the bridge is off', async () => {
+        await t.user.say(PHONES.yasir, 'Bu hafta ne paylaşıyoruz?');
+        await send('audio', { id: 'aud-1', mime_type: 'audio/ogg' });
+        assert.deepEqual(hermes.texts(), ['Bu hafta ne paylaşıyoruz?', 'audio']);
+        assert.equal(hermes.messages()[1].audio.caption, undefined);
+        assert.equal(t.trypost.uploads.length + media.lookups.length, 0);
+
+        const off = setup({ assistant: { url: hermes.url }, projectExtra: { mediaBridge: false } });
+        assert.equal(off.config.mediaBridge, null);
+    });
+
+    it('keeps Echo\'s approval flow as it was: buttons and notes go to TryPost, nothing is uploaded', async () => {
+        t.trypost.posts.set('p1', post());
+        await t.user.hello(PHONES.yasir);
+        await t.echo.handleProjectEvent('marmara', approvalEvent(post()));
+        const request = t.whatsapp.last(PHONES.yasir);
+        const [approve, , comment] = buttonsOf(request);
+        await t.user.tap(PHONES.yasir, comment);
+        await t.user.say(PHONES.yasir, 'Görsel biraz karanlık');
+        await t.user.tap(PHONES.yasir, approve);
+        assert.ok(t.trypost.notes.some((note) => note.body.includes('Görsel biraz karanlık')));
+        assert.equal(t.trypost.posts.get('p1').status, 'scheduled');
+        assert.deepEqual(hermes.texts(), ['merhaba']);
+        assert.equal(t.trypost.uploads.length + media.lookups.length, 0);
     });
 });

@@ -246,6 +246,47 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
         return json;
     }
 
+    /**
+     * Uploads a file to the workspace as a temporary upload (POST /uploads,
+     * multipart field `media`). TryPost keeps it 24 hours; its `upload_token`
+     * is spent by the first post that takes it as a media item.
+     * `file` is a Blob (e.g. fs.openAsBlob, so a large video streams from disk).
+     * @returns {Promise<{ uploadToken: string, type: string|null, expiresAt: string|null }>}
+     */
+    async function uploadMedia({ file, filename, mimeType }) {
+        const form = new FormData();
+        form.append('media', file, filename);
+        const path = '/uploads';
+        let response;
+        try {
+            response = await fetchImpl(`${project.apiUrl.replace(/\/$/, '')}${path}`, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${project.apiToken}`, Accept: 'application/json' },
+                body: form,
+            });
+        } catch (cause) {
+            throw Object.assign(new Error(`TryPost POST ${path} -> ${cause.message}`), { status: null, retryable: true });
+        }
+        const text = await response.text();
+        let json = null;
+        try {
+            json = text ? JSON.parse(text) : null;
+        } catch {
+            json = null;
+        }
+        if (!response.ok) {
+            // 422: the file was refused (type, size, pixels); TryPost says why in errors.media.
+            const reason = json?.errors?.media?.[0] ?? json?.message ?? null;
+            const error = new Error(`TryPost POST ${path} -> ${response.status}${reason ? `: ${String(reason).slice(0, 200)}` : ''}`);
+            error.status = response.status;
+            error.retryable = response.status >= 500 || response.status === 429;
+            throw error;
+        }
+        const data = json?.data ?? json;
+        if (!data?.upload_token) throw Object.assign(new Error(`TryPost POST ${path} returned no upload_token`), { retryable: true });
+        return { uploadToken: String(data.upload_token), type: data.type ?? null, expiresAt: data.expires_at ?? null };
+    }
+
     const currentPost = async (id) => {
         try {
             const json = await api('GET', `/posts/${id}`);
@@ -553,6 +594,8 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
     };
 
     return {
+        uploadMedia,
+
         async handleEvent(event, echo) {
             const post = event.data ?? {};
             const eventKey = `${project.id}:${event.id ?? `${event.type}:${post.id}:${fingerprint(post)}`}`;

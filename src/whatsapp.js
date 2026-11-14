@@ -72,7 +72,55 @@ export function createWhatsAppClient(config, fetchImpl = globalThis.fetch) {
         return json.id;
     }
 
-    return { send, uploadMedia };
+    /**
+     * Where an inbound media can be downloaded (GET /{media-id}): { url, mimeType, size, sha256 }.
+     * The URL is valid for about 5 minutes and needs the access token (see downloadMedia).
+     */
+    async function mediaInfo(mediaId) {
+        let response;
+        try {
+            response = await fetchImpl(`${config.graphUrl}/${config.graphVersion}/${encodeURIComponent(mediaId)}`, {
+                headers: { Authorization: `Bearer ${config.accessToken}` },
+            });
+        } catch (error) {
+            throw new WhatsAppError(`network: ${error.message}`, { retryable: true });
+        }
+        const json = await response.json().catch(() => ({}));
+        if (!response.ok || !json?.url) {
+            const code = json?.error?.code ?? null;
+            throw new WhatsAppError(json?.error?.message ?? `media lookup: HTTP ${response.status}`, {
+                code,
+                status: response.status,
+                retryable: response.status >= 500 || response.status === 429 || RETRYABLE_CODES.has(code),
+            });
+        }
+        return {
+            url: json.url,
+            mimeType: json.mime_type ? String(json.mime_type).split(';')[0].trim().toLowerCase() : null,
+            size: json.file_size === undefined ? null : Number(json.file_size),
+            sha256: json.sha256 ?? null,
+        };
+    }
+
+    /** Starts the download of a media URL from mediaInfo; returns the fetch Response (the caller reads its body). */
+    async function downloadMedia(url) {
+        let response;
+        try {
+            response = await fetchImpl(url, { headers: { Authorization: `Bearer ${config.accessToken}` } });
+        } catch (error) {
+            throw new WhatsAppError(`media download: ${error.message}`, { retryable: true });
+        }
+        if (!response.ok) {
+            await response.arrayBuffer().catch(() => null);
+            throw new WhatsAppError(`media download: HTTP ${response.status}`, {
+                status: response.status,
+                retryable: response.status >= 500 || response.status === 429,
+            });
+        }
+        return response;
+    }
+
+    return { send, uploadMedia, mediaInfo, downloadMedia };
 }
 
 /**

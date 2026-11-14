@@ -1,5 +1,5 @@
 {
-  "_DUZENLE": "Duzenleme gerekmez: ${...} degerleri /opt/echo/.env dosyasindan gelir (install.sh sorar). Yeni kisi eklemek icin people ve members listesine ekle. Kisi alanlari: id, name, phone (ulke koduyla, + yok); istege bagli whatsappUsername (WhatsApp kullanici adi, @ olmadan da olur) ve whatsappUserId (Meta BSUID, or. TR.1234...). Kullanici adi olan kisiler numarasiz yazabilir; Echo onlari bu alanlarla ya da daha once numarayla birlikte gordugu BSUID ile tanir.",
+  "_DUZENLE": "Duzenleme gerekmez: ${...} degerleri /opt/echo/.env dosyasindan gelir (install.sh sorar). Yeni kisi eklemek icin people ve members listesine ekle. Kisi alanlari: id, name, phone (ulke koduyla, + yok); istege bagli whatsappUsername (WhatsApp kullanici adi, @ olmadan da olur) ve whatsappUserId (Meta BSUID, or. TR.1234...). Kullanici adi olan kisiler numarasiz yazabilir; Echo onlari bu alanlarla ya da daha once numarayla birlikte gordugu BSUID ile tanir. mediaBridge: true ise kisilerin Hermes'e gonderdigi gorsel/video/PDF once bu projenin TryPost calisma alanina yuklenir (API anahtari Hermes'in TryPost MCP baglantisiyla ayni calisma alanina ait olmali); kapatmak icin false yap.",
   "publicUrl": "https://${ECHO_HOST}",
   "timeZone": "Europe/Istanbul",
   "whatsapp": {
@@ -25,6 +25,7 @@
       "publicUrl": "https://sosyal.marmaraai.com",
       "apiToken": "${MARMARA_TRYPOST_TOKEN}",
       "webhookSecret": "${MARMARA_TRYPOST_WEBHOOK_SECRET}",
+      "mediaBridge": true,
       "templates": {
         "language": "tr",
         "approval": "onay_bekliyor",
