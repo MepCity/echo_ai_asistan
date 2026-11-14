@@ -118,6 +118,12 @@ def main(path):
         display["language"] = "tr"
     config["display"] = display
 
+    # No "gateway shutting down / restarted" notices to WhatsApp users on updates
+    # (gateway/config.py gateway_restart_notification; a root-level platform block).
+    wa = config.get("whatsapp_cloud") if isinstance(config.get("whatsapp_cloud"), dict) else {}
+    wa["gateway_restart_notification"] = False
+    config["whatsapp_cloud"] = wa
+
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         yaml.safe_dump(config, handle, allow_unicode=True, sort_keys=False)
