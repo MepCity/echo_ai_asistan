@@ -109,6 +109,8 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
     const timeouts = { ...BRIDGE_TIMEOUTS_MS, ...mediaTimeouts };
     // Running upload jobs, by bridge key.
     const jobs = new Map();
+    // Messages waiting for a free upload slot, woken when a job ends.
+    const slotWaiters = new Set();
     const adapters = new Map();
     const people = new Map(config.people.map((person) => [person.phone, person]));
     const peopleByUserId = new Map(config.people.filter((person) => person.whatsappUserId).map((person) => [person.whatsappUserId, person]));
@@ -227,8 +229,10 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
 
         /** Waits until no media upload job is running and the worker has passed after them (tests, shutdown). */
         async settled() {
-            while (jobs.size) await Promise.allSettled([...jobs.values()]);
-            await echo.tick();
+            do {
+                while (jobs.size) await Promise.allSettled([...jobs.values()]);
+                await echo.tick();
+            } while (jobs.size);
         },
     };
 
@@ -251,9 +255,13 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
     async function processInbox() {
         store.recoverInbox(5 * 60_000);
         // Each person's messages in order: a message waiting for a retry holds back that person's later ones.
+        // A message is handled at most once per pass: one that comes back at once can never starve the others.
+        const handled = new Set();
         for (let count = 0; count < 500; count++) {
             const item = store.inboxNext();
-            if (!item || !store.claimInbox(item.wa_message_id)) return;
+            if (!item || handled.has(item.wa_message_id)) return;
+            handled.add(item.wa_message_id);
+            if (!store.claimInbox(item.wa_message_id)) return;
             await processInbound(store.inbox(item.wa_message_id));
         }
     }
@@ -281,8 +289,8 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
                 // Waiting for its media upload (a background job): not a failed try, and nothing to tell the person.
                 saveProgress();
                 store.inboxDefer(message.id, error.deferMs);
-                // The job may have finished meanwhile: then the message is due at once.
-                if (!error.waiting()) store.inboxDue(message.id);
+                // Waiting for a job (or a free slot) that already ended: due at once. A retry's backoff just waits.
+                if (error.ready?.()) store.inboxDue(message.id);
                 return;
             }
             if (error.retryable && attempts < backoff.length + 1) {
@@ -569,9 +577,11 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
 
         const key = { messageId: message.id, mediaId, project: projectId, target: bridgeTarget(projectId) };
         const jobKey = JSON.stringify(key);
-        const defer = (ms) => {
-            throw Object.assign(new Error('waiting for the media upload'), { deferMs: Math.max(ms, 0), waiting: () => jobs.has(jobKey) });
+        // `ready` says whether what the message waits for is already over (then it is due at once).
+        const defer = (ms, ready = null) => {
+            throw Object.assign(new Error('waiting for the media upload'), { deferMs: Math.max(ms, 0), ready });
         };
+        const jobDone = () => !jobs.has(jobKey);
         const row = store.bridged(key);
         // An upload kept longer than TryPost keeps it (a forward delayed by an outage) is made again.
         const stale = row?.status === 'uploaded' && store.now() - row.updated_at > BRIDGE_FRESH_MS;
@@ -584,16 +594,23 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
             const caption = block.caption ? `${block.caption}\n\n${note}` : note;
             return { ...message, raw: { ...raw, [kind]: { ...block, caption } } };
         }
-        if (jobs.has(jobKey)) defer(BRIDGE_POLL_MS);
+        if (jobs.has(jobKey)) defer(BRIDGE_POLL_MS, jobDone);
+        // A retry's backoff: only this sender's later messages wait behind it (the inbox keeps order per sender).
         if (row?.status === 'pending' && row.next_attempt_at > store.now()) defer(row.next_attempt_at - store.now());
-        if (jobs.size >= BRIDGE_JOBS) defer(BRIDGE_POLL_MS);
+        if (jobs.size >= BRIDGE_JOBS) {
+            slotWaiters.add(message.id);
+            defer(BRIDGE_POLL_MS, () => jobs.size < BRIDGE_JOBS);
+        }
         const job = runBridgeJob(adapter, key, raw[kind], kind).finally(() => {
             jobs.delete(jobKey);
             store.inboxDue(message.id);
+            // A slot is free: messages that waited for one go now.
+            for (const id of slotWaiters) store.inboxDue(id);
+            slotWaiters.clear();
             echo.tick().catch((error) => log('error', 'tick failed', error.message));
         });
         jobs.set(jobKey, job);
-        defer(BRIDGE_POLL_MS);
+        defer(BRIDGE_POLL_MS, jobDone);
     }
 
     /** One try of an upload, stored as done, as a retry for later (bounded) or as failed. Never throws. */

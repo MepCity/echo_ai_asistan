@@ -1873,6 +1873,36 @@ describe('media bridge: WhatsApp media to TryPost for the assistant', () => {
         assert.deepEqual(captions(), [`[TryPost medya: upload_token=${t.trypost.uploads[0].token}, tür=image]`]);
     });
 
+    it('lets other senders through while one sender\'s media waits for its retry, and keeps that sender\'s order', async () => {
+        t.trypost.uploadAnswers.push(503); // A's upload fails once: it waits 15 s for the retry
+        await send('image', { id: 'img-1', mime_type: 'image/jpeg' }, 'wamid.a1', PHONES.yasir);
+        const claimInbox = t.store.claimInbox;
+        let claims = 0;
+        t.store.claimInbox = (id) => (id === 'wamid.a1' && claims++, claimInbox(id));
+        await t.user.say(PHONES.ayse, 'B: bu hafta ne var?', null, 'wamid.b1');
+        await t.user.say(PHONES.yasir, 'A: bunu paylaş', null, 'wamid.a2');
+        await t.echo.settled();
+        assert.deepEqual(hermes.texts(), ['B: bu hafta ne var?']); // B went at once; A's text waits behind A's image
+        assert.equal(t.store.inbox('wamid.a1').status, 'pending');
+        assert.equal(t.store.inbox('wamid.a2').status, 'pending');
+        assert.equal(claims, 0); // the waiting message is not picked again before its time: no spinning
+        t.store.claimInbox = claimInbox;
+        assert.equal(t.trypost.uploads.length, 0);
+
+        await step(16_000);
+        assert.deepEqual(hermes.texts(), ['B: bu hafta ne var?', 'image', 'A: bunu paylaş']);
+        assert.match(hermes.messages()[1].image.caption, /upload_token=/);
+    });
+
+    it('wakes a message that waited for a free upload slot when a job ends', async () => {
+        await receive('image', { id: 'hang-1', mime_type: 'image/jpeg' }, 'wamid.a1', PHONES.yasir);
+        await receive('image', { id: 'hang-1', mime_type: 'image/jpeg' }, 'wamid.m1', PHONES.mehmet);
+        await receive('image', { id: 'img-1', mime_type: 'image/jpeg' }, 'wamid.b1', PHONES.ayse); // both slots busy: waits
+        await t.echo.settled();
+        assert.equal(t.trypost.uploads.length, 1); // B's upload ran once a slot freed, without a 30 s wait
+        assert.equal(hermes.messages().filter((message) => message.id === 'wamid.b1').length, 1);
+    });
+
     it('does not hold up approvals while an upload is slow', async () => {
         t.trypost.posts.set('p1', post());
         await t.user.hello(PHONES.yasir);
