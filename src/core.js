@@ -55,6 +55,9 @@ const BRIDGE_TYPES = {
 const BRIDGE_LIMITS_MB = { image: 10, video: 100, document: 100 };
 // Echo's own buttons are "<action>:<outbox id>"; anything else (e.g. Hermes' "appr:<id>:approve") is the assistant's.
 const ECHO_BUTTON = /^[a-z_]+:\d+$/i;
+// Told to people who may not use the assistant, at most once an hour each.
+const ASSISTANT_DENIED = 'Asistanı kullanma yetkin yok; onay/görüş mesajları çalışmaya devam ediyor.';
+const DENIED_NOTICE_MS = 60 * 60_000;
 const CANCEL = /^\s*(iptal|vazgeç|vazgec)\s*$/i;
 
 /**
@@ -105,6 +108,11 @@ const CANCEL = /^\s*(iptal|vazgeç|vazgec)\s*$/i;
  * inbox: in order per person, retried on network errors and 5xx, and the
  * person is told when it finally fails. Delivery statuses of messages Echo
  * did not send are the assistant's too, and are forwarded from `forwards`.
+ * Only people in `config.assistant.allowedPeople` reach the assistant (their
+ * messages, their media through the media bridge, and "Hermes'e bırak"):
+ * the assistant acts for the club with one TryPost account and checks no one.
+ * Anyone else gets a short notice (at most once an hour) instead; Echo's own
+ * flows (buttons, note sessions, quote-replies) work for them as before.
  */
 export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl = globalThis.fetch, mediaTimeouts = {} }) {
     const timeouts = { ...BRIDGE_TIMEOUTS_MS, ...mediaTimeouts };
@@ -119,6 +127,8 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
     const assistant = config.assistant
         ? createAssistant(config.assistant, { phoneNumberId: config.whatsapp.phoneNumberId, fetchImpl })
         : null;
+    const assistantPeople = new Set(config.assistant?.allowedPeople ?? []);
+    if (assistant) log('info', `assistant access: ${[...assistantPeople].join(', ') || 'nobody'}`);
     let ticking = null;
     let again = false;
 
@@ -231,6 +241,9 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
         /** True when an assistant (Hermes) is configured. */
         hasAssistant: () => Boolean(assistant),
 
+        /** True when this person may use the assistant (config.assistant.allowedPeople). */
+        assistantAllowed: (person) => Boolean(assistant) && assistantPeople.has(person?.id),
+
         /**
          * Forwards a message Echo wrote on the person's behalf (e.g. "draft a reply
          * to this comment") to the assistant, as if the person had sent it. `id`
@@ -239,6 +252,7 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
          */
         async forwardToAssistant(person, text, id) {
             if (!assistant) throw Object.assign(new Error('no assistant configured'), { retryable: false });
+            if (!assistantPeople.has(person.id)) throw Object.assign(new Error('not allowed to use the assistant'), { retryable: false, userMessage: ASSISTANT_DENIED });
             const from = person.phone && !isUserId(person.phone) ? person.phone : null;
             await assistant.forwardMessage({ id, from, type: 'text', text, timestamp: store.now() }, person);
             log('info', 'synthesized message forwarded to the assistant', id);
@@ -734,8 +748,22 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
         }
     }
 
-    /** Forwards a message to the assistant; the route is stored first so a retry (and a failure) knows where it went. */
+    /**
+     * Forwards a message to the assistant; the route is stored first so a retry (and a failure) knows where it went.
+     * Someone who may not use the assistant gets a notice instead (at most once an hour), and nothing is
+     * forwarded or uploaded (the media bridge never runs for them).
+     */
     async function toAssistant(message, person, progress) {
+        if (!assistantPeople.has(person.id)) {
+            const key = `assistant-denied:${person.id}`;
+            const last = Number(store.getState(key) ?? 0);
+            if (store.now() - last >= DENIED_NOTICE_MS) {
+                store.setState(key, store.now());
+                echo.reply(person, ASSISTANT_DENIED, message.id);
+            }
+            log('info', 'message not forwarded: no assistant access', person.id);
+            return null;
+        }
         store.setRoute(message.id, { assistant: true, progress });
         const forwarded = await bridgeMedia(message);
         await assistant.forwardMessage(forwarded, person);

@@ -80,8 +80,18 @@ henv_set WHATSAPP_CLOUD_WEBHOOK_PORT 8090
 henv_set WHATSAPP_CLOUD_WEBHOOK_PATH /whatsapp/webhook
 # Meta never calls Hermes (Echo does), but the adapter wants a verify token.
 [ -n "$(henv_get WHATSAPP_CLOUD_VERIFY_TOKEN)" ] || henv_set WHATSAPP_CLOUD_VERIFY_TOKEN "$(openssl rand -hex 16)"
-# Kept once set: add numbers by editing this line (see README).
-[ -n "$(henv_get WHATSAPP_CLOUD_ALLOWED_USERS)" ] || henv_set WHATSAPP_CLOUD_ALLOWED_USERS "$DEFAULT_ALLOWED"
+# Who may talk to Hermes: the same people Echo lets through (config.json assistant.allowedPeople,
+# by default the inbox repliers = approvers), worked out by Echo itself from config.json. Echo is the
+# real gate; this keeps Hermes' own list in step. If Echo cannot tell (image not built, config
+# error), the current line is kept.
+ALLOWED=$(compose run --rm --no-deps -T echo node --no-warnings src/assistant-users.js 2>/dev/null || true)
+if [[ $ALLOWED =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+  henv_set WHATSAPP_CLOUD_ALLOWED_USERS "$ALLOWED"
+  echo "WHATSAPP_CLOUD_ALLOWED_USERS config.json'dan alindi (assistant.allowedPeople)."
+else
+  echo "UYARI: Asistan izinli kisileri config.json'dan alinamadi (bos, assistant ayari henuz yok ya da imaj yok); WHATSAPP_CLOUD_ALLOWED_USERS oldugu gibi birakildi. Ilk kurulumdan sonra update.sh tekrar dener."
+  [ -n "$(henv_get WHATSAPP_CLOUD_ALLOWED_USERS)" ] || henv_set WHATSAPP_CLOUD_ALLOWED_USERS "$DEFAULT_ALLOWED"
+fi
 [ -n "$(henv_get WHATSAPP_CLOUD_HOME_CHANNEL)" ] || henv_set WHATSAPP_CLOUD_HOME_CHANNEL "$DEFAULT_ALLOWED"
 [ -n "$(henv_get HERMES_TIMEZONE)" ] || henv_set HERMES_TIMEZONE Europe/Istanbul
 if grep -Eq '^(WHATSAPP_CLOUD_ALLOW_ALL_USERS|GATEWAY_ALLOW_ALL_USERS)=(true|1|yes)' "$HENV"; then

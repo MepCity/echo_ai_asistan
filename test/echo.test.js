@@ -2490,3 +2490,95 @@ describe('social inbox: replies TryPost has not sent yet', () => {
         assert.equal(sentTexts().length, 1);
     });
 });
+
+describe('assistant access: only allowed people reach Hermes', () => {
+    let t;
+    let hermes;
+    after(() => hermes?.close());
+    beforeEach(async () => {
+        await hermes?.close();
+        hermes = await fakeHermes();
+        // Yasir and Ayşe are approvers (inbox repliers), so they may use the assistant; Mehmet is only a reviewer.
+        t = setup({ assistant: { url: hermes.url } });
+    });
+    const notices = () => textsTo(t, PHONES.mehmet, /Asistanı kullanma yetkin yok/);
+
+    it('defaults to the inbox repliers and logs the allowed ids without phone numbers', () => {
+        assert.deepEqual(t.config.assistant.allowedPeople, ['yasir', 'ayse']);
+        const line = t.logs.find((entry) => /^assistant access:/.test(entry[1]));
+        assert.equal(line[1], 'assistant access: yasir, ayse');
+        assert.ok(!JSON.stringify(t.logs).includes(PHONES.yasir));
+        // Set explicitly, and checked.
+        assert.deepEqual(baseConfig({ assistant: { url: hermes.url, allowedPeople: ['mehmet'] } }).assistant.allowedPeople, ['mehmet']);
+        assert.deepEqual(baseConfig({ assistant: { url: hermes.url }, projectExtra: { inbox: { repliers: ['mehmet'] } } }).assistant.allowedPeople, ['mehmet']);
+        assert.throws(() => baseConfig({ assistant: { url: hermes.url, allowedPeople: ['kisi2'] } }), /allowedPeople lists unknown person kisi2/);
+    });
+
+    it('forwards an allowed person\'s message', async () => {
+        await t.user.say(PHONES.yasir, 'Bu hafta ne paylaşıyoruz?', null, 'y1');
+        assert.deepEqual(hermes.messages().map((message) => message.id), ['y1']);
+    });
+
+    it('blocks everyone else with a notice at most once an hour', async () => {
+        await t.user.say(PHONES.mehmet, 'Son Instagram mesajına cevap ver', null, 'm1');
+        await t.user.say(PHONES.mehmet, 'Hadi', null, 'm2');
+        await t.user.tap(PHONES.mehmet, 'appr:123:approve', 'm3'); // a Hermes button
+        assert.equal(hermes.accepted.length, 0);
+        assert.equal(notices().length, 1);
+        assert.equal(bodyOf(notices()[0]), 'Asistanı kullanma yetkin yok; onay/görüş mesajları çalışmaya devam ediyor.');
+        assert.equal(t.store.inbox('m2').status, 'done');
+        await later(t, 61 * 60_000);
+        await t.user.say(PHONES.mehmet, 'Tekrar', null, 'm4');
+        assert.equal(notices().length, 2);
+        assert.equal(hermes.accepted.length, 0);
+    });
+
+    it('keeps Echo\'s own flows for them: feedback buttons and notes', async () => {
+        t.trypost.posts.set('p1', post({ status: 'draft' }));
+        await t.user.say(PHONES.mehmet, 'selam', null, 'm0'); // opens the window (and gets the notice)
+        await t.echo.handleProjectEvent('marmara', {
+            id: 'f1',
+            type: 'post.feedback_requested',
+            data: { ...post({ status: 'draft' }), feedback: { requested_by: { id: 'u-yasir', name: 'Yasir' }, recipients: [{ id: 'u-mehmet', name: 'Mehmet' }] } },
+        });
+        const request = t.whatsapp.last(PHONES.mehmet);
+        await t.user.tap(PHONES.mehmet, buttonsOf(request)[0]);
+        await t.user.say(PHONES.mehmet, 'Görsel güzel', request.id);
+        await t.user.tap(PHONES.mehmet, buttonsOf(request)[2]);
+        await t.user.say(PHONES.mehmet, 'Hashtag ekleyelim');
+        const bodies = t.trypost.notes.map((note) => note.body);
+        assert.ok(bodies.some((body) => body.includes('Mehmet: Uygun')));
+        assert.ok(bodies.some((body) => body.includes('Görsel güzel')));
+        assert.ok(bodies.some((body) => body.includes('Hashtag ekleyelim')));
+        assert.equal(hermes.accepted.length, 0);
+        assert.equal(notices().length, 1);
+    });
+
+    it('blocks "Hermes’e bırak" for a replier who may not use the assistant', async () => {
+        t = setup({ assistant: { url: hermes.url, allowedPeople: ['yasir'] }, projectExtra: { inbox: { repliers: ['yasir', 'mehmet'] } } });
+        await t.user.hello(PHONES.mehmet);
+        await receiveItem(t, inboxItem());
+        const notification = t.whatsapp.last(PHONES.mehmet);
+        await t.user.tap(PHONES.mehmet, idsOf(notification)[1]);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.mehmet)), /Asistanı kullanma yetkin yok/);
+        assert.equal(hermes.accepted.length, 0);
+        // He may still reply himself.
+        await t.user.say(PHONES.mehmet, 'Cuma!', notification.id);
+        await t.user.tap(PHONES.mehmet, idsOf(t.whatsapp.last(PHONES.mehmet))[0]);
+        assert.deepEqual(t.trypost.replies.map((reply) => reply.text), ['Cuma!']);
+    });
+
+    it('never runs the media bridge for them', async () => {
+        const media = fakeMedia(t, { 'img-1': { mime: 'image/jpeg', bytes: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2]) } });
+        await t.echo.handleWebhook({
+            messages: [{ id: 'wm1', from: PHONES.mehmet, type: 'image', text: null, raw: { from: PHONES.mehmet, id: 'wm1', timestamp: '1762862400', type: 'image', image: { id: 'img-1', mime_type: 'image/jpeg' } } }],
+            statuses: [],
+        });
+        await t.echo.settled();
+        assert.equal(media.lookups.length, 0);
+        assert.equal(t.trypost.uploads.length, 0);
+        assert.equal(hermes.accepted.length, 0);
+        assert.equal(notices().length, 1);
+        assert.equal(t.store.inbox('wm1').status, 'done');
+    });
+});

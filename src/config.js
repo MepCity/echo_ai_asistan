@@ -48,7 +48,13 @@ import { readFileSync } from 'node:fs';
  * `assistant` (optional): where messages from known people that Echo does not
  * handle itself are forwarded, as signed WhatsApp webhooks (Hermes Agent's
  * WhatsApp Cloud adapter). Optional keys: "appSecret" (defaults to
- * whatsapp.appSecret) and "timeoutMs" (20000). Without it, or with
+ * whatsapp.appSecret), "timeoutMs" (20000) and "allowedPeople": the person ids
+ * whose messages may reach the assistant. Hermes acts for the club with one
+ * TryPost account (posts, replies) and checks no one, so Echo is the gate. By
+ * default it is everyone who may reply to the social inbox in some project
+ * (`inbox.repliers`, by default the approvers). Others keep Echo's own flows
+ * (approvals by role, notes, "Okundu") and are told they cannot use the
+ * assistant. Hermes' WHATSAPP_CLOUD_ALLOWED_USERS should list the same people. Without it, or with
  * "enabled": false, Echo answers such messages with its help text.
  */
 export function loadConfig(env = process.env) {
@@ -115,7 +121,7 @@ export function normalizeConfig(config) {
         },
         people,
         projects,
-        assistant: normalizeAssistant(config.assistant, config.whatsapp),
+        assistant: normalizeAssistant(config.assistant, config.whatsapp, people, projects),
         mediaBridge: mediaBridgeProject(projects),
     };
 }
@@ -186,7 +192,19 @@ export const minutesOf = (hhmm) => {
     return Number(hours) * 60 + Number(minutes);
 };
 
-function normalizeAssistant(assistant, whatsapp) {
+/** Who may use the assistant: `assistant.allowedPeople`, or every inbox replier of any project. */
+function assistantPeople(assistant, people, projects) {
+    if (assistant.allowedPeople === undefined || assistant.allowedPeople === null) {
+        return [...new Set(projects.flatMap((project) => project.inbox?.repliers ?? []))];
+    }
+    if (!Array.isArray(assistant.allowedPeople)) throw new Error('Config: assistant.allowedPeople must be a list of person ids');
+    for (const id of assistant.allowedPeople) {
+        if (!people.some((person) => person.id === id)) throw new Error(`Config: assistant.allowedPeople lists unknown person ${id}`);
+    }
+    return [...new Set(assistant.allowedPeople)];
+}
+
+function normalizeAssistant(assistant, whatsapp, people = [], projects = []) {
     if (!assistant || assistant.enabled === false || !assistant.url) return null;
     let url;
     try {
@@ -199,5 +217,6 @@ function normalizeAssistant(assistant, whatsapp) {
         url: url.href,
         appSecret: assistant.appSecret ?? whatsapp.appSecret,
         timeoutMs: Number(assistant.timeoutMs ?? 20_000),
+        allowedPeople: assistantPeople(assistant, people, projects),
     };
 }

@@ -271,9 +271,20 @@ bilinmeyen numaraları Hermes'e hiç iletmez). İsteğe bağlı: `"whatsappUsern
 `from_user_id` / `contacts[].user_id` ile) gelebilir; Echo onu bu alanlarla ya da daha önce
 numarasıyla birlikte gördüğü BSUID ile (SQLite `user_ids`) tanır ve Hermes'e iletirken
 numarasını `from` ve `wa_id` alanlarına koyar. Numarası olmayan kişiye BSUID'ye
-(`recipient` alanı) yazılır. (2) Hermes: `/opt/hermes/data/.env`
-içindeki satırı virgülle genişlet: `WHATSAPP_CLOUD_ALLOWED_USERS=905418557902,905xxxxxxxxx`
-(ülke kodu, `+` ve boşluk yok). Sonra `bash /opt/echo/app/deploy/oracle/update.sh`.
+(`recipient` alanı) yazılır. (2) Asistan izni: Hermes tek bir TryPost hesabıyla kulüp
+adına iş yapar (gönderi, cevap) ve kimseyi ayırt etmez; bu yüzden kapı Echo'dadır. Echo
+yalnızca `assistant.allowedPeople` listesindeki kişilerin mesajlarını (metin, medya ve
+medya köprüsü, "Hermes'e bırak") Hermes'e iletir. Liste verilmezse varsayılan, herhangi
+bir projede gelen kutusuna cevap verebilenlerdir (`inbox.repliers`, varsayılanı `approver`
+rolü). Diğerleri onay/görüş butonlarını ve notları kullanmaya devam eder; asistana
+yazdıklarında saatte en fazla bir kez "Asistanı kullanma yetkin yok; onay/görüş mesajları
+çalışmaya devam ediyor." cevabını alır. Echo açılışta izinli kişi id'lerini loglar
+(`assistant access: …`, numarasız). (3) Hermes: `/opt/hermes/data/.env` içindeki
+`WHATSAPP_CLOUD_ALLOWED_USERS` aynı kişileri listelemeli; `setup-hermes.sh` (ve onu çağıran
+`update.sh`) bu satırı Echo'nun kendi hesapladığı listeden yazar
+(`src/assistant-users.js`). Echo bunu hesaplayamazsa satır olduğu gibi kalır; o zaman elle
+yaz: `WHATSAPP_CLOUD_ALLOWED_USERS=905418557902,905xxxxxxxxx` (ülke kodu, `+` ve boşluk
+yok). Sonra `bash /opt/echo/app/deploy/oracle/update.sh`.
 
 **Güvenlik:** TryPost aracı `trust: untrusted` ile tanımlı: salt okunur olmayan her
 TryPost aracı (gönderi oluşturma/düzenleme/silme, hemen yayınlama, onaylama/reddetme,

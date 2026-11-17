@@ -217,6 +217,7 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
 
     async function toHermes(echo, person, items, messageId, progress, say) {
         if (!echo.hasAssistant()) return say('Hermes bağlı değil; cevabı panelden yazabilir ya da "Cevapla"yı kullanabilirsin.');
+        if (!echo.assistantAllowed(person)) return say('Asistanı kullanma yetkin yok; onay/görüş mesajları çalışmaya devam ediyor.');
         if (!progress.forwarded) {
             try {
                 await echo.forwardToAssistant(person, hermesText(items), `${messageId}.inbox`);
