@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Creates Echo's WhatsApp message templates (onay_bekliyor, gorus_istegi) in the
-# WhatsApp Business Account, skipping ones that already exist. Run on the VM:
+# Creates Echo's WhatsApp message templates (onay_bekliyor, gorus_istegi,
+# yeni_etkilesim, etkilesim_ozeti) in the WhatsApp Business Account, skipping
+# ones that already exist. Run on the VM:
 #   bash /opt/echo/app/deploy/oracle/create-templates.sh            # create missing ones
 #   bash /opt/echo/app/deploy/oracle/create-templates.sh --status   # only show approval status
 # Body variables match src/projects/trypost.js: {{1}} project, {{2}} requester,
-# {{3}} channel, {{4}} time, {{5}} excerpt. Button order matches Echo's buttons.
+# {{3}} channel, {{4}} time, {{5}} excerpt. Social inbox (src/projects/trypost-inbox.js):
+# yeni_etkilesim {{1}} platform, {{2}} kind (yorum/mesaj), {{3}} "@author: text";
+# etkilesim_ozeti {{1}} count, {{2}} channels. Button order matches Echo's buttons.
 set -euo pipefail
 
 ENV_FILE=/opt/echo/.env
@@ -33,17 +36,20 @@ status() {   # name -> "STATUS" or empty
 }
 
 EXAMPLES='["Marmara AI Sosyal","Yasir","Instagram · marmaraai","20 Kas 2026 18:00","Yapay zeka atölyemiz cuma 18:00’de!"]'
+INBOX_EXAMPLES='["Instagram","yorum","@ali: Etkinlik ne zaman?"]'
+DIGEST_EXAMPLES='["7","Instagram (4), X (3)"]'
 
-create() {   # name body button1 button2 button3
-  local name=$1 body=$2 current payload response
+create() {   # name body examples_json button...
+  local name=$1 body=$2 examples=$3 current payload response buttons
+  shift 3
   current=$(status "$name")
   if [ -n "$current" ]; then echo "$name: exists ($current), skipped"; return; fi
-  payload=$(jq -n --arg name "$name" --arg body "$body" --argjson ex "$EXAMPLES" \
-            --arg b1 "$3" --arg b2 "$4" --arg b3 "$5" '{
+  buttons=$(printf '%s\n' "$@" | jq -R '{type: "QUICK_REPLY", text: .}' | jq -s .)
+  payload=$(jq -n --arg name "$name" --arg body "$body" --argjson ex "$examples" --argjson buttons "$buttons" '{
     name: $name, language: "tr", category: "UTILITY",
     components: [
       { type: "BODY", text: $body, example: { body_text: [ $ex ] } },
-      { type: "BUTTONS", buttons: [ {type:"QUICK_REPLY",text:$b1}, {type:"QUICK_REPLY",text:$b2}, {type:"QUICK_REPLY",text:$b3} ] }
+      { type: "BUTTONS", buttons: $buttons }
     ] }')
   response=$(graph POST "$WABA_ID/message_templates" "$payload")
   echo "$name: HTTP $(tail -n 1 <<<"$response") $(sed '$d' <<<"$response")"
@@ -51,12 +57,16 @@ create() {   # name body button1 button2 button3
 
 if [ "${1:-}" != "--status" ]; then
   create onay_bekliyor $'📝 {{1}} için onayını bekleyen bir gönderi var.\nOnay isteyen: {{2}}\nKanal: {{3}}\nYayın: {{4}}\n\n"{{5}}"' \
-    "Onayla" "Düzeltme iste" "Yorum yaz"
+    "$EXAMPLES" "Onayla" "Düzeltme iste" "Yorum yaz"
   create gorus_istegi $'👀 {{2}}, {{1}} için görüşünü soruyor.\nKanal: {{3}}\nYayın: {{4}}\n\n"{{5}}"' \
-    "Uygun" "Revize gerekli" "Yorum yaz"
+    "$EXAMPLES" "Uygun" "Revize gerekli" "Yorum yaz"
+  create yeni_etkilesim $'📥 {{1}} üzerinde yeni bir {{2}} var:\n"{{3}}"\n\nCevaplamak ya da okundu olarak işaretlemek için aşağıdaki butonları kullanabilirsin.' \
+    "$INBOX_EXAMPLES" "Cevapla" "Hermes'e bırak" "Okundu"
+  create etkilesim_ozeti $'📥 Sosyal medya hesaplarında {{1}} yeni etkileşim var.\nKanallar: {{2}}\n\nHermes\'e bırakabilir ya da hepsini okundu olarak işaretleyebilirsin.' \
+    "$DIGEST_EXAMPLES" "Hermes'e bırak" "Hepsi okundu"
   echo
 fi
 echo "Status (APPROVED = ready to use; review usually takes minutes to a few hours):"
-for name in onay_bekliyor gorus_istegi; do
+for name in onay_bekliyor gorus_istegi yeni_etkilesim etkilesim_ozeti; do
   echo "  $name: $(status "$name" || true)"
 done
