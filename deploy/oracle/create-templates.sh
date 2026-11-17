@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Creates Echo's WhatsApp message templates (onay_bekliyor, gorus_istegi,
-# yeni_etkilesim, etkilesim_ozeti) in the WhatsApp Business Account, skipping
+# yeni_etkilesim, etkilesim_ozeti and their "_bilgi" variants with only the
+# read button, for people who may not reply) in the WhatsApp Business Account, skipping
 # ones that already exist. Run on the VM:
 #   bash /opt/echo/app/deploy/oracle/create-templates.sh            # create missing ones
 #   bash /opt/echo/app/deploy/oracle/create-templates.sh --status   # only show approval status
@@ -64,9 +65,13 @@ if [ "${1:-}" != "--status" ]; then
     "$INBOX_EXAMPLES" "Cevapla" "Hermes'e bırak" "Okundu"
   create etkilesim_ozeti $'📥 Sosyal medya hesaplarında {{1}} yeni etkileşim var.\nKanallar: {{2}}\n\nHermes\'e bırakabilir ya da hepsini okundu olarak işaretleyebilirsin.' \
     "$DIGEST_EXAMPLES" "Hermes'e bırak" "Hepsi okundu"
+  create yeni_etkilesim_bilgi $'📥 {{1}} üzerinde yeni bir {{2}} var:\n"{{3}}"\n\nAyrıntılar TryPost panelinde.' \
+    "$INBOX_EXAMPLES" "Okundu"
+  create etkilesim_ozeti_bilgi $'📥 Sosyal medya hesaplarında {{1}} yeni etkileşim var.\nKanallar: {{2}}\n\nAyrıntılar TryPost panelinde.' \
+    "$DIGEST_EXAMPLES" "Hepsi okundu"
   echo
 fi
 echo "Status (APPROVED = ready to use; review usually takes minutes to a few hours):"
-for name in onay_bekliyor gorus_istegi yeni_etkilesim etkilesim_ozeti; do
+for name in onay_bekliyor gorus_istegi yeni_etkilesim etkilesim_ozeti yeni_etkilesim_bilgi etkilesim_ozeti_bilgi; do
   echo "  $name: $(status "$name" || true)"
 done
