@@ -7,7 +7,7 @@ import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createAssistant } from './assistant.js';
 import { normalizePhone, normalizeUsername } from './config.js';
-import { MEDIA_ERROR_CODES, OUTSIDE_WINDOW, toPayload, toTemplatePayload } from './whatsapp.js';
+import { MEDIA_ERROR_CODES, OUTSIDE_WINDOW, isUserId, toPayload, toTemplatePayload } from './whatsapp.js';
 
 const BACKOFF_MS = [30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
 const MAX_ATTEMPTS = BACKOFF_MS.length + 1;
@@ -66,6 +66,7 @@ const CANCEL = /^\s*(iptal|vazgeç|vazgec)\s*$/i;
  *   handleEvent(event)            -> Promise<void>   (calls echo.enqueue / echo.notify)
  *   handleAction(ctx)             -> Promise<void>   (a button was tapped)
  *   handleText(ctx)               -> Promise<void>   (a typed note for a session or a reply)
+ *                                                    (ctx.mode: the session's mode, or 'comment' for a quote-reply)
  *   onDeliveryFailed(ctx)         -> Promise<void>   (a request could not be delivered)
  *   periodic?(echo)               -> Promise<void>   (called on every worker pass: reminders, digests)
  *   mediaHeaders?(url)            -> object          (headers for downloading the project's media)
@@ -225,6 +226,22 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
         async handleWebhook(parsed) {
             echo.ingest(parsed);
             await echo.tick();
+        },
+
+        /** True when an assistant (Hermes) is configured. */
+        hasAssistant: () => Boolean(assistant),
+
+        /**
+         * Forwards a message Echo wrote on the person's behalf (e.g. "draft a reply
+         * to this comment") to the assistant, as if the person had sent it. `id`
+         * must be stable across retries. Throws (retryable for network errors and
+         * 5xx) like a forward of the person's own message.
+         */
+        async forwardToAssistant(person, text, id) {
+            if (!assistant) throw Object.assign(new Error('no assistant configured'), { retryable: false });
+            const from = person.phone && !isUserId(person.phone) ? person.phone : null;
+            await assistant.forwardMessage({ id, from, type: 'text', text, timestamp: store.now() }, person);
+            log('info', 'synthesized message forwarded to the assistant', id);
         },
 
         /** Waits until no media upload job is running and the worker has passed after them (tests, shutdown). */

@@ -10,6 +10,7 @@ import { normalizeConfig } from '../src/config.js';
 import { createEcho } from '../src/core.js';
 import { createStore, openDatabase } from '../src/db.js';
 import { createTryPostProject, fingerprint, sameVersion, versionTag } from '../src/projects/trypost.js';
+import { replyRequestId } from '../src/projects/trypost-inbox.js';
 import { createHttpServer } from '../src/server.js';
 import { WhatsAppError, createWhatsAppClient, parseWebhook, toPayload, verifySignature } from '../src/whatsapp.js';
 
@@ -97,6 +98,11 @@ function fakeTryPost(clock) {
     const uploads = [];
     const uploadAnswers = []; // queued answers for POST /uploads: a status code or 'network'
     const decided = new Map(); // "<post id> <request_id>" -> action
+    // Social inbox (the contract of TryPost's Inbox module).
+    const inbox = new Map(); // item id -> item
+    const replies = []; // replies TryPost accepted (and would post on the platform)
+    const replyResults = new Map(); // request_id -> [status, body]: a repeat answers the same
+    const reads = []; // item ids marked read
     let legacy = false;
     let down = false;
     let crash = null;
@@ -106,6 +112,8 @@ function fakeTryPost(clock) {
     function handle(method, path, body) {
         if (typeof down === 'number') return json(down, { message: 'error' });
         if (down) return json(503, { message: 'down' });
+        const inboxMatch = path.match(/^\/inbox\/items\/([^/]+)(?:\/(\w+))?$/);
+        if (inboxMatch) return handleInbox(method, decodeURIComponent(inboxMatch[1]), inboxMatch[2], body);
         const match = path.match(/^\/posts\/([^/]+)(?:\/(\w+))?$/);
         const post = match && posts.get(match[1]);
         if (!post) return json(404, { message: 'not found' });
@@ -147,6 +155,35 @@ function fakeTryPost(clock) {
         return json(404, {});
     }
 
+    /**
+     * GET /inbox/items/{id}; POST .../replies {text, request_id} -> 201 {id, status}, the same
+     * request_id answers the same again, 409 when the reply window closed, 422 when the text is
+     * empty or longer than 1000 characters; POST .../read.
+     */
+    function handleInbox(method, id, action, body) {
+        const item = inbox.get(id);
+        if (!item) return json(404, { message: 'not found' });
+        if (method === 'GET' && !action) return json(200, { data: item });
+        if (method === 'POST' && action === 'read') {
+            reads.push(id);
+            return json(200, { data: { ...item, read: true } });
+        }
+        if (method === 'POST' && action === 'replies') {
+            const done = replyResults.get(body?.request_id);
+            if (done) return json(done[0], done[1]);
+            let answer;
+            if (item.reply_window_ends_at && Date.parse(item.reply_window_ends_at) <= clock.t) answer = [409, { message: 'The reply window has closed.' }];
+            else if (!body?.text || body.text.length > 1000) answer = [422, { message: 'invalid', errors: { text: ['Metin en fazla 1000 karakter olabilir.'] } }];
+            else {
+                replies.push({ itemId: id, text: body.text, requestId: body.request_id });
+                answer = [201, { id: `r${replies.length}`, status: 'sent' }];
+            }
+            if (body?.request_id) replyResults.set(body.request_id, answer);
+            return json(...answer);
+        }
+        return json(404, {});
+    }
+
     /** POST /uploads (multipart `media`): a temporary upload with a single-use token, like UploadController::create. */
     async function upload(init) {
         const answer = uploadAnswers.shift();
@@ -171,6 +208,9 @@ function fakeTryPost(clock) {
         requests,
         hooks,
         decided,
+        inbox,
+        replies,
+        reads,
         setDown: (value) => (down = value),
         setLegacy: (value) => (legacy = value),
         /** Someone decides in the panel (the API token's user is Echo's, so approved_by says nothing). */
@@ -1916,3 +1956,372 @@ describe('media bridge: WhatsApp media to TryPost for the assistant', () => {
     });
 });
 
+
+const inboxItem = (overrides = {}) => ({
+    id: 'i1',
+    platform: 'instagram',
+    kind: 'comment',
+    author: { name: 'Ali Veli', handle: 'ali' },
+    text: 'Etkinlik ne zaman?',
+    permalink: 'https://instagram.com/p/abc',
+    post: { id: 'p1', excerpt: 'Yapay zeka atölyemiz cuma 18:00’de!' },
+    received_at: '2026-11-11T11:59:00Z',
+    can_reply: true,
+    reply_window_ends_at: null,
+    ...overrides,
+});
+const inboxEvent = (item, id = `evt-${item.id}`) => ({ id, type: 'inbox.item_received', data: { item } });
+
+/** TryPost tells Echo about a new comment or DM (and knows the item for its API). */
+const receiveItem = async (t, item, eventId) => {
+    t.trypost.inbox.set(item.id, item);
+    await t.echo.handleProjectEvent('marmara', inboxEvent(item, eventId));
+};
+
+/** Button ids of an interactive or template message. */
+const idsOf = (message) =>
+    message.type === 'template'
+        ? message.template.components.filter((component) => component.type === 'button').map((component) => component.parameters[0].payload)
+        : buttonsOf(message);
+const bodyOf = (message) => message.interactive?.body.text ?? message.text?.body ?? '';
+const replyCalls = (t) => t.trypost.requests.filter((request) => request.path.endsWith('/replies'));
+
+describe('social inbox: notifications', () => {
+    let t;
+    beforeEach(() => {
+        t = setup();
+    });
+
+    it('notifies inside the window with an interactive message and three buttons', async () => {
+        await t.user.hello(PHONES.yasir);
+        await receiveItem(t, inboxItem());
+        const message = t.whatsapp.last(PHONES.yasir);
+        assert.equal(message.type, 'interactive');
+        assert.match(bodyOf(message), /📥 \*Instagram yorumu\* — @ali: “Etkinlik ne zaman\?”/);
+        assert.match(bodyOf(message), /Gönderi: “Yapay zeka atölyemiz/);
+        assert.match(bodyOf(message), /https:\/\/instagram\.com\/p\/abc/);
+        assert.deepEqual(
+            message.interactive.action.buttons.map((button) => button.reply.title),
+            ['Cevapla', 'Hermes’e bırak', 'Okundu'],
+        );
+        const row = t.store.outboxByWaId(message.id);
+        assert.equal(row.kind, 'inbox');
+        assert.equal(row.item_id, 'i1');
+    });
+
+    it('uses the yeni_etkilesim template outside the window, with the same buttons', async () => {
+        await receiveItem(t, inboxItem({ platform: 'linkedin-page', kind: 'message', author: { name: 'Zeynep' }, text: 'Merhaba,  staj var mı?' }));
+        const message = t.whatsapp.last(PHONES.ayse);
+        assert.equal(message.type, 'template');
+        assert.equal(message.template.name, 'yeni_etkilesim');
+        const params = message.template.components.find((component) => component.type === 'body').parameters.map((param) => param.text);
+        assert.deepEqual(params, ['LinkedIn', 'mesaj', 'Zeynep: Merhaba, staj var mı?']);
+        assert.equal(idsOf(message).length, 3);
+        assert.match(idsOf(message)[0], /^ib_reply:\d+$/);
+    });
+
+    it('notifies every member once per item, however often the item is sent', async () => {
+        await receiveItem(t, inboxItem(), 'evt-a');
+        await receiveItem(t, inboxItem(), 'evt-a'); // TryPost retried the webhook
+        await receiveItem(t, inboxItem(), 'evt-b'); // another event for the same item
+        for (const phone of Object.values(PHONES)) assert.equal(t.whatsapp.to(phone).length, 1);
+    });
+
+    it('notifies only the configured recipients', async () => {
+        t = setup({ projectExtra: { inbox: { recipients: ['yasir'] } } });
+        await receiveItem(t, inboxItem());
+        assert.equal(t.whatsapp.to(PHONES.yasir).length, 1);
+        assert.equal(t.whatsapp.to(PHONES.ayse).length, 0);
+    });
+
+    it('sends nothing when the inbox is turned off', async () => {
+        t = setup({ projectExtra: { inbox: { enabled: false } } });
+        await receiveItem(t, inboxItem());
+        assert.equal(t.whatsapp.sent.length, 0);
+    });
+
+    it('sends a digest instead of a burst: the first ones alone, the rest together at the end of the window', async () => {
+        await t.user.hello(PHONES.yasir);
+        for (let i = 1; i <= 12; i++) {
+            await receiveItem(t, inboxItem({ id: `i${i}`, text: `Soru ${i}`, platform: i % 3 ? 'instagram' : 'x' }));
+            t.clock.t += 5_000;
+        }
+        const alone = () => t.whatsapp.to(PHONES.yasir).filter((m) => /📥 \*/.test(bodyOf(m)));
+        assert.equal(alone().length, 5);
+        await later(t, 60_000); // still inside the window of the first held item
+        assert.equal(alone().length, 5);
+        assert.equal(t.whatsapp.to(PHONES.yasir).filter((m) => /yeni etkileşim var/.test(bodyOf(m))).length, 0);
+        await later(t, 60_000);
+        const digest = t.whatsapp.last(PHONES.yasir);
+        assert.match(bodyOf(digest), /7 yeni etkileşim var/);
+        assert.match(bodyOf(digest), /Soru 6/);
+        assert.deepEqual(digest.interactive.action.buttons.map((button) => button.reply.title), ['Hermes’e bırak', 'Hepsi okundu']);
+        // Outside the window the digest goes as its template.
+        const template = t.whatsapp.last(PHONES.ayse);
+        assert.equal(template.template.name, 'etkilesim_ozeti');
+        const params = template.template.components.find((component) => component.type === 'body').parameters.map((param) => param.text);
+        assert.deepEqual(params, ['7', 'X (3), Instagram (4)']);
+        // Sent once.
+        await later(t, 10 * 60_000);
+        assert.equal(t.whatsapp.to(PHONES.yasir).filter((m) => /yeni etkileşim var/.test(bodyOf(m))).length, 1);
+
+        // "Hepsi okundu" marks all of them read.
+        await t.user.tap(PHONES.yasir, idsOf(digest)[1]);
+        assert.deepEqual(t.trypost.reads, ['i6', 'i7', 'i8', 'i9', 'i10', 'i11', 'i12']);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /7 etkileşim okundu/);
+    });
+
+    it('takes the digest settings from the config, and sends a single held item on its own', async () => {
+        t = setup({ projectExtra: { inbox: { digestThreshold: 1, digestWindowSec: 30 } } });
+        await t.user.hello(PHONES.yasir);
+        await receiveItem(t, inboxItem({ id: 'i1' }));
+        await receiveItem(t, inboxItem({ id: 'i2', text: 'İkinci' }));
+        assert.equal(t.whatsapp.to(PHONES.yasir).filter((m) => /📥/.test(bodyOf(m))).length, 1);
+        await later(t, 31_000);
+        const message = t.whatsapp.last(PHONES.yasir);
+        assert.match(bodyOf(message), /📥 \*Instagram yorumu\* — @ali: “İkinci”/);
+        assert.equal(idsOf(message).length, 3);
+    });
+
+    it('holds notifications during quiet hours and sends them when they end', async () => {
+        t = setup({ projectExtra: { inbox: { quietHours: { start: '23:00', end: '08:00' } } } });
+        t.clock.t = Date.parse('2026-11-11T21:30:00Z'); // 00:30 in Istanbul
+        await t.user.hello(PHONES.yasir);
+        await receiveItem(t, inboxItem({ id: 'i1' }));
+        await receiveItem(t, inboxItem({ id: 'i2' }));
+        await later(t, 3 * 60 * 60_000); // 03:30
+        assert.equal(t.whatsapp.to(PHONES.ayse).length, 0);
+        t.clock.t = Date.parse('2026-11-12T05:00:00Z'); // 08:00
+        await t.echo.tick();
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /2 yeni etkileşim var/);
+    });
+
+    it('checks the inbox settings', () => {
+        assert.deepEqual(baseConfig().projects[0].inbox, { enabled: true, digestThreshold: 5, digestWindowSec: 120, quietHours: null, recipients: null });
+        assert.deepEqual(baseConfig({ projectExtra: { inbox: { quietHours: '23:30-07:00' } } }).projects[0].inbox.quietHours, { start: '23:30', end: '07:00' });
+        assert.throws(() => baseConfig({ projectExtra: { inbox: { quietHours: { start: '25:00', end: '08:00' } } } }), /quietHours/);
+        assert.throws(() => baseConfig({ projectExtra: { inbox: { recipients: ['hasan'] } } }), /not a member/);
+        assert.throws(() => baseConfig({ projectExtra: { inbox: { digestThreshold: 0 } } }), /digestThreshold/);
+    });
+});
+
+describe('social inbox: replies', () => {
+    let t;
+    let notification;
+    beforeEach(async () => {
+        t = setup();
+        await t.user.hello(PHONES.yasir);
+        await receiveItem(t, inboxItem());
+        notification = t.whatsapp.last(PHONES.yasir);
+    });
+    const confirmOf = () => t.whatsapp.to(PHONES.yasir).filter((m) => /Şu cevabı göndereyim mi/.test(bodyOf(m))).at(-1);
+
+    it('asks for the text on "Cevapla", shows it back and sends it on "Gönder"', async () => {
+        await t.user.tap(PHONES.yasir, idsOf(notification)[0]);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /Cevabını yaz: Instagram yorumu, @ali/);
+        await t.user.say(PHONES.yasir, 'Cuma 18:00’de, görüşmek üzere!', null, 'draft-1');
+
+        const confirm = confirmOf();
+        assert.match(bodyOf(confirm), /\n\nCuma 18:00’de, görüşmek üzere!$/);
+        assert.deepEqual(confirm.interactive.action.buttons.map((button) => button.reply.title), ['Gönder', 'Düzenle', 'İptal']);
+        assert.equal(confirm.context.message_id, 'draft-1');
+        assert.equal(replyCalls(t).length, 0);
+
+        await t.user.tap(PHONES.yasir, idsOf(confirm)[0]);
+        assert.deepEqual(t.trypost.replies, [{ itemId: 'i1', text: 'Cuma 18:00’de, görüşmek üzere!', requestId: replyRequestId('marmara', 'draft-1') }]);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /✅ Cevabın gönderildi/);
+
+        // A double tap sends nothing again.
+        await t.user.tap(PHONES.yasir, idsOf(confirm)[0]);
+        assert.equal(replyCalls(t).length, 1);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /zaten gönderildi/);
+    });
+
+    it('takes a quote-reply to the notification as the reply text', async () => {
+        await t.user.say(PHONES.yasir, 'Cuma akşamı!', notification.id);
+        assert.match(bodyOf(confirmOf()), /Cuma akşamı!$/);
+    });
+
+    it('lets the person edit the draft; the old draft no longer sends', async () => {
+        await t.user.say(PHONES.yasir, 'Cuma', notification.id);
+        const first = confirmOf();
+        await t.user.tap(PHONES.yasir, idsOf(first)[1]); // Düzenle
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /Yeni cevabını yaz/);
+        await t.user.say(PHONES.yasir, 'Cuma 18:00, Mühendislik binası');
+        const second = confirmOf();
+        assert.notEqual(second.id, first.id);
+        assert.match(bodyOf(second), /Mühendislik binası$/);
+
+        await t.user.tap(PHONES.yasir, idsOf(first)[0]);
+        assert.equal(replyCalls(t).length, 0);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /yerine yenisini yazdın/);
+        await t.user.tap(PHONES.yasir, idsOf(second)[0]);
+        assert.deepEqual(t.trypost.replies.map((reply) => reply.text), ['Cuma 18:00, Mühendislik binası']);
+    });
+
+    it('cancels a draft', async () => {
+        await t.user.say(PHONES.yasir, 'Cuma', notification.id);
+        const confirm = confirmOf();
+        await t.user.tap(PHONES.yasir, idsOf(confirm)[2]);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /cevap gönderilmedi/);
+        await t.user.tap(PHONES.yasir, idsOf(confirm)[0]);
+        assert.equal(replyCalls(t).length, 0);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /iptal etmiştin/);
+    });
+
+    it('"iptal" ends the "Cevapla" session without a draft', async () => {
+        await t.user.tap(PHONES.yasir, idsOf(notification)[0]);
+        await t.user.say(PHONES.yasir, 'iptal');
+        assert.equal(confirmOf(), undefined);
+        assert.equal(t.store.session(PHONES.yasir), null);
+    });
+
+    it('retries a reply while TryPost is down, with the same request_id', async () => {
+        await t.user.say(PHONES.yasir, 'Cuma', notification.id, 'draft-1');
+        t.trypost.setDown(true);
+        await t.user.tap(PHONES.yasir, idsOf(confirmOf())[0], 'send-1');
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /ulaşamıyorum/);
+        t.trypost.setDown(false);
+        await later(t, 31_000);
+        assert.equal(t.trypost.replies.length, 1);
+        assert.deepEqual([...new Set(replyCalls(t).map((call) => call.body.request_id))], [replyRequestId('marmara', 'draft-1')]);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /✅ Cevabın gönderildi/);
+    });
+
+    it('replies once when Echo crashed after TryPost took the reply', async () => {
+        await t.user.say(PHONES.yasir, 'Cuma', notification.id, 'draft-1');
+        const confirm = confirmOf();
+        const crashed = t.trypost.crashOn('POST /inbox/items/i1/replies', { when: 'after' });
+        t.user.tap(PHONES.yasir, idsOf(confirm)[0], 'send-1'); // the process dies inside the call
+        await crashed;
+        assert.equal(t.store.decision(t.store.outboxByWaId(confirm.id).id, PHONES.yasir).state, 'started');
+        restart(t);
+        await later(t, 6 * 60_000);
+
+        const calls = replyCalls(t);
+        assert.equal(calls.length, 2);
+        assert.equal(calls[1].body.request_id, calls[0].body.request_id);
+        assert.equal(t.trypost.replies.length, 1);
+        assert.equal(t.store.inbox('send-1').status, 'done');
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /✅ Cevabın gönderildi/);
+    });
+
+    it('says the reply window closed (409) and offers "Okundu"', async () => {
+        t.trypost.inbox.get('i1').reply_window_ends_at = '2026-11-11T12:30:00Z';
+        await t.user.say(PHONES.yasir, 'Cuma', notification.id);
+        t.clock.t = Date.parse('2026-11-11T12:31:00Z');
+        await t.user.tap(PHONES.yasir, idsOf(confirmOf())[0]);
+        const answer = t.whatsapp.last(PHONES.yasir);
+        assert.match(bodyOf(answer), /cevap süresi dolmuş/);
+        assert.deepEqual(answer.interactive.action.buttons.map((button) => button.reply.title), ['Okundu']);
+        assert.equal(t.trypost.replies.length, 0);
+        await t.user.tap(PHONES.yasir, idsOf(answer)[0]);
+        assert.deepEqual(t.trypost.reads, ['i1']);
+    });
+
+    it('explains a refused text (422) and lets the person edit it', async () => {
+        await t.user.say(PHONES.yasir, 'x'.repeat(1200), notification.id);
+        // A long draft is shown in a message of its own before the buttons.
+        const messages = t.whatsapp.to(PHONES.yasir);
+        assert.equal(messages.at(-2).text.body, 'x'.repeat(1200));
+        await t.user.tap(PHONES.yasir, idsOf(confirmOf())[0]);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /Cevabın gönderilemedi: Metin en fazla 1000 karakter olabilir\.\nMetni değiştirmek için "Düzenle"ye bas/);
+        await t.user.tap(PHONES.yasir, idsOf(confirmOf())[1]);
+        await t.user.say(PHONES.yasir, 'Kısa cevap');
+        await t.user.tap(PHONES.yasir, idsOf(confirmOf())[0]);
+        assert.deepEqual(t.trypost.replies.map((reply) => reply.text), ['Kısa cevap']);
+    });
+
+    it('says when an item cannot be replied to and offers "Okundu"', async () => {
+        t.trypost.inbox.get('i1').can_reply = false;
+        await t.user.tap(PHONES.yasir, idsOf(notification)[0]);
+        const answer = t.whatsapp.last(PHONES.yasir);
+        assert.match(bodyOf(answer), /buradan cevap verilemiyor/);
+        assert.deepEqual(answer.interactive.action.buttons.map((button) => button.reply.title), ['Okundu']);
+        assert.equal(t.store.session(PHONES.yasir), null);
+    });
+
+    it('marks an item read on "Okundu", once', async () => {
+        await t.user.tap(PHONES.yasir, idsOf(notification)[2], 'read-1');
+        await t.user.tap(PHONES.yasir, idsOf(notification)[2], 'read-1'); // a retried webhook
+        assert.deepEqual(t.trypost.reads, ['i1']);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /Okundu olarak işaretlendi/);
+    });
+
+    it('works from the template outside the window too', async () => {
+        const template = t.whatsapp.last(PHONES.ayse);
+        await t.user.tap(PHONES.ayse, idsOf(template)[0]);
+        await t.user.say(PHONES.ayse, 'Teşekkürler!');
+        const confirm = t.whatsapp.last(PHONES.ayse);
+        assert.match(bodyOf(confirm), /Şu cevabı göndereyim mi[\s\S]*Teşekkürler!$/);
+        await t.user.tap(PHONES.ayse, idsOf(confirm)[0]);
+        assert.deepEqual(t.trypost.replies.map((reply) => reply.text), ['Teşekkürler!']);
+    });
+
+    it('leaves approvals as they were', async () => {
+        t.trypost.posts.set('p1', post());
+        await t.echo.handleProjectEvent('marmara', approvalEvent(post()));
+        const request = t.whatsapp.last(PHONES.yasir);
+        await receiveItem(t, inboxItem({ id: 'i2' }));
+        // A quote-reply to the approval request is still a comment on the post; to the notification, a draft.
+        await t.user.say(PHONES.yasir, 'Görsel biraz karanlık', request.id);
+        assert.ok(t.trypost.notes.some((note) => note.body.includes('Görsel biraz karanlık')));
+        await t.user.tap(PHONES.yasir, buttonsOf(request)[0]);
+        assert.equal(t.trypost.posts.get('p1').status, 'scheduled');
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /Onaylandı/);
+        assert.equal(replyCalls(t).length, 0);
+    });
+});
+
+describe('social inbox: "Hermes’e bırak"', () => {
+    let t;
+    let hermes;
+    after(() => hermes?.close());
+    beforeEach(async () => {
+        await hermes?.close();
+        hermes = await fakeHermes();
+        t = setup({ assistant: { url: hermes.url } });
+        await t.user.say(PHONES.yasir, 'merhaba', null, 'hello-1'); // goes to Hermes, opens the window
+    });
+
+    it('forwards the item to Hermes with an instruction to draft a reply', async () => {
+        await receiveItem(t, inboxItem());
+        await t.user.tap(PHONES.yasir, idsOf(t.whatsapp.last(PHONES.yasir))[1], 'tap-h');
+        const forwarded = hermes.messages().at(-1);
+        assert.equal(forwarded.from, PHONES.yasir);
+        assert.equal(forwarded.id, 'tap-h.inbox');
+        assert.match(forwarded.text.body, /^\[Echo · Gelen kutusu\] Bu yoruma cevap taslağı hazırla/);
+        assert.match(forwarded.text.body, /Kimden: Ali Veli @ali/);
+        assert.match(forwarded.text.body, /Metin: “Etkinlik ne zaman\?”/);
+        assert.match(forwarded.text.body, /inbox_item_id: i1/);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /Hermes’e ilettim/);
+        // The button tap itself is Echo's, not forwarded.
+        assert.equal(hermes.texts().filter((text) => /^ib_/.test(text)).length, 0);
+    });
+
+    it('forwards once when Hermes was down, then delivers on the retry', async () => {
+        await receiveItem(t, inboxItem());
+        hermes.respond(503);
+        await t.user.tap(PHONES.yasir, idsOf(t.whatsapp.last(PHONES.yasir))[1], 'tap-h');
+        hermes.respond(200);
+        await later(t, 31_000);
+        assert.equal(hermes.messages().filter((message) => message.id === 'tap-h.inbox').length, 1);
+    });
+
+    it('forwards a whole digest', async () => {
+        for (let i = 1; i <= 7; i++) await receiveItem(t, inboxItem({ id: `i${i}`, text: `Soru ${i}` }));
+        await later(t, 121_000);
+        await t.user.tap(PHONES.yasir, idsOf(t.whatsapp.last(PHONES.yasir))[0], 'tap-all');
+        const body = hermes.messages().at(-1).text.body;
+        assert.match(body, /2 yeni etkileşim var/);
+        assert.match(body, /inbox_item_id: i6[\s\S]*inbox_item_id: i7/);
+    });
+
+    it('says so when no assistant is configured', async () => {
+        const plain = setup();
+        await plain.user.hello(PHONES.yasir);
+        await receiveItem(plain, inboxItem());
+        await plain.user.tap(PHONES.yasir, idsOf(plain.whatsapp.last(PHONES.yasir))[1]);
+        assert.match(bodyOf(plain.whatsapp.last(PHONES.yasir)), /Hermes bağlı değil/);
+    });
+});

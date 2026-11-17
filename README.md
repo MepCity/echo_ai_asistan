@@ -42,6 +42,7 @@ Meta ──▶ Echo /whatsapp ──▶ Echo's own flows (TryPost approvals, not
 | `post.approval_requested`  | every approver except the requester                   | Onayla · Düzeltme iste (+note → reject) · Yorum |
 | `post.feedback_requested`  | the people chosen in "Görüş iste"                     | Uygun · Revize gerekli (+note) · Yorum          |
 | `post.approved` / `rejected` | the requester and other approvers, only inside the 24h window | –                                   |
+| `inbox.item_received`      | project members (social inbox, see below)             | Cevapla (+text → Gönder/Düzenle/İptal) · Hermes'e bırak · Okundu |
 
 Every answer becomes a note on the post. A reply to a message whose content has
 changed since is not applied; Echo sends the new version instead. A failed
@@ -52,6 +53,31 @@ to Echo's "Yorumunu yaz…" prompt about it). Without a quote it goes to the ope
 note session ("Yorum yaz" / "Düzeltme iste"); a new tap replaces the session, and
 the prompt names the content it is for. With neither, Echo asks the person to
 quote-reply; it never guesses.
+
+### Social inbox
+
+`inbox.item_received` (same signing) carries `data.item` = `{id, platform, kind:
+"comment"|"message", author:{name, handle}, text, permalink, post:{id, excerpt}|null,
+received_at, can_reply, reply_window_ends_at|null}`. Echo notifies the project's
+members (or `inbox.recipients`) once per item id: an interactive message inside
+the 24h window, the `yeni_etkilesim` template outside it, with **Cevapla ·
+Hermes'e bırak · Okundu**.
+
+- More than `digestThreshold` (5) items within `digestWindowSec` (120 s): the
+  first ones go alone, the rest are held and sent as one digest ("7 yeni
+  etkileşim var", template `etkilesim_ozeti`) at the end of the window, with
+  **Hermes'e bırak · Hepsi okundu**. `quietHours` holds everything until it ends.
+- **Cevapla** (or a quote-reply to the notification) → the typed text is shown
+  back with **Gönder · Düzenle · İptal**. **Gönder** calls
+  `POST /api/inbox/items/{id}/replies {text, request_id}`; `request_id` is
+  `echo-ib-<sha256(project, WhatsApp id of the typed draft)>`, so retries and
+  double taps send one reply (a decision row per draft, as for approvals).
+  201 → "gönderildi"; 409 → reply window closed (offers Okundu); 422 → the
+  reason, edit and try again. `can_reply: false` → said, with Okundu.
+- **Hermes'e bırak** forwards "[Echo · Gelen kutusu] Bu yoruma cevap taslağı
+  hazırla…" with the item summary and `inbox_item_id` to Hermes, which drafts and
+  confirms with the TryPost MCP inbox tools.
+- **Okundu** → `POST /api/inbox/items/{id}/read`.
 
 ## Contract with TryPost
 

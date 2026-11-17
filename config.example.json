@@ -20,7 +20,8 @@
       "publicUrl": "https://sosyal.marmaraai.com",
       "apiToken": "${MARMARA_TRYPOST_TOKEN}",
       "webhookSecret": "${MARMARA_TRYPOST_WEBHOOK_SECRET}",
-      "templates": { "language": "tr", "approval": "onay_bekliyor", "feedback": "gorus_istegi" },
+      "templates": { "language": "tr", "approval": "onay_bekliyor", "feedback": "gorus_istegi", "inbox": "yeni_etkilesim", "inboxDigest": "etkilesim_ozeti" },
+      "inbox": { "enabled": true, "digestThreshold": 5, "digestWindowSec": 120, "quietHours": { "start": "23:00", "end": "08:00" }, "recipients": null },
       "members": [
         { "person": "yasir", "userId": "<TryPost user id>", "roles": ["reviewer", "approver"] },
         { "person": "ayse", "userId": "<TryPost user id>", "roles": ["reviewer"] }

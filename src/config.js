@@ -32,6 +32,16 @@ import { readFileSync } from 'node:fs';
  * workspace before they are forwarded, so the assistant can attach them to a
  * post. With a single TryPost project it is on unless set to false.
  *
+ * A TryPost project may set "inbox" for its social inbox (comments and DMs
+ * from TryPost's `inbox.item_received` webhook): { "enabled": true,
+ * "digestThreshold": 5, "digestWindowSec": 120, "quietHours": null,
+ * "recipients": null }. It is on by default for TryPost projects. When more
+ * than `digestThreshold` items come within `digestWindowSec`, the rest are
+ * held and sent as one digest at the end of the window. `quietHours`
+ * ({ "start": "23:00", "end": "08:00" } in timeZone, or "23:00-08:00") holds
+ * notifications until it ends. `recipients` lists person ids (members of the
+ * project) to notify; null notifies every member.
+ *
  * `assistant` (optional): where messages from known people that Echo does not
  * handle itself are forwarded, as signed WhatsApp webhooks (Hermes Agent's
  * WhatsApp Cloud adapter). Optional keys: "appSecret" (defaults to
@@ -87,7 +97,7 @@ export function normalizeConfig(config) {
             if (!person) throw new Error(`Config: project ${project.id} lists unknown person ${member.person}`);
             return { ...member, roles: member.roles ?? ['reviewer'], person };
         });
-        return { name: project.id, templates: {}, ...project, members };
+        return { name: project.id, templates: {}, ...project, members, inbox: normalizeInbox(project, members) };
     });
 
     return {
@@ -123,6 +133,50 @@ function mediaBridgeProject(projects) {
     if (trypost.length === 1 && trypost[0].mediaBridge !== false) return trypost[0].id;
     return null;
 }
+
+const INBOX_DEFAULTS = { digestThreshold: 5, digestWindowSec: 120 };
+const HHMM = /^([01]?\d|2[0-3]):([0-5]\d)$/;
+
+/** A project's social inbox settings; on by default for TryPost projects. */
+export function normalizeInbox(project, members = []) {
+    const raw = project.inbox;
+    const value = raw && typeof raw === 'object' ? raw : {};
+    const enabled = raw === false ? false : raw === true ? true : (value.enabled ?? project.type === 'trypost') !== false;
+    const number = (key, min) => {
+        const given = value[key] ?? INBOX_DEFAULTS[key];
+        const parsed = Number(given);
+        if (!Number.isFinite(parsed) || parsed < min) throw new Error(`Config: projects[${project.id}].inbox.${key} must be a number >= ${min}`);
+        return parsed;
+    };
+    let quietHours = null;
+    if (value.quietHours) {
+        const [start, end] = typeof value.quietHours === 'string' ? value.quietHours.split('-').map((part) => part.trim()) : [value.quietHours.start, value.quietHours.end];
+        if (!HHMM.test(String(start ?? '')) || !HHMM.test(String(end ?? '')) || start === end) {
+            throw new Error(`Config: projects[${project.id}].inbox.quietHours must be { "start": "HH:MM", "end": "HH:MM" }`);
+        }
+        quietHours = { start, end };
+    }
+    let recipients = null;
+    if (Array.isArray(value.recipients)) {
+        for (const id of value.recipients) {
+            if (!members.some((member) => member.person.id === id)) throw new Error(`Config: projects[${project.id}].inbox.recipients lists ${id}, who is not a member`);
+        }
+        recipients = value.recipients.slice();
+    }
+    return {
+        enabled: Boolean(enabled),
+        digestThreshold: Math.floor(number('digestThreshold', 1)),
+        digestWindowSec: number('digestWindowSec', 0),
+        quietHours,
+        recipients,
+    };
+}
+
+/** Minutes after midnight of "HH:MM". */
+export const minutesOf = (hhmm) => {
+    const [, hours, minutes] = String(hhmm).match(HHMM);
+    return Number(hours) * 60 + Number(minutes);
+};
 
 function normalizeAssistant(assistant, whatsapp) {
     if (!assistant || assistant.enabled === false || !assistant.url) return null;

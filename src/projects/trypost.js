@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { createInbox } from './trypost-inbox.js';
 
 const PLATFORMS = {
     instagram: 'Instagram',
@@ -79,7 +80,9 @@ const MORE_IMAGES = 4;
  * The template names of a project. `approval` / `feedback` name the text
  * templates; the media variants default to "<name>_gorsel" / "<name>_video"
  * and the other templates to their standard names once `approval` (or
- * `feedback`) is set. A key set to null or "" turns that template off.
+ * `feedback`) is set. The social inbox templates (`inbox`, `inboxDigest`)
+ * default to "yeni_etkilesim" and "etkilesim_ozeti". A key set to null or ""
+ * turns that template off.
  */
 export function templateNames(templates = {}) {
     const t = templates ?? {};
@@ -96,6 +99,8 @@ export function templateNames(templates = {}) {
         alert: pick('alert', 'yayin_hatasi'),
         reminder: pick('reminder', 'onay_hatirlatma'),
         digest: pick('digest', 'gunluk_ozet'),
+        inbox: t.inbox !== undefined ? t.inbox || null : 'yeni_etkilesim',
+        inboxDigest: t.inboxDigest !== undefined ? t.inboxDigest || null : 'etkilesim_ozeti',
     };
 }
 
@@ -585,6 +590,16 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
         return true;
     }
 
+    const inbox = createInbox({
+        project,
+        api,
+        names,
+        timeZone,
+        platformName: (platform) => PLATFORMS[platform] ?? null,
+        decisionState,
+        recipients: () => (project.inbox?.recipients ? members.filter((member) => project.inbox.recipients.includes(member.person.id)) : members),
+    });
+
     const explain = (error) => {
         if (error.status === 403) return 'Bu işlem için TryPost yetkim yok, yöneticiye haber ver.';
         if (error.status === 404) return 'Gönderi bulunamadı, silinmiş olabilir.';
@@ -603,6 +618,7 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
         uploadMedia,
 
         async handleEvent(event, echo) {
+            if (event.type === 'inbox.item_received') return inbox.handleEvent(event, echo);
             const post = event.data ?? {};
             const eventKey = `${project.id}:${event.id ?? `${event.type}:${post.id}:${fingerprint(post)}`}`;
 
@@ -649,9 +665,10 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
             }
         },
 
-        async handleAction({ echo, person, row, action, messageId }) {
+        async handleAction({ echo, person, row, action, messageId, progress = {} }) {
             const member = memberByPhone(person.phone);
             if (!member) return;
+            if (row.kind.startsWith('inbox')) return inbox.handleAction({ echo, person, row, action, messageId, progress });
             const isApproval = row.kind === 'approval';
             const reply = (text) => echo.reply(person, text, messageId, project.id, row.id);
 
@@ -733,6 +750,7 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
         async handleText({ echo, person, row, mode, text, messageId, progress = {} }) {
             const member = memberByPhone(person.phone);
             if (!member) return;
+            if (row.kind.startsWith('inbox')) return inbox.handleText({ echo, person, row, mode, text, messageId, progress });
             const reply = (body, dedupeKey = null) => echo.reply(person, body, messageId, project.id, row.id, dedupeKey);
             try {
                 if (mode === 'revise' && row.kind === 'approval' && can(member, 'approver')) {
@@ -787,6 +805,9 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
                 throw giveUp(error);
             }
         },
+
+        /** Held social inbox items: sent once their burst window (and quiet hours) are over. */
+        periodic: (echo) => inbox.periodic(echo),
 
         texts: {
             retrying: 'TryPost’a şu an ulaşamıyorum, cevabını kaydettim; bağlantı gelince işleyeceğim.',

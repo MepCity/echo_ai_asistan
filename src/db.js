@@ -38,6 +38,11 @@ import { DatabaseSync } from 'node:sqlite';
  * - forwards:  delivery statuses of messages Echo did not send (the assistant
  *              sent them), waiting to be passed on to the assistant; retried
  *              with backoff, removed once it took them
+ * - social_items: social inbox items (comments, DMs) a project told Echo about,
+ *              one row per project and item id (a repeated webhook adds nothing).
+ *              'notified' (sent on its own), 'held' (waiting for a digest or for
+ *              quiet hours to end) or 'digested' (sent in a digest); who
+ *              replied to it through Echo, if anyone
  */
 export function openDatabase(dataDir) {
     let file = ':memory:';
@@ -161,6 +166,19 @@ export function openDatabase(dataDir) {
             updated_at      INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS forwards_due ON forwards (status, next_attempt_at);
+
+        CREATE TABLE IF NOT EXISTS social_items (
+            project      TEXT NOT NULL,
+            item_id      TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            state        TEXT NOT NULL,
+            received_at  INTEGER NOT NULL,
+            notified_at  INTEGER,
+            replied_by   TEXT,
+            replied_at   INTEGER,
+            PRIMARY KEY (project, item_id)
+        );
+        CREATE INDEX IF NOT EXISTS social_items_state ON social_items (project, state, received_at);
     `);
     migrate(db);
     return db;
@@ -285,6 +303,12 @@ export function createStore(db, now = () => Date.now()) {
         // A deferred message: back to pending without counting a try (it was waiting, not failing).
         inboxDefer: q(`UPDATE inbox SET status = 'pending', attempts = MAX(attempts - 1, 0), next_attempt_at = ?, updated_at = ? WHERE wa_message_id = ?`),
         inboxDue: q(`UPDATE inbox SET next_attempt_at = 0 WHERE wa_message_id = ? AND status = 'pending'`),
+        socialAdd: q(`INSERT OR IGNORE INTO social_items (project, item_id, payload_json, state, received_at, notified_at) VALUES (?, ?, ?, ?, ?, ?)`),
+        socialItem: q(`SELECT * FROM social_items WHERE project = ? AND item_id = ?`),
+        socialHeld: q(`SELECT * FROM social_items WHERE project = ? AND state = 'held' ORDER BY received_at, rowid`),
+        socialRecent: q(`SELECT COUNT(*) AS count FROM social_items WHERE project = ? AND state IN ('notified', 'digested') AND notified_at > ?`),
+        socialMark: q(`UPDATE social_items SET state = ?, notified_at = ? WHERE project = ? AND item_id = ?`),
+        socialReplied: q(`UPDATE social_items SET replied_by = ?, replied_at = ? WHERE project = ? AND item_id = ?`),
     };
 
     const parseInbox = (row) =>
@@ -410,5 +434,21 @@ export function createStore(db, now = () => Date.now()) {
         inboxDefer: (waId, delayMs) => statements.inboxDefer.run(now() + delayMs, now(), waId),
         /** Makes a waiting message due now (its media upload finished). */
         inboxDue: (waId) => statements.inboxDue.run(waId),
+        /**
+         * Records a social inbox item as 'notified' or 'held'.
+         * @returns {boolean} false when this item id was already recorded (a repeated webhook)
+         */
+        socialAdd: (project, item, state) =>
+            statements.socialAdd.run(project, String(item.id), JSON.stringify(item), state, now(), state === 'notified' ? now() : null).changes === 1,
+        socialItem: (project, itemId) => {
+            const row = statements.socialItem.get(project, String(itemId));
+            return row ? { ...row, item: JSON.parse(row.payload_json) } : null;
+        },
+        /** Items waiting for a digest (or for quiet hours to end), oldest first. */
+        socialHeld: (project) => statements.socialHeld.all(project).map((row) => ({ ...row, item: JSON.parse(row.payload_json) })),
+        /** How many items were sent (on their own or in a digest) since `sinceMs`. */
+        socialRecent: (project, sinceMs) => Number(statements.socialRecent.get(project, sinceMs).count),
+        socialMark: (project, itemId, state) => statements.socialMark.run(state, now(), project, String(itemId)),
+        socialReplied: (project, itemId, by) => statements.socialReplied.run(by, now(), project, String(itemId)),
     };
 }
