@@ -23,9 +23,11 @@ TOKEN=$(sed -n "s/^WA_ACCESS_TOKEN=//p" "$ENV_FILE" | tail -n 1 | sed "s/^'\(.*\
 
 # graph METHOD PATH [JSON_BODY] -> prints body, then the HTTP status on the last line
 graph() {
-  local args=(-sS -X "$1" -w '\n%{http_code}' -H @<(printf 'Authorization: Bearer %s\n' "$TOKEN"))
+  # The token header is read from a process substitution opened by curl's own command line,
+  # so it never shows in `ps` and the descriptor is still open when curl reads it.
+  local args=(-sS -X "$1" -w '\n%{http_code}')
   [ -n "${3:-}" ] && args+=(-H 'Content-Type: application/json' --data-binary "$3")
-  curl "${args[@]}" "$GRAPH/$2"
+  curl "${args[@]}" -H @<(printf 'Authorization: Bearer %s\n' "$TOKEN") "$GRAPH/$2"
 }
 
 status() {   # name -> "STATUS" or empty
