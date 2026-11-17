@@ -80,8 +80,10 @@ const MORE_IMAGES = 4;
  * The template names of a project. `approval` / `feedback` name the text
  * templates; the media variants default to "<name>_gorsel" / "<name>_video"
  * and the other templates to their standard names once `approval` (or
- * `feedback`) is set. The social inbox templates (`inbox`, `inboxDigest`)
- * default to "yeni_etkilesim" and "etkilesim_ozeti". A key set to null or ""
+ * `feedback`) is set. The social inbox templates (`inbox`, `inboxDigest`, and
+ * for people who may not reply `inboxReadOnly`, `inboxDigestReadOnly`) default
+ * to "yeni_etkilesim", "etkilesim_ozeti", "yeni_etkilesim_bilgi" and
+ * "etkilesim_ozeti_bilgi". A key set to null or ""
  * turns that template off.
  */
 export function templateNames(templates = {}) {
@@ -101,6 +103,8 @@ export function templateNames(templates = {}) {
         digest: pick('digest', 'gunluk_ozet'),
         inbox: t.inbox !== undefined ? t.inbox || null : 'yeni_etkilesim',
         inboxDigest: t.inboxDigest !== undefined ? t.inboxDigest || null : 'etkilesim_ozeti',
+        inboxReadOnly: t.inboxReadOnly !== undefined ? t.inboxReadOnly || null : 'yeni_etkilesim_bilgi',
+        inboxDigestReadOnly: t.inboxDigestReadOnly !== undefined ? t.inboxDigestReadOnly || null : 'etkilesim_ozeti_bilgi',
     };
 }
 
@@ -598,6 +602,7 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
         platformName: (platform) => PLATFORMS[platform] ?? null,
         decisionState,
         recipients: () => (project.inbox?.recipients ? members.filter((member) => project.inbox.recipients.includes(member.person.id)) : members),
+        canReply: (person) => Boolean(project.inbox?.repliers?.includes(person.id)),
     });
 
     const explain = (error) => {

@@ -43,6 +43,9 @@ import { DatabaseSync } from 'node:sqlite';
  *              'notified' (sent on its own), 'held' (waiting for a digest or for
  *              quiet hours to end) or 'digested' (sent in a digest); who
  *              replied to it through Echo, if anyone
+ * - reply_checks: inbox replies TryPost accepted but had not sent yet
+ *              ('sending'/'pending'): re-checked with the same request_id on
+ *              the worker's passes, a bounded number of times
  */
 export function openDatabase(dataDir) {
     let file = ':memory:';
@@ -179,6 +182,16 @@ export function openDatabase(dataDir) {
             PRIMARY KEY (project, item_id)
         );
         CREATE INDEX IF NOT EXISTS social_items_state ON social_items (project, state, received_at);
+
+        CREATE TABLE IF NOT EXISTS reply_checks (
+            outbox_id     INTEGER NOT NULL,
+            phone         TEXT NOT NULL,
+            project       TEXT NOT NULL,
+            attempts      INTEGER NOT NULL DEFAULT 0,
+            next_check_at INTEGER NOT NULL,
+            created_at    INTEGER NOT NULL,
+            PRIMARY KEY (outbox_id, phone)
+        );
     `);
     migrate(db);
     return db;
@@ -309,6 +322,12 @@ export function createStore(db, now = () => Date.now()) {
         socialRecent: q(`SELECT COUNT(*) AS count FROM social_items WHERE project = ? AND state IN ('notified', 'digested') AND notified_at > ?`),
         socialMark: q(`UPDATE social_items SET state = ?, notified_at = ? WHERE project = ? AND item_id = ?`),
         socialReplied: q(`UPDATE social_items SET replied_by = ?, replied_at = ? WHERE project = ? AND item_id = ?`),
+        checkReply: q(`INSERT INTO reply_checks (outbox_id, phone, project, next_check_at, created_at) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(outbox_id, phone) DO NOTHING`),
+        replyChecksDue: q(`SELECT * FROM reply_checks WHERE project = ? AND next_check_at <= ? ORDER BY next_check_at LIMIT ?`),
+        replyCheckLater: q(`UPDATE reply_checks SET attempts = attempts + 1, next_check_at = ? WHERE outbox_id = ? AND phone = ? RETURNING attempts`),
+        replyCheckDone: q(`DELETE FROM reply_checks WHERE outbox_id = ? AND phone = ?`),
+        undecideAny: q(`DELETE FROM decisions WHERE outbox_id = ? AND phone = ? AND state = 'started'`),
     };
 
     const parseInbox = (row) =>
@@ -450,5 +469,13 @@ export function createStore(db, now = () => Date.now()) {
         socialRecent: (project, sinceMs) => Number(statements.socialRecent.get(project, sinceMs).count),
         socialMark: (project, itemId, state) => statements.socialMark.run(state, now(), project, String(itemId)),
         socialReplied: (project, itemId, by) => statements.socialReplied.run(by, now(), project, String(itemId)),
+        /** Remembers to re-check a reply TryPost had not sent yet (kept as it is when already waiting). */
+        checkReply: (outboxId, phone, project, delayMs) => statements.checkReply.run(outboxId, phone, project, now() + delayMs, now()),
+        replyChecksDue: (project, limit = 20) => statements.replyChecksDue.all(project, now(), limit),
+        /** @returns {number} the checks made so far */
+        replyCheckLater: (outboxId, phone, delayMs) => Number(statements.replyCheckLater.get(now() + delayMs, outboxId, phone)?.attempts ?? 0),
+        replyCheckDone: (outboxId, phone) => statements.replyCheckDone.run(outboxId, phone),
+        /** Removes a started (never applied) decision, whichever message started it. */
+        undecideAny: (outboxId, phone) => statements.undecideAny.run(outboxId, phone),
     };
 }

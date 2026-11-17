@@ -40,7 +40,10 @@ import { readFileSync } from 'node:fs';
  * held and sent as one digest at the end of the window. `quietHours`
  * ({ "start": "23:00", "end": "08:00" } in timeZone, or "23:00-08:00") holds
  * notifications until it ends. `recipients` lists person ids (members of the
- * project) to notify; null notifies every member.
+ * project) to notify; null notifies every member. `repliers` lists the person
+ * ids who may reply (and hand items to Hermes, which replies with the same
+ * TryPost token); null means the members with the "approver" role, the ones
+ * who may publish. Everyone else is notified with "Okundu" only.
  *
  * `assistant` (optional): where messages from known people that Echo does not
  * handle itself are forwarded, as signed WhatsApp webhooks (Hermes Agent's
@@ -156,19 +159,24 @@ export function normalizeInbox(project, members = []) {
         }
         quietHours = { start, end };
     }
-    let recipients = null;
-    if (Array.isArray(value.recipients)) {
-        for (const id of value.recipients) {
-            if (!members.some((member) => member.person.id === id)) throw new Error(`Config: projects[${project.id}].inbox.recipients lists ${id}, who is not a member`);
+    const personList = (key) => {
+        if (value[key] === undefined || value[key] === null) return null;
+        if (!Array.isArray(value[key])) throw new Error(`Config: projects[${project.id}].inbox.${key} must be a list of person ids`);
+        for (const id of value[key]) {
+            if (!members.some((member) => member.person.id === id)) throw new Error(`Config: projects[${project.id}].inbox.${key} lists ${id}, who is not a member`);
         }
-        recipients = value.recipients.slice();
-    }
+        return value[key].slice();
+    };
+    const recipients = personList('recipients');
+    // By default only those who may approve (publish) may reply on the club's behalf.
+    const repliers = personList('repliers') ?? members.filter((member) => member.roles.includes('approver')).map((member) => member.person.id);
     return {
         enabled: Boolean(enabled),
         digestThreshold: Math.floor(number('digestThreshold', 1)),
         digestWindowSec: number('digestWindowSec', 0),
         quietHours,
         recipients,
+        repliers,
     };
 }
 

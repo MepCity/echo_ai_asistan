@@ -67,13 +67,23 @@ Hermes'e bırak · Okundu**.
   first ones go alone, the rest are held and sent as one digest ("7 yeni
   etkileşim var", template `etkilesim_ozeti`) at the end of the window, with
   **Hermes'e bırak · Hepsi okundu**. `quietHours` holds everything until it ends.
+- Who may reply is separate from who is notified: `inbox.repliers` (person
+  ids; default: members with the `approver` role, who may publish). Others get
+  "Okundu" only (templates `yeni_etkilesim_bilgi` / `etkilesim_ozeti_bilgi`),
+  and Echo refuses their reply buttons and typed replies on every press ("Bu
+  etkileşime cevap verme yetkin yok"). "Hermes'e bırak" is a replier button too,
+  since Hermes replies with the same TryPost token.
 - **Cevapla** (or a quote-reply to the notification) → the typed text is shown
   back with **Gönder · Düzenle · İptal**. **Gönder** calls
   `POST /api/inbox/items/{id}/replies {text, request_id}`; `request_id` is
   `echo-ib-<sha256(project, WhatsApp id of the typed draft)>`, so retries and
   double taps send one reply (a decision row per draft, as for approvals).
-  201 → "gönderildi"; 409 → reply window closed (offers Okundu); 422 → the
-  reason, edit and try again. `can_reply: false` → said, with Okundu.
+  Only `status: "sent"` is told as sent. `sending`/`pending` → "⏳ Gönderiliyor…";
+  the decision stays open and the worker replays the POST with the same
+  request_id (30 s, 1, 2, 5, 10, 15, 30 min; then "durumunu doğrulayamadım",
+  and a new Gönder checks again) until `sent` or `failed`. `failed` → the
+  error, with Düzenle / Okundu. 409 → reply window closed (offers Okundu);
+  422 → the reason, edit and try again. `can_reply: false` → said, with Okundu.
 - **Hermes'e bırak** forwards "[Echo · Gelen kutusu] Bu yoruma cevap taslağı
   hazırla…" with the item summary and `inbox_item_id` to Hermes, which drafts and
   confirms with the TryPost MCP inbox tools.

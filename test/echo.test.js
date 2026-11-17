@@ -101,7 +101,8 @@ function fakeTryPost(clock) {
     // Social inbox (the contract of TryPost's Inbox module).
     const inbox = new Map(); // item id -> item
     const replies = []; // replies TryPost accepted (and would post on the platform)
-    const replyResults = new Map(); // request_id -> [status, body]: a repeat answers the same
+    const replyResults = new Map(); // request_id -> [status, body] or the reply: a repeat answers the same (with its current status)
+    const replyStatuses = []; // statuses for the next accepted replies (default 'sent'); a test may change a reply's status later
     const reads = []; // item ids marked read
     let legacy = false;
     let down = false;
@@ -170,13 +171,16 @@ function fakeTryPost(clock) {
         }
         if (method === 'POST' && action === 'replies') {
             const done = replyResults.get(body?.request_id);
-            if (done) return json(done[0], done[1]);
+            if (Array.isArray(done)) return json(done[0], done[1]);
+            if (done) return json(201, { id: done.id, status: done.status, ...(done.error ? { error: done.error } : {}) });
             let answer;
             if (item.reply_window_ends_at && Date.parse(item.reply_window_ends_at) <= clock.t) answer = [409, { message: 'The reply window has closed.' }];
             else if (!body?.text || body.text.length > 1000) answer = [422, { message: 'invalid', errors: { text: ['Metin en fazla 1000 karakter olabilir.'] } }];
             else {
-                replies.push({ itemId: id, text: body.text, requestId: body.request_id });
-                answer = [201, { id: `r${replies.length}`, status: 'sent' }];
+                const reply = { id: `r${replies.length + 1}`, itemId: id, text: body.text, requestId: body.request_id, status: replyStatuses.shift() ?? 'sent' };
+                replies.push(reply);
+                if (body?.request_id) replyResults.set(body.request_id, reply);
+                return json(201, { id: reply.id, status: reply.status });
             }
             if (body?.request_id) replyResults.set(body.request_id, answer);
             return json(...answer);
@@ -211,6 +215,7 @@ function fakeTryPost(clock) {
         inbox,
         replies,
         reads,
+        replyStatuses,
         setDown: (value) => (down = value),
         setLegacy: (value) => (legacy = value),
         /** Someone decides in the panel (the API token's user is Echo's, so approved_by says nothing). */
@@ -2097,7 +2102,17 @@ describe('social inbox: notifications', () => {
     });
 
     it('checks the inbox settings', () => {
-        assert.deepEqual(baseConfig().projects[0].inbox, { enabled: true, digestThreshold: 5, digestWindowSec: 120, quietHours: null, recipients: null });
+        assert.deepEqual(baseConfig().projects[0].inbox, {
+            enabled: true,
+            digestThreshold: 5,
+            digestWindowSec: 120,
+            quietHours: null,
+            recipients: null,
+            repliers: ['yasir', 'ayse'], // the approvers
+        });
+        assert.deepEqual(baseConfig({ projectExtra: { inbox: { repliers: ['mehmet'] } } }).projects[0].inbox.repliers, ['mehmet']);
+        assert.throws(() => baseConfig({ projectExtra: { inbox: { repliers: ['hasan'] } } }), /repliers lists hasan, who is not a member/);
+        assert.throws(() => baseConfig({ projectExtra: { inbox: { repliers: 'yasir' } } }), /list of person ids/);
         assert.deepEqual(baseConfig({ projectExtra: { inbox: { quietHours: '23:30-07:00' } } }).projects[0].inbox.quietHours, { start: '23:30', end: '07:00' });
         assert.throws(() => baseConfig({ projectExtra: { inbox: { quietHours: { start: '25:00', end: '08:00' } } } }), /quietHours/);
         assert.throws(() => baseConfig({ projectExtra: { inbox: { recipients: ['hasan'] } } }), /not a member/);
@@ -2128,7 +2143,10 @@ describe('social inbox: replies', () => {
         assert.equal(replyCalls(t).length, 0);
 
         await t.user.tap(PHONES.yasir, idsOf(confirm)[0]);
-        assert.deepEqual(t.trypost.replies, [{ itemId: 'i1', text: 'Cuma 18:00’de, görüşmek üzere!', requestId: replyRequestId('marmara', 'draft-1') }]);
+        assert.deepEqual(
+            t.trypost.replies.map(({ itemId, text, requestId }) => ({ itemId, text, requestId })),
+            [{ itemId: 'i1', text: 'Cuma 18:00’de, görüşmek üzere!', requestId: replyRequestId('marmara', 'draft-1') }],
+        );
         assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /✅ Cevabın gönderildi/);
 
         // A double tap sends nothing again.
@@ -2323,5 +2341,152 @@ describe('social inbox: "Hermes’e bırak"', () => {
         await receiveItem(plain, inboxItem());
         await plain.user.tap(PHONES.yasir, idsOf(plain.whatsapp.last(PHONES.yasir))[1]);
         assert.match(bodyOf(plain.whatsapp.last(PHONES.yasir)), /Hermes bağlı değil/);
+    });
+});
+
+describe('social inbox: who may reply', () => {
+    let t;
+    beforeEach(async () => {
+        t = setup(); // Yasir and Ayşe are approvers, Mehmet only a reviewer
+        await t.user.hello(PHONES.yasir);
+        await t.user.hello(PHONES.mehmet);
+        await receiveItem(t, inboxItem());
+    });
+
+    it('notifies a member who may not reply with "Okundu" only, and the read-only template outside the window', async () => {
+        const mehmet = t.whatsapp.last(PHONES.mehmet);
+        assert.deepEqual(mehmet.interactive.action.buttons.map((button) => button.reply.title), ['Okundu']);
+        assert.doesNotMatch(bodyOf(mehmet), /yanıtlayabilirsin/);
+        assert.deepEqual(t.whatsapp.last(PHONES.yasir).interactive.action.buttons.map((button) => button.reply.title), ['Cevapla', 'Hermes’e bırak', 'Okundu']);
+
+        t = setup({ projectExtra: { inbox: { repliers: ['yasir'] } } });
+        await receiveItem(t, inboxItem());
+        const ayse = t.whatsapp.last(PHONES.ayse);
+        assert.equal(ayse.template.name, 'yeni_etkilesim_bilgi');
+        assert.equal(idsOf(ayse).length, 1);
+        assert.match(idsOf(ayse)[0], /^ib_read:/);
+        assert.equal(t.whatsapp.last(PHONES.yasir).template.name, 'yeni_etkilesim');
+    });
+
+    it('refuses replies from someone who may not reply, whatever button or text they send', async () => {
+        const own = t.store.outboxByWaId(t.whatsapp.last(PHONES.mehmet).id);
+        // Buttons crafted for his own notification (as if he still had an old one with every button).
+        for (const action of ['ib_reply', 'ib_hermes']) {
+            await t.user.tap(PHONES.mehmet, `${action}:${own.id}`);
+            assert.equal(bodyOf(t.whatsapp.last(PHONES.mehmet)), 'Bu etkileşime cevap verme yetkin yok.');
+        }
+        assert.equal(t.store.session(PHONES.mehmet), null);
+        // A quote-reply to the notification is refused too, and nothing is sent.
+        const notification = t.whatsapp.to(PHONES.mehmet).find((m) => m.interactive);
+        await t.user.say(PHONES.mehmet, 'Cuma!', notification.id);
+        assert.equal(bodyOf(t.whatsapp.last(PHONES.mehmet)), 'Bu etkileşime cevap verme yetkin yok.');
+        assert.equal(t.whatsapp.to(PHONES.mehmet).filter((m) => /Şu cevabı göndereyim mi/.test(bodyOf(m))).length, 0);
+        // "Okundu" still works.
+        await t.user.tap(PHONES.mehmet, idsOf(notification)[0]);
+        assert.deepEqual(t.trypost.reads, ['i1']);
+        assert.equal(replyCalls(t).length, 0);
+    });
+
+    it('refuses "Gönder" from someone whose reply permission was taken away after the draft', async () => {
+        await t.user.say(PHONES.yasir, 'Cuma', t.whatsapp.last(PHONES.yasir).id);
+        const confirm = t.whatsapp.last(PHONES.yasir);
+        t.config.projects[0].inbox.repliers = ['ayse'];
+        await t.user.tap(PHONES.yasir, idsOf(confirm)[0]);
+        assert.equal(bodyOf(t.whatsapp.last(PHONES.yasir)), 'Bu etkileşime cevap verme yetkin yok.');
+        assert.equal(replyCalls(t).length, 0);
+    });
+
+    it('hides the digest\'s "Hermes’e bırak" from those who may not reply', async () => {
+        for (let i = 2; i <= 8; i++) await receiveItem(t, inboxItem({ id: `i${i}` }));
+        await later(t, 121_000);
+        assert.deepEqual(t.whatsapp.last(PHONES.mehmet).interactive.action.buttons.map((button) => button.reply.title), ['Hepsi okundu']);
+        assert.deepEqual(t.whatsapp.last(PHONES.yasir).interactive.action.buttons.map((button) => button.reply.title), ['Hermes’e bırak', 'Hepsi okundu']);
+        assert.equal(t.whatsapp.last(PHONES.ayse).template.name, 'etkilesim_ozeti');
+    });
+});
+
+describe('social inbox: replies TryPost has not sent yet', () => {
+    let t;
+    let confirm;
+    beforeEach(async () => {
+        t = setup();
+        await t.user.hello(PHONES.yasir);
+        await receiveItem(t, inboxItem());
+        await t.user.say(PHONES.yasir, 'Cuma', t.whatsapp.last(PHONES.yasir).id, 'draft-1');
+        confirm = t.whatsapp.last(PHONES.yasir);
+        t.trypost.replyStatuses.push('sending');
+        await t.user.tap(PHONES.yasir, idsOf(confirm)[0], 'send-1');
+    });
+    const sentTexts = () => textsTo(t, PHONES.yasir, /Cevabın gönderildi/);
+
+    it('says "Gönderiliyor…" until TryPost reports it sent, re-checking with the same request_id', async () => {
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /⏳ Gönderiliyor…/);
+        assert.equal(sentTexts().length, 0);
+        assert.equal(t.store.decision(t.store.outboxByWaId(confirm.id).id, PHONES.yasir).state, 'started');
+
+        await later(t, 31_000); // still sending
+        assert.equal(sentTexts().length, 0);
+        assert.equal(replyCalls(t).length, 2);
+        t.trypost.replies[0].status = 'sent';
+        await later(t, 61_000);
+        assert.equal(sentTexts().length, 1);
+        assert.equal(t.trypost.replies.length, 1);
+        assert.deepEqual([...new Set(replyCalls(t).map((call) => call.body.request_id))], [replyRequestId('marmara', 'draft-1')]);
+        assert.equal(t.store.decision(t.store.outboxByWaId(confirm.id).id, PHONES.yasir).state, 'applied');
+        // No more checks; another tap says it was sent.
+        await later(t, 60 * 60_000);
+        assert.equal(replyCalls(t).length, 3);
+        await t.user.tap(PHONES.yasir, idsOf(confirm)[0]);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /zaten gönderildi/);
+    });
+
+    it('reports a reply that failed while sending, and offers "Düzenle" for a new draft', async () => {
+        t.trypost.replies[0].status = 'failed';
+        t.trypost.replies[0].error = 'Instagram bu yoruma cevap verilmesine izin vermiyor.';
+        await later(t, 31_000);
+        const answer = t.whatsapp.last(PHONES.yasir);
+        assert.match(bodyOf(answer), /❌ Cevabın gönderilemedi: Instagram bu yoruma cevap verilmesine izin vermiyor\./);
+        assert.deepEqual(answer.interactive.action.buttons.map((button) => button.reply.title), ['Düzenle', 'Okundu']);
+        assert.equal(sentTexts().length, 0);
+        // The failed draft does not send again; "Düzenle" starts a new one.
+        await t.user.tap(PHONES.yasir, idsOf(confirm)[0]);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /gönderilemedi; metni değiştirip/);
+        await t.user.tap(PHONES.yasir, idsOf(answer)[0]);
+        await t.user.say(PHONES.yasir, 'Cuma 18:00', null, 'draft-2');
+        await t.user.tap(PHONES.yasir, idsOf(t.whatsapp.last(PHONES.yasir))[0]);
+        assert.deepEqual(t.trypost.replies.map((reply) => [reply.text, reply.status]), [['Cuma', 'failed'], ['Cuma 18:00', 'sent']]);
+        assert.equal(sentTexts().length, 1);
+    });
+
+    it('reports "failed" at once when TryPost answers it right away', async () => {
+        t = setup();
+        await t.user.hello(PHONES.yasir);
+        await receiveItem(t, inboxItem());
+        await t.user.say(PHONES.yasir, 'Cuma', t.whatsapp.last(PHONES.yasir).id);
+        t.trypost.replyStatuses.push('failed');
+        await t.user.tap(PHONES.yasir, idsOf(t.whatsapp.last(PHONES.yasir))[0]);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /❌ Cevabın gönderilemedi/);
+        assert.equal(sentTexts().length, 0);
+    });
+
+    it('stops checking after a bounded number of tries and says it could not verify', async () => {
+        for (let i = 0; i < 10; i++) await later(t, 31 * 60_000);
+        assert.equal(replyCalls(t).length, 1 + 7);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /durumunu doğrulayamadım/);
+        assert.equal(sentTexts().length, 0);
+        // A new tap checks again with the same request_id.
+        t.trypost.replies[0].status = 'sent';
+        await t.user.tap(PHONES.yasir, idsOf(confirm)[0]);
+        assert.equal(sentTexts().length, 1);
+        assert.equal(replyCalls(t).at(-1).body.request_id, replyRequestId('marmara', 'draft-1'));
+    });
+
+    it('keeps checking through a TryPost outage', async () => {
+        t.trypost.setDown(true);
+        await later(t, 31_000);
+        t.trypost.setDown(false);
+        t.trypost.replies[0].status = 'sent';
+        await later(t, 61_000);
+        assert.equal(sentTexts().length, 1);
     });
 });

@@ -2,6 +2,11 @@ import { createHash } from 'node:crypto';
 import { minutesOf } from '../config.js';
 
 const DIGEST_LINES = 8;
+// Re-checks of a reply TryPost accepted but had not sent yet: waits before each one (bounded).
+const CHECK_BACKOFF_MS = [30_000, 60_000, 2 * 60_000, 5 * 60_000, 10 * 60_000, 15 * 60_000, 30 * 60_000];
+const NO_PERMISSION = 'Bu etkileşime cevap verme yetkin yok.';
+// Buttons only people who may reply get (Hermes replies with the same TryPost token).
+const REPLIER_ACTIONS = new Set(['ib_reply', 'ib_hermes', 'ib_all_hermes', 'ib_send', 'ib_edit', 'ib_cancel']);
 // Interactive message bodies take 1024 characters: a longer draft is shown in a message of its own first.
 const CONFIRM_LIMIT = 1000;
 
@@ -24,10 +29,20 @@ export function replyRequestId(projectId, waMessageId) {
  * Outbox kinds (all carry the item snapshot in message.item, or message.items
  * for a digest): 'inbox' (notification), 'inbox_digest', 'inbox_confirm' (a
  * draft waiting for "Gönder"), 'inbox_note' (an answer with an "Okundu" button
- * or a long draft's text). The outbox row is the link from a WhatsApp message
+ * or a long draft's text), 'inbox_failed' (TryPost could not send a reply:
+ * "Düzenle" / "Okundu"). The outbox row is the link from a WhatsApp message
  * (button or quote-reply) back to the item, as for approval requests.
+ *
+ * Who is notified (recipients) and who may reply (canReply: `inbox.repliers`,
+ * by default the approvers) are separate. Others get "Okundu" only, and their
+ * presses and typed replies are refused on the server side.
+ *
+ * Only a reply TryPost reports as `sent` is told as sent. `sending`/`pending`
+ * keeps the decision open and is re-checked on the worker's passes by
+ * replaying the POST with the same request_id, until `sent` or `failed`
+ * (bounded); `failed` is reported with "Düzenle".
  */
-export function createInbox({ project, api, names, timeZone, platformName, decisionState, recipients }) {
+export function createInbox({ project, api, names, timeZone, platformName, decisionState, recipients, canReply }) {
     const settings = project.inbox ?? { enabled: false };
     const windowMs = (settings.digestWindowSec ?? 120) * 1000;
     const threshold = settings.digestThreshold ?? 5;
@@ -70,40 +85,41 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
     ];
 
     /** The notification of one item, inside the window (interactive) and outside it (template). */
-    function itemMessage(item) {
+    function itemMessage(item, replier) {
         const lines = [`📥 *${label(item)}* — ${who(item)}: “${excerpt(item.text, 500)}”`];
         if (item.post) lines.push(`Gönderi: “${excerpt(item.post.excerpt, 80)}”`);
         if (item.reply_window_ends_at) lines.push(`Cevap süresi: ${when(item.reply_window_ends_at)}’e kadar`);
         if (item.can_reply === false) lines.push('Bu etkileşime buradan cevap verilemiyor.');
         if (item.permalink) lines.push(`🔗 ${item.permalink}`);
-        if (item.can_reply !== false) lines.push('', 'Cevap yazmak için bu mesajı yanıtlayabilirsin.');
+        if (replier && item.can_reply !== false) lines.push('', 'Cevap yazmak için bu mesajı yanıtlayabilirsin.');
         // Template body: {{1}} platform, {{2}} kind (yorum / mesaj), {{3}} "@author: text"
-        const template = names.inbox
-            ? { name: names.inbox, language: names.language, params: [platform(item), kindWord(item), `${who(item)}: ${excerpt(item.text, 200)}`] }
-            : null;
-        return { message: { text: lines.join('\n'), buttons: notifyButtons, item }, template };
+        const name = replier ? names.inbox : names.inboxReadOnly;
+        const template = name ? { name, language: names.language, params: [platform(item), kindWord(item), `${who(item)}: ${excerpt(item.text, 200)}`] } : null;
+        const buttons = replier ? notifyButtons : notifyButtons.filter((button) => button.action === 'ib_read');
+        return { message: { text: lines.join('\n'), buttons, item }, template };
     }
 
-    function digestMessage(items) {
+    function digestMessage(items, replier) {
         const lines = [`📥 *${items.length} yeni etkileşim var*`];
         for (const item of items.slice(0, DIGEST_LINES)) lines.push(`• ${label(item)} — ${who(item)}: “${excerpt(item.text, 60)}”`);
         if (items.length > DIGEST_LINES) lines.push(`… ve ${items.length - DIGEST_LINES} tane daha`);
-        lines.push('', 'Hermes’e bırakırsan cevap gerekenler için taslak hazırlar; tek tek panelden de bakabilirsin.');
+        lines.push('', replier ? 'Hermes’e bırakırsan cevap gerekenler için taslak hazırlar; tek tek panelden de bakabilirsin.' : 'Ayrıntılar panelde.');
         const counts = new Map();
         for (const item of items) counts.set(platform(item), (counts.get(platform(item)) ?? 0) + 1);
         const channels = [...counts].map(([name, count]) => `${name} (${count})`).join(', ');
         // Template body: {{1}} count, {{2}} channels with counts
-        const template = names.inboxDigest ? { name: names.inboxDigest, language: names.language, params: [String(items.length), channels] } : null;
+        const name = replier ? names.inboxDigest : names.inboxDigestReadOnly;
+        const template = name ? { name, language: names.language, params: [String(items.length), channels] } : null;
         const buttons = [
-            { action: 'ib_all_hermes', title: 'Hermes’e bırak' },
+            ...(replier ? [{ action: 'ib_all_hermes', title: 'Hermes’e bırak' }] : []),
             { action: 'ib_all_read', title: 'Hepsi okundu' },
         ];
         return { message: { text: lines.join('\n'), buttons, items }, template };
     }
 
     function queueItem(echo, item) {
-        const { message, template } = itemMessage(item);
         for (const member of recipients()) {
+            const { message, template } = itemMessage(item, canReply(member.person));
             echo.enqueue({
                 project: project.id,
                 itemId: String(item.id),
@@ -118,8 +134,8 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
 
     function queueDigest(echo, items) {
         const key = createHash('sha256').update(items.map((item) => String(item.id)).join('\u0000')).digest('hex').slice(0, 16);
-        const { message, template } = digestMessage(items);
         for (const member of recipients()) {
+            const { message, template } = digestMessage(items, canReply(member.person));
             echo.enqueue({
                 project: project.id,
                 itemId: `digest:${key}`,
@@ -218,12 +234,14 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
         const store = echo.store;
         const item = row.message.item;
         const current = decisionState(echo, row, person, messageId);
+        // 'done' (this tap applied it) is answered by sent(); a retry of the tap only repeats the dedup-keyed answer.
         if (current.state === 'done') return say('✅ Cevabın gönderildi.', true);
-        if (current.state === 'busy') return say('Cevabın gönderiliyor.');
+        if (current.state === 'busy') return say('⏳ Cevabın gönderiliyor.');
         if (current.state === 'taken') {
             const action = current.decision.action;
             if (action === 'cancel') return say('Bu taslağı iptal etmiştin; yeni bir cevap için bildirimi yanıtla.');
             if (action === 'replaced') return say('Bu taslağın yerine yenisini yazdın; son taslaktaki "Gönder"e bas.');
+            if (action === 'failed') return say('Bu cevap gönderilemedi; metni değiştirip yeniden denemek için "Düzenle"ye bas.');
             return say('Bu cevap zaten gönderildi.');
         }
         if (current.state === 'fresh') {
@@ -247,11 +265,90 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
             }
             throw giveUp(error);
         }
+        const reply = result?.data ?? result ?? {};
+        const status = String(reply.status ?? '');
+        if (status === 'sent') {
+            store.replyCheckDone(row.id, person.phone);
+            return sent(echo, person, row, messageId);
+        }
+        if (status === 'failed') return failed(echo, person, row, reply, messageId);
+        // Accepted, not sent yet: the decision stays open and the worker checks again with the same request_id.
+        store.checkReply(row.id, person.phone, project.id, CHECK_BACKOFF_MS[0]);
+        say('⏳ Gönderiliyor… Gönderilince haber vereceğim.', true);
+    }
+
+    function sent(echo, person, row, messageId) {
+        const item = row.message.item;
+        echo.store.applyDecision(row.id, person.phone);
+        echo.store.socialReplied(project.id, item.id, person.name);
+        echo.reply(person, `✅ Cevabın gönderildi (${label(item)}, ${who(item)}).`, messageId, project.id, row.id, `${project.id}:inbox-sent:${row.id}:${person.phone}`);
+    }
+
+    /** TryPost could not send it: the draft is closed (its request_id would replay the failure); "Düzenle" starts a new one. */
+    function failed(echo, person, row, reply, messageId) {
+        const store = echo.store;
+        const item = row.message.item;
+        store.replyCheckDone(row.id, person.phone);
+        store.undecideAny(row.id, person.phone);
+        store.startDecision(row.id, person.phone, 'failed', messageId);
         store.applyDecision(row.id, person.phone);
-        store.socialReplied(project.id, item.id, person.name);
-        const status = String((result?.data ?? result)?.status ?? '');
-        if (status === 'failed') return say('TryPost cevabı aldı ama platforma iletemedi; lütfen panelden kontrol et.', true);
-        say(`✅ Cevabın gönderildi (${label(item)}, ${who(item)}).`, true);
+        const reason = reply.error ?? reply.failure_reason ?? reply.message ?? null;
+        echo.enqueue({
+            project: project.id,
+            itemId: String(item.id),
+            kind: 'inbox_failed',
+            person,
+            message: {
+                text: `❌ Cevabın gönderilemedi${reason ? `: ${String(reason).slice(0, 300)}` : '.'}\nMetni değiştirip yeniden denemek için "Düzenle"ye bas.`,
+                buttons: [
+                    { action: 'ib_edit', title: 'Düzenle' },
+                    { action: 'ib_read', title: 'Okundu' },
+                ],
+                item,
+                replyTo: messageId,
+            },
+            dedupeKey: `${project.id}:inbox-failed:${row.id}:${person.phone}`,
+        });
+    }
+
+    /** Re-checks replies TryPost had not sent yet, replaying the POST with the same request_id. */
+    async function checkReplies(echo) {
+        const store = echo.store;
+        for (const check of store.replyChecksDue(project.id)) {
+            const row = store.outbox(check.outbox_id);
+            const person = echo.personByPhone(check.phone);
+            const decision = store.decision(check.outbox_id, check.phone);
+            if (!row || !person || decision?.state !== 'started') {
+                store.replyCheckDone(check.outbox_id, check.phone);
+                continue;
+            }
+            const later = () => {
+                const attempts = store.replyCheckLater(row.id, person.phone, CHECK_BACKOFF_MS[Math.min(check.attempts + 1, CHECK_BACKOFF_MS.length - 1)]);
+                if (attempts < CHECK_BACKOFF_MS.length) return;
+                // Given up: the decision stays started, so a new "Gönder" checks again with the same request_id.
+                store.replyCheckDone(row.id, person.phone);
+                echo.reply(person, 'Cevabın hâlâ gönderiliyor görünüyor; durumunu doğrulayamadım. Lütfen panelden kontrol et.', null, project.id, row.id, `${project.id}:inbox-unknown:${row.id}:${person.phone}`);
+            };
+            let reply;
+            try {
+                const result = await api('POST', `${itemPath(row.message.item)}/replies`, { text: row.message.draft, request_id: row.message.requestId });
+                reply = result?.data ?? result ?? {};
+            } catch (error) {
+                if (error.retryable) {
+                    later();
+                    continue;
+                }
+                reply = { status: 'failed', error: error.status === 409 ? 'cevap süresi dolmuş' : (error.body?.message ?? `TryPost ${error.status}`) };
+            }
+            if (reply.status === 'sent') {
+                store.replyCheckDone(row.id, person.phone);
+                sent(echo, person, row, decision.wa_message_id);
+            } else if (reply.status === 'failed') {
+                failed(echo, person, row, reply, decision.wa_message_id);
+            } else {
+                later();
+            }
+        }
     }
 
     return {
@@ -281,6 +378,7 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
         /** Sends held items once the burst window (and quiet hours) are over: one alone, several as a digest. */
         async periodic(echo) {
             if (!settings.enabled) return;
+            await checkReplies(echo);
             const store = echo.store;
             const held = store.socialHeld(project.id);
             if (!held.length) return;
@@ -307,8 +405,11 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
                 inbox_note: ['ib_read'],
                 inbox_confirm: ['ib_send', 'ib_edit', 'ib_cancel'],
                 inbox_digest: ['ib_all_hermes', 'ib_all_read'],
+                inbox_failed: ['ib_edit', 'ib_read'],
             };
             if (!valid[row.kind]?.includes(action)) return say('Bu buton artık geçerli değil.');
+            // Checked on every press: a button sent before a role change (or forwarded) does not grant anything.
+            if (REPLIER_ACTIONS.has(action) && !canReply(person)) return say(NO_PERMISSION);
 
             if (action === 'ib_reply') {
                 let current = item;
@@ -345,7 +446,7 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
             if (action === 'ib_send') return send(echo, person, row, messageId, say);
 
             const decision = echo.store.decision(row.id, person.phone);
-            if (decision?.action === 'send') return say(decision.state === 'applied' ? 'Bu cevap zaten gönderildi.' : 'Cevabın gönderiliyor.');
+            if (decision?.action === 'send') return say(decision.state === 'applied' ? 'Bu cevap zaten gönderildi.' : '⏳ Cevabın gönderiliyor.');
             if (action === 'ib_edit') {
                 echo.store.setSession(person.phone, row.id, 'inbox_reply');
                 return say('Yeni cevabını yaz; göndermeden önce yine sana göstereceğim. Vazgeçmek için "iptal" yaz.');
@@ -362,6 +463,7 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
         /** A typed reply (in the "Cevapla" session, or a quote-reply to a notification or draft): shown back for confirmation. */
         async handleText({ echo, person, row, text, messageId }) {
             const say = (body) => echo.reply(person, body, messageId, project.id, row.id);
+            if (!canReply(person)) return say(NO_PERMISSION);
             if (row.kind === 'inbox_digest') {
                 return say('Bu bir özet. Tek bir etkileşime cevap vermek için "Hermes’e bırak"ı kullan ya da panelden cevapla.');
             }
