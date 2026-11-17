@@ -61,7 +61,7 @@ create() {   # name body examples_json button...
 if [ "${1:-}" != "--status" ]; then
   create onay_bekliyor $'📝 {{1}} için onayını bekleyen bir gönderi var.\nOnay isteyen: {{2}}\nKanal: {{3}}\nYayın: {{4}}\n\n"{{5}}"' \
     "$EXAMPLES" "Onayla" "Düzeltme iste" "Yorum yaz"
-  create gorus_istegi $'👀 {{2}}, {{1}} için görüşünü soruyor.\nKanal: {{3}}\nYayın: {{4}}\n\n"{{5}}"' \
+  create gorus_istegi $'👀 {{2}}, {{1}} projesindeki bir gönderi için senin görüşünü soruyor.\nKanal: {{3}}\nPlanlanan yayın zamanı: {{4}}\n\nGönderi metni:\n"{{5}}"\n\nGörüşünü aşağıdaki butonlarla ya da bu mesaja yanıt yazarak iletebilirsin.' \
     "$EXAMPLES" "Uygun" "Revize gerekli" "Yorum yaz"
   create yeni_etkilesim $'📥 {{1}} üzerinde yeni bir {{2}} var:\n"{{3}}"\n\nCevaplamak ya da okundu olarak işaretlemek için aşağıdaki butonları kullanabilirsin.' \
     "$INBOX_EXAMPLES" "Cevapla" "Hermes'e bırak" "Okundu"
