@@ -60,6 +60,14 @@ export function replyRequestId(projectId, waMessageId) {
  * the panel) is shown ("Not: Yasir 01:06’da cevap verdi: …") and turns
  * "Gönder" into "Yine de gönder". Once a reply is `sent`, the others who got
  * the item's notification are told, inside their 24-hour window only.
+ *
+ * TryPost checks again at send time, under a lock: "Yine de gönder" carries
+ * the shown reply's id as `acknowledged_reply_id`; a reply the person did not
+ * see answers 409 `already_replied` (the draft is closed and a new
+ * confirmation "⚠️ Bu arada X cevap verdi" offers "Yine de gönder" with a new
+ * request_id and that reply acknowledged), one being sent right now 409
+ * `reply_in_progress` (the draft moves to a "Tekrar dene" message, same
+ * request_id, since TryPost stored nothing).
  */
 export function createInbox({ project, api, names, timeZone, platformName, decisionState, recipients, canReply }) {
     const settings = project.inbox ?? { enabled: false };
@@ -120,10 +128,10 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
             if (!last) return null;
             const text = String(last.text ?? '');
             const match = drafts.findLast((draft) => draft.draft.trim() === text.trim());
-            const author = [last.author?.name, last.user?.name, last.sent_by?.name].find((name) => typeof name === 'string' && name.trim());
             const at = toTime(last.sent_at ?? last.created_at);
             return {
-                name: author?.trim() ?? (match && echo.personByPhone(match.phone)?.name) ?? 'biri',
+                id: last.id ?? null,
+                name: replierName(echo, item, last) ?? 'biri',
                 at: Number.isNaN(at) ? (match?.at ?? null) : at,
                 text,
             };
@@ -131,6 +139,19 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
         const row = echo.store.socialItem(project.id, item.id);
         if (!row?.replied_by) return null;
         return { name: row.replied_by, at: row.replied_at, text: drafts.at(-1)?.draft ?? null };
+    }
+
+    /**
+     * Who sent a reply TryPost lists: the person who sent the same text through Echo (TryPost
+     * only knows Echo's API key user), else the author TryPost names, else null.
+     */
+    function replierName(echo, item, reply) {
+        const text = String(reply?.text ?? '').trim();
+        const match = text ? echo.store.itemReplyDrafts(project.id, item.id).findLast((draft) => draft.draft.trim() === text) : null;
+        const echoName = match ? echo.personByPhone(match.phone)?.name : null;
+        if (echoName) return echoName;
+        const author = [reply?.author?.name, reply?.user?.name, reply?.sent_by?.name].find((name) => typeof name === 'string' && name.trim());
+        return author?.trim() ?? null;
     }
 
     const replyNote = (previous, now) =>
@@ -307,13 +328,16 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
         const item = row.message.item;
         const current = decisionState(echo, row, person, messageId);
         // 'done' (this tap applied it) is answered by sent(); a retry of the tap only repeats the dedup-keyed answer.
-        if (current.state === 'done') return say('✅ Cevabın gönderildi.', true);
+        // A tap that closed the draft (someone else replied, or is replying) queued its own message already.
+        if (current.state === 'done') return ['conflict', 'busy'].includes(current.decision.action) ? undefined : say('✅ Cevabın gönderildi.', true);
         if (current.state === 'busy') return say('⏳ Cevabın gönderiliyor.');
         if (current.state === 'taken') {
             const action = current.decision.action;
             if (action === 'cancel') return say('Bu taslağı iptal etmiştin; yeni bir cevap için bildirimi yanıtla.');
             if (action === 'replaced') return say('Bu taslağın yerine yenisini yazdın; son taslaktaki "Gönder"e bas.');
             if (action === 'failed') return say('Bu cevap gönderilemedi; metni değiştirip yeniden denemek için "Düzenle"ye bas.');
+            if (action === 'conflict') return say('Bu taslak gönderilmedi: bu arada başka biri cevap verdi. Yine de göndermek için son mesajdaki "Yine de gönder"e bas.');
+            if (action === 'busy') return say('Bu taslak için son mesajdaki "Tekrar dene"ye bas.');
             return say('Bu cevap zaten gönderildi.');
         }
         if (current.state === 'fresh') {
@@ -321,12 +345,15 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
         }
         let result;
         try {
-            result = await api('POST', `${itemPath(item)}/replies`, { text: row.message.draft, request_id: row.message.requestId });
+            result = await api('POST', `${itemPath(item)}/replies`, replyBody(row));
         } catch (error) {
             // A temporary error keeps the started decision: the retry sends the same request_id.
             if (error.retryable) throw giveUp(error);
             store.undecide(row.id, person.phone, messageId);
             if (error.status === 409) {
+                const body = error.body && typeof error.body === 'object' ? error.body : {};
+                if (body.code === 'already_replied') return reconfirm(echo, person, row, messageId, 'conflict', body.reply);
+                if (body.code === 'reply_in_progress') return reconfirm(echo, person, row, messageId, 'busy', body.reply);
                 offerRead(echo, person, item, '⌛ Bu etkileşimin cevap süresi dolmuş; cevabın gönderilemedi.', messageId);
                 return;
             }
@@ -347,6 +374,72 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
         // Accepted, not sent yet: the decision stays open and the worker checks again with the same request_id.
         store.checkReply(row.id, person.phone, project.id, CHECK_BACKOFF_MS[0]);
         say('⏳ Gönderiliyor… Gönderilince haber vereceğim.', true);
+    }
+
+    /** The replies POST of a draft: the acknowledged reply only when the person chose "Yine de gönder". */
+    const replyBody = (row) => ({
+        text: row.message.draft,
+        request_id: row.message.requestId,
+        ...(row.message.acknowledgedReplyId ? { acknowledged_reply_id: row.message.acknowledgedReplyId } : {}),
+    });
+
+    /**
+     * TryPost refused the draft because of another reply (409): 'conflict' (already_replied, the
+     * person had not seen it) or 'busy' (reply_in_progress). In one transaction, the draft is
+     * closed (its "Gönder" no longer sends) and a new confirmation for the same text is queued:
+     * "Yine de gönder" with that reply acknowledged under a new request_id derived from the new
+     * message, or "Tekrar dene" with the same request_id (TryPost stored nothing). Both are keyed
+     * by the draft, so a retry of the tap queues nothing new.
+     */
+    function reconfirm(echo, person, row, messageId, reason, other) {
+        const store = echo.store;
+        const item = row.message.item;
+        const name = replierName(echo, item, other);
+        const conflict = reason === 'conflict';
+        const dedupeKey = conflict
+            ? `${project.id}:inbox-conflict:${row.id}:${person.phone}:${other?.id ?? ''}`
+            : `${project.id}:inbox-busy:${row.id}:${person.phone}`;
+        const text = conflict
+            ? [
+                  `⚠️ Bu arada ${name ?? 'biri'} cevap verdi${other?.text ? `: “${excerpt(other.text, 300)}”` : '.'}`,
+                  'Senin cevabın gönderilmedi. Yine de göndereyim mi?',
+                  '',
+                  excerpt(row.message.draft, 500),
+              ].join('\n')
+            : `⏳ ${name ?? 'Biri'} şu an cevap gönderiyor; birkaç saniye sonra tekrar dene.`;
+        store.transaction(() => {
+            store.startDecision(row.id, person.phone, reason, messageId);
+            store.applyDecision(row.id, person.phone);
+            echo.enqueue({
+                project: project.id,
+                itemId: String(item.id),
+                kind: 'inbox_confirm',
+                person,
+                message: {
+                    text,
+                    buttons: conflict
+                        ? [
+                              { action: 'ib_send', title: 'Yine de gönder' },
+                              { action: 'ib_cancel', title: 'İptal' },
+                          ]
+                        : [{ action: 'ib_send', title: 'Tekrar dene' }],
+                    item,
+                    draft: row.message.draft,
+                    answered: conflict || Boolean(row.message.answered),
+                    ...(conflict
+                        ? other?.id
+                            ? { acknowledgedReplyId: String(other.id) }
+                            : {}
+                        : row.message.acknowledgedReplyId
+                          ? { acknowledgedReplyId: row.message.acknowledgedReplyId }
+                          : {}),
+                    requestId: conflict ? replyRequestId(project.id, dedupeKey) : row.message.requestId,
+                    replyTo: messageId,
+                    onlyInWindow: true,
+                },
+                dedupeKey,
+            });
+        });
     }
 
     function sent(echo, person, row, messageId) {
@@ -433,7 +526,7 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
             };
             let reply;
             try {
-                const result = await api('POST', `${itemPath(row.message.item)}/replies`, { text: row.message.draft, request_id: row.message.requestId });
+                const result = await api('POST', `${itemPath(row.message.item)}/replies`, replyBody(row));
                 reply = result?.data ?? result ?? {};
             } catch (error) {
                 if (error.retryable) {
@@ -613,6 +706,8 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
                     item,
                     draft,
                     ...(previous ? { answered: true } : {}),
+                    // "Yine de gönder": the newest reply shown, so TryPost lets this one through unless a newer one came.
+                    ...(previous?.id ? { acknowledgedReplyId: String(previous.id) } : {}),
                     requestId: replyRequestId(project.id, messageId),
                     replyTo: messageId,
                     onlyInWindow: true,

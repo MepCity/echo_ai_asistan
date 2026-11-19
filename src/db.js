@@ -325,6 +325,8 @@ export function createStore(db, now = () => Date.now()) {
         itemNotified: q(`SELECT recipient, wa_message_id FROM outbox WHERE project = ? AND item_id = ? AND kind = 'inbox' ORDER BY id`),
         itemSentDrafts: q(`SELECT o.message_json, d.phone, d.decided_at FROM outbox o JOIN decisions d ON d.outbox_id = o.id
             WHERE o.project = ? AND o.item_id = ? AND o.kind = 'inbox_confirm' AND d.action = 'send' AND d.state = 'applied' ORDER BY d.decided_at`),
+        itemReplyDrafts: q(`SELECT o.message_json, d.phone, d.decided_at FROM outbox o JOIN decisions d ON d.outbox_id = o.id
+            WHERE o.project = ? AND o.item_id = ? AND o.kind = 'inbox_confirm' AND d.action = 'send' ORDER BY d.decided_at`),
         checkReply: q(`INSERT INTO reply_checks (outbox_id, phone, project, next_check_at, created_at) VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(outbox_id, phone) DO NOTHING`),
         replyChecksDue: q(`SELECT * FROM reply_checks WHERE project = ? AND next_check_at <= ? ORDER BY next_check_at LIMIT ?`),
@@ -477,6 +479,9 @@ export function createStore(db, now = () => Date.now()) {
         /** Replies to an item sent through Echo: the draft and who sent it, oldest first. */
         itemSentDrafts: (project, itemId) =>
             statements.itemSentDrafts.all(project, String(itemId)).map((row) => ({ phone: row.phone, draft: JSON.parse(row.message_json).draft ?? '', at: row.decided_at })),
+        /** Replies to an item sent or being sent through Echo ("Gönder" pressed): the draft and who sent it, oldest first. */
+        itemReplyDrafts: (project, itemId) =>
+            statements.itemReplyDrafts.all(project, String(itemId)).map((row) => ({ phone: row.phone, draft: JSON.parse(row.message_json).draft ?? '', at: row.decided_at })),
         /** Remembers to re-check a reply TryPost had not sent yet (kept as it is when already waiting). */
         checkReply: (outboxId, phone, project, delayMs) => statements.checkReply.run(outboxId, phone, project, now() + delayMs, now()),
         replyChecksDue: (project, limit = 20) => statements.replyChecksDue.all(project, now(), limit),

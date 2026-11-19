@@ -157,9 +157,10 @@ function fakeTryPost(clock) {
     }
 
     /**
-     * GET /inbox/items/{id}; POST .../replies {text, request_id} -> 201 {id, status}, the same
-     * request_id answers the same again, 409 when the reply window closed, 422 when the text is
-     * empty or longer than 1000 characters; POST .../read.
+     * GET /inbox/items/{id}; POST .../replies {text, request_id[, acknowledged_reply_id]} -> 201
+     * {id, status}, the same request_id answers the same again, 409 when the reply window closed,
+     * 409 already_replied / reply_in_progress (replyConflict), 422 when the text is empty or longer
+     * than 1000 characters; POST .../read.
      */
     function handleInbox(method, id, action, body) {
         const item = inbox.get(id);
@@ -177,12 +178,14 @@ function fakeTryPost(clock) {
             return json(200, { data: { ...item, read: true } });
         }
         if (method === 'POST' && action === 'replies') {
+            let conflict;
             const done = replyResults.get(body?.request_id);
             if (Array.isArray(done)) return json(done[0], done[1]);
             if (done) return json(201, { id: done.id, status: done.status, ...(done.error ? { error: done.error } : {}) });
             let answer;
             if (item.reply_window_ends_at && Date.parse(item.reply_window_ends_at) <= clock.t) answer = [409, { message: 'The reply window has closed.' }];
             else if (!body?.text || body.text.length > 1000) answer = [422, { message: 'invalid', errors: { text: ['Metin en fazla 1000 karakter olabilir.'] } }];
+            else if ((conflict = replyConflict(id, body?.acknowledged_reply_id))) return json(409, conflict); // not stored: nothing was sent
             else {
                 const reply = {
                     id: `r${replies.length + 1}`,
@@ -200,6 +203,23 @@ function fakeTryPost(clock) {
             return json(...answer);
         }
         return json(404, {});
+    }
+
+    /**
+     * Like SendInboxReply's lock-time check: a reply still `sending` refuses with 409
+     * reply_in_progress, a `sent` one with 409 already_replied unless `acknowledged` is that
+     * reply or a newer one. Both name the reply (TryPost's payload: id, status, text, created_at, author).
+     */
+    function replyConflict(itemId, acknowledged) {
+        const others = replies.filter((reply) => reply.itemId === itemId && ['sending', 'sent'].includes(reply.status));
+        const payload = (reply) => ({ id: reply.id, status: reply.status, text: reply.text, error: null, created_at: reply.createdAt, author: reply.author ?? null });
+        const busy = others.find((reply) => reply.status === 'sending');
+        if (busy) return { message: 'in progress', code: 'reply_in_progress', reply: payload(busy) };
+        const newest = others.at(-1);
+        if (!newest) return null;
+        const seen = replies.findIndex((reply) => reply.itemId === itemId && reply.id === acknowledged);
+        if (seen !== -1 && replies.indexOf(newest) <= seen) return null;
+        return { message: 'already replied', code: 'already_replied', reply: payload(newest) };
     }
 
     /** POST /uploads (multipart `media`): a temporary upload with a single-use token, like UploadController::create. */
@@ -2500,6 +2520,96 @@ describe('social inbox: several people replying to the same item', () => {
         // Once only.
         await later(t, 31 * 60_000);
         assert.equal(answeredNotes(PHONES.mehmet).length, 1);
+    });
+
+    const warningOf = (phone) => t.whatsapp.to(phone).filter((m) => /^⚠️ Bu arada/.test(bodyOf(m))).at(-1);
+
+    it('refuses an old "Gönder" once someone else replied and offers "Yine de gönder" under a new request_id', async () => {
+        // Ayşe drafts before anyone replied, Yasir then sends his reply.
+        await t.user.say(PHONES.ayse, 'Cuma 18:00, Mühendislik binası', notificationOf(PHONES.ayse).id);
+        const draft = confirmOf(PHONES.ayse);
+        assert.deepEqual(titles(draft), ['Gönder', 'Düzenle', 'İptal']);
+        await yasirReplies();
+
+        await t.user.tap(PHONES.ayse, idsOf(draft)[0]);
+        assert.deepEqual(t.trypost.replies.map((reply) => reply.text), ['Cuma 18:00’de!']);
+        assert.equal(replyCalls(t).at(-1).body.acknowledged_reply_id, undefined);
+        const warning = warningOf(PHONES.ayse);
+        assert.equal(
+            bodyOf(warning),
+            '⚠️ Bu arada Yasir cevap verdi: “Cuma 18:00’de!”\nSenin cevabın gönderilmedi. Yine de göndereyim mi?\n\nCuma 18:00, Mühendislik binası',
+        );
+        assert.deepEqual(titles(warning), ['Yine de gönder', 'İptal']);
+
+        // The old draft is closed.
+        await t.user.tap(PHONES.ayse, idsOf(draft)[0]);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.ayse)), /^Bu taslak gönderilmedi: bu arada başka biri cevap verdi/);
+        assert.equal(replyCalls(t).length, 2);
+
+        await t.user.tap(PHONES.ayse, idsOf(warning)[0]);
+        const [first, refused, resent] = replyCalls(t);
+        assert.equal(resent.body.acknowledged_reply_id, 'r1');
+        assert.notEqual(resent.body.request_id, refused.body.request_id);
+        assert.notEqual(resent.body.request_id, first.body.request_id);
+        assert.deepEqual(t.trypost.replies.map((reply) => reply.text), ['Cuma 18:00’de!', 'Cuma 18:00, Mühendislik binası']);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.ayse)), /^✅ Cevabın gönderildi/);
+    });
+
+    it('says who is sending right now and retries the same draft with "Tekrar dene"', async () => {
+        await t.user.say(PHONES.ayse, 'Merhaba!', notificationOf(PHONES.ayse).id);
+        const draft = confirmOf(PHONES.ayse);
+        t.trypost.replyStatuses.push('sending');
+        await yasirReplies(); // accepted, not sent yet
+
+        await t.user.tap(PHONES.ayse, idsOf(draft)[0]);
+        const busy = t.whatsapp.last(PHONES.ayse);
+        assert.equal(bodyOf(busy), '⏳ Yasir şu an cevap gönderiyor; birkaç saniye sonra tekrar dene.');
+        assert.deepEqual(titles(busy), ['Tekrar dene']);
+        assert.equal(t.trypost.replies.length, 1);
+
+        // Still sending: refused again, nothing sent.
+        await t.user.tap(PHONES.ayse, idsOf(busy)[0]);
+        assert.equal(t.trypost.replies.length, 1);
+        const retry = t.whatsapp.last(PHONES.ayse);
+        assert.equal(bodyOf(retry), '⏳ Yasir şu an cevap gönderiyor; birkaç saniye sonra tekrar dene.');
+
+        // Sent meanwhile: the retry now says Yasir replied and asks again.
+        t.trypost.replies[0].status = 'sent';
+        await t.user.tap(PHONES.ayse, idsOf(retry)[0]);
+        assert.match(bodyOf(warningOf(PHONES.ayse)), /^⚠️ Bu arada Yasir cevap verdi: “Cuma 18:00’de!”/);
+        const calls = replyCalls(t);
+        // The retries kept the draft's request_id (TryPost stored nothing for them).
+        assert.equal(new Set(calls.slice(1).map((call) => call.body.request_id)).size, 1);
+        assert.equal(t.trypost.replies.length, 1);
+    });
+
+    it('refuses a stale "Yine de gönder" when another reply came after the one shown', async () => {
+        await yasirReplies();
+        await t.user.say(PHONES.ayse, 'Biz de bekliyoruz', notificationOf(PHONES.ayse).id);
+        const confirm = confirmOf(PHONES.ayse);
+        assert.deepEqual(titles(confirm), ['Yine de gönder', 'Düzenle', 'İptal']);
+        t.clock.t += 60_000;
+        t.trypost.outsideReply('i1', 'Panelden ikinci cevap', { author: { name: 'Bilal' } });
+
+        await t.user.tap(PHONES.ayse, idsOf(confirm)[0]);
+        assert.equal(replyCalls(t).at(-1).body.acknowledged_reply_id, 'r1');
+        assert.equal(t.trypost.replies.length, 2);
+        const warning = warningOf(PHONES.ayse);
+        assert.match(bodyOf(warning), /^⚠️ Bu arada Bilal cevap verdi: “Panelden ikinci cevap”/);
+
+        await t.user.tap(PHONES.ayse, idsOf(warning)[0]);
+        assert.equal(replyCalls(t).at(-1).body.acknowledged_reply_id, 'r2');
+        assert.deepEqual(t.trypost.replies.map((reply) => reply.text), ['Cuma 18:00’de!', 'Panelden ikinci cevap', 'Biz de bekliyoruz']);
+    });
+
+    it('cancels from the warning', async () => {
+        await t.user.say(PHONES.ayse, 'Merhaba!', notificationOf(PHONES.ayse).id);
+        const draft = confirmOf(PHONES.ayse);
+        await yasirReplies();
+        await t.user.tap(PHONES.ayse, idsOf(draft)[0]);
+        await t.user.tap(PHONES.ayse, idsOf(warningOf(PHONES.ayse))[1]);
+        assert.equal(bodyOf(t.whatsapp.last(PHONES.ayse)), 'Tamam, cevap gönderilmedi.');
+        assert.equal(t.trypost.replies.length, 1);
     });
 
     it('names the kind of item and the author in the note', async () => {

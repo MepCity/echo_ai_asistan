@@ -84,6 +84,15 @@ Hermes'e bırak · Okundu**.
   and a new Gönder checks again) until `sent` or `failed`. `failed` → the
   error, with Düzenle / Okundu. 409 → reply window closed (offers Okundu);
   422 → the reason, edit and try again. `can_reply: false` → said, with Okundu.
+- Someone else replied: TryPost checks under a lock at send time. "Yine de
+  gönder" (an earlier reply was shown) sends that reply's id as
+  `acknowledged_reply_id`; a plain "Gönder" sends none. 409 `already_replied`
+  closes the draft and asks "⚠️ Bu arada X cevap verdi: “…”" with
+  **Yine de gönder · İptal** (the reply in `reply` acknowledged, a new
+  request_id derived from that message); 409 `reply_in_progress` → "⏳ X şu an
+  cevap gönderiyor; birkaç saniye sonra tekrar dene" with **Tekrar dene** (same
+  request_id). X is the person who sent the same text through Echo, else
+  TryPost's `author.name`.
 - **Hermes'e bırak** forwards "[Echo · Gelen kutusu] Bu yoruma cevap taslağı
   hazırla…" with the item summary and `inbox_item_id` to Hermes, which drafts and
   confirms with the TryPost MCP inbox tools.
