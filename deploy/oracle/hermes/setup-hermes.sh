@@ -107,7 +107,7 @@ else
   echo "SOUL.md senin duzenledigin haliyle birakildi."
 fi
 python3 -I "$HERE/configure.py" "$DATA/config.yaml"
-echo "config.yaml: saglayici openai-codex (secilen model korunur), TryPost MCP (OAuth, yazma araclari onayli), riskli araclar kapali, profil teklifi ve komut ipuclari kapali, dil tr."
+echo "config.yaml: saglayici openai-codex (secilen model korunur), TryPost MCP (OAuth, yazma araclari onayli), riskli araclar kapali, profil teklifi ve komut ipuclari kapali, dil tr; onay mesaji Turkce (locales/tr.yaml)."
 
 # --- Start Hermes -----------------------------------------------------------------------------
 say "Hermes imaji indiriliyor ve baslatiliyor (ilk sefer birkac dakika surebilir)"

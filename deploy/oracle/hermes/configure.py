@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Merges Echo's settings into Hermes' config.yaml, keeping everything else in it.
+"""Merges Echo's settings into Hermes' config.yaml, keeping everything else in it, and
+writes the Turkish wording of Hermes' approval prompt (locales/tr.yaml next to it).
 
 Usage: python3 -I configure.py /opt/hermes/data/config.yaml
 Run by setup-hermes.sh; safe to run again. Needs PyYAML (python3-yaml).
@@ -42,6 +43,32 @@ DISABLED_TOOLSETS = [
     "image_gen",
     "video_gen",
 ]
+
+# TryPost write tools always ask on WhatsApp: an "always allow" answer for one of them
+# (command_allowlist key "mcp:<server>/<tool>", tools/mcp_tool_handlers.py) is removed again.
+TRYPOST_GRANT_PREFIX = "mcp:trypost/"
+
+# Hermes' user overlay ($HERMES_HOME/locales/<lang>.yaml, agent/i18n_layers.py): plainer
+# Turkish for the approval card's frame and buttons than the bundled locales/tr.yaml. The
+# card's middle (tool name and arguments) is fixed English in Hermes and cannot be changed;
+# SOUL.md has Hermes say in Turkish, just before it, what will be sent.
+LOCALE_MARKER = "# echo-managed: setup-hermes.sh bu dosyayi yeniler. Kendi metnini korumak icin bu satiri sil."
+LOCALE_TR = {
+    "gateway": {
+        "exec_approval": {
+            "header": "Onayın gerekiyor",
+            "reason_label": "Ayrıntı",
+            "deadline": "{window} içinde cevap vermezsen hiçbir şey yapılmaz.",
+            "timed_out_notice": "⌛ {window} içinde onay gelmedi; işlem yapılmadı. Hâlâ istiyorsan tekrar söyle.",
+        },
+    },
+    "platform": {
+        "whatsapp": {
+            "approve_button": "✅ Onayla",
+            "deny_button": "❌ Vazgeç",
+        },
+    },
+}
 
 # onboarding.seen flags (Hermes agent/onboarding.py) marked as already shown.
 ONBOARDING_SEEN_FLAGS = [
@@ -93,6 +120,12 @@ def main(path):
     approvals.setdefault("timeout", 300)
     config["approvals"] = approvals
 
+    allowlist = config.get("command_allowlist")
+    if isinstance(allowlist, list):
+        config["command_allowlist"] = [
+            entry for entry in allowlist if not (isinstance(entry, str) and entry.startswith(TRYPOST_GRANT_PREFIX))
+        ]
+
     agent = config.get("agent") if isinstance(config.get("agent"), dict) else {}
     disabled = agent.get("disabled_toolsets") or []
     if not isinstance(disabled, list):
@@ -128,6 +161,23 @@ def main(path):
     with open(tmp, "w", encoding="utf-8") as handle:
         yaml.safe_dump(config, handle, allow_unicode=True, sort_keys=False)
     os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+    write_locale(os.path.join(os.path.dirname(os.path.abspath(path)), "locales", "tr.yaml"))
+
+
+def write_locale(path):
+    """Writes the Turkish overlay unless someone took it over (removed the marker line)."""
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as handle:
+            if LOCALE_MARKER not in handle.read():
+                return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(LOCALE_MARKER + "\n")
+        yaml.safe_dump(LOCALE_TR, handle, allow_unicode=True, sort_keys=False)
+    os.chmod(tmp, 0o644)
     os.replace(tmp, path)
 
 
