@@ -10,6 +10,19 @@ const REPLIER_ACTIONS = new Set(['ib_reply', 'ib_hermes', 'ib_all_hermes', 'ib_s
 // Interactive message bodies take 1024 characters: a longer draft is shown in a message of its own first.
 const CONFIRM_LIMIT = 1000;
 
+// Turkish suffixes: the locative after a clock time ("01:06’da": by how the last number is said) and the genitive.
+const ONES_LOCATIVE = ['da', 'de', 'de', 'te', 'te', 'te', 'da', 'de', 'de', 'da'];
+const TENS_LOCATIVE = { 1: 'da', 2: 'de', 3: 'da', 4: 'ta', 5: 'de' };
+const locative = (number) => (number % 10 || number === 0 ? ONES_LOCATIVE[number % 10] : TENS_LOCATIVE[number / 10]);
+const VOWELS = 'aıoueiöü';
+/** "@ali" -> "@ali’nin", "Ayşe Kaya" -> "Ayşe Kaya’nın" (vowel harmony on the last vowel). */
+export function genitive(word) {
+    const letters = [...String(word).toLocaleLowerCase('tr')];
+    const vowel = letters.findLast((letter) => VOWELS.includes(letter));
+    const suffix = { a: 'ın', ı: 'ın', o: 'un', u: 'un', e: 'in', i: 'in', ö: 'ün', ü: 'ün' }[vowel] ?? 'in';
+    return `${word}’${VOWELS.includes(letters.at(-1)) ? 'n' : ''}${suffix}`;
+}
+
 /**
  * The idempotency key of one reply, sent as `request_id` to
  * POST /inbox/items/{id}/replies: derived from the WhatsApp message id of the
@@ -41,6 +54,12 @@ export function replyRequestId(projectId, waMessageId) {
  * keeps the decision open and is re-checked on the worker's passes by
  * replaying the POST with the same request_id, until `sent` or `failed`
  * (bounded); `failed` is reported with "Düzenle".
+ *
+ * Several people get every item: "Cevapla" and a typed draft read the item
+ * from TryPost first, and a reply already sent from anywhere (Echo, Hermes,
+ * the panel) is shown ("Not: Yasir 01:06’da cevap verdi: …") and turns
+ * "Gönder" into "Yine de gönder". Once a reply is `sent`, the others who got
+ * the item's notification are told, inside their 24-hour window only.
  */
 export function createInbox({ project, api, names, timeZone, platformName, decisionState, recipients, canReply }) {
     const settings = project.inbox ?? { enabled: false };
@@ -62,8 +81,60 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
     };
     const when = (value) =>
         new Intl.DateTimeFormat('tr-TR', { timeZone, dateStyle: 'medium', timeStyle: 'short' }).format(new Date(toTime(value)));
+    const accusative = (item) => `${platform(item)} ${item.kind === 'message' ? 'mesajını' : item.kind === 'comment' ? 'yorumunu' : 'etkileşimini'}`;
     const windowClosed = (item, now) => Boolean(item.reply_window_ends_at) && toTime(item.reply_window_ends_at) <= now;
+    // The item without its thread and replies (TryPost's detail), as kept in outbox rows.
+    const slim = ({ thread, replies, ...rest }) => rest;
     const itemPath = (item) => `/inbox/items/${encodeURIComponent(String(item.id))}`;
+
+    /** "01:06’da" (with the day when it is not today), in the project's time zone. */
+    function atTime(ms, now) {
+        const hm = new Intl.DateTimeFormat('tr-TR', { timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(ms));
+        const [hour, minute] = hm.split(':').map(Number);
+        const day = (value) => new Intl.DateTimeFormat('en-CA', { timeZone, dateStyle: 'short' }).format(new Date(value));
+        const date = day(ms) === day(now) ? '' : `${new Intl.DateTimeFormat('tr-TR', { timeZone, day: 'numeric', month: 'long' }).format(new Date(ms))} `;
+        return `${date}${hm}’${locative(minute || hour)}`;
+    }
+
+    /** Fetches the item from TryPost: { item } (merged over the snapshot), { item, stale: true } when TryPost could not answer, { gone: true } on 404. */
+    async function fetchCurrent(item) {
+        try {
+            const json = await api('GET', itemPath(item));
+            return { item: { ...item, ...(json?.data ?? json ?? {}) } };
+        } catch (error) {
+            if (error.status === 404) return { gone: true, item };
+            return { item, stale: true };
+        }
+    }
+
+    /**
+     * The last reply already sent to the item, from anywhere (Echo, Hermes, the panel): TryPost's
+     * `replies` when it gave them, else what went through Echo. { name, at, text } or null. The
+     * name is the reply's author when TryPost gives one, else the person who sent the same text
+     * through Echo, else "biri".
+     */
+    function previousReply(echo, item, current) {
+        const drafts = echo.store.itemSentDrafts(project.id, item.id);
+        if (Array.isArray(current?.replies)) {
+            const last = current.replies.filter((reply) => reply?.status === 'sent').at(-1);
+            if (!last) return null;
+            const text = String(last.text ?? '');
+            const match = drafts.findLast((draft) => draft.draft.trim() === text.trim());
+            const author = [last.author?.name, last.user?.name, last.sent_by?.name].find((name) => typeof name === 'string' && name.trim());
+            const at = toTime(last.sent_at ?? last.created_at);
+            return {
+                name: author?.trim() ?? (match && echo.personByPhone(match.phone)?.name) ?? 'biri',
+                at: Number.isNaN(at) ? (match?.at ?? null) : at,
+                text,
+            };
+        }
+        const row = echo.store.socialItem(project.id, item.id);
+        if (!row?.replied_by) return null;
+        return { name: row.replied_by, at: row.replied_at, text: drafts.at(-1)?.draft ?? null };
+    }
+
+    const replyNote = (previous, now) =>
+        `Not: ${previous.name} ${previous.at ? `${atTime(previous.at, now)} ` : 'bu etkileşime zaten '}cevap verdi${previous.text ? `: “${excerpt(previous.text, 120)}”` : '.'}`;
 
     function inQuietHours(now) {
         if (!settings.quietHours) return false;
@@ -204,13 +275,13 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
         if (items.length === 1) {
             const item = items[0];
             return [
-                `[Echo · Gelen kutusu] Bu ${kindWord(item)}a cevap taslağı hazırla. Taslağı bana göster, onayımı almadan gönderme.`,
+                `[Echo · Gelen kutusu] Bu ${kindWord(item)}a cevap taslağı hazırla ve göndermek için onayıma sun; onaylamadan gönderme.`,
                 '',
                 describe(item),
             ].join('\n');
         }
         return [
-            `[Echo · Gelen kutusu] ${items.length} yeni etkileşim var. Hangilerine cevap gerektiğini söyle ve onlar için cevap taslakları hazırla. Taslakları bana göster, onayımı almadan hiçbirini gönderme.`,
+            `[Echo · Gelen kutusu] ${items.length} yeni etkileşim var. Hangilerine cevap gerektiğini söyle ve onlar için cevap taslakları hazırlayıp her birini ayrı ayrı onayıma sun; onaylamadan hiçbirini gönderme.`,
             ...items.map((item, index) => `\n${index + 1})\n${describe(item)}`),
         ].join('\n');
     }
@@ -283,6 +354,36 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
         echo.store.applyDecision(row.id, person.phone);
         echo.store.socialReplied(project.id, item.id, person.name);
         echo.reply(person, `✅ Cevabın gönderildi (${label(item)}, ${who(item)}).`, messageId, project.id, row.id, `${project.id}:inbox-sent:${row.id}:${person.phone}`);
+        notifyOthers(echo, person, row);
+    }
+
+    /**
+     * Tells everyone else who was notified of the item that it was answered, as a reply to their
+     * notification. Only inside their 24-hour window (no template is paid for this); replies made
+     * through Hermes or the panel are not seen here (the next "Cevapla" shows them).
+     */
+    function notifyOthers(echo, person, row) {
+        const item = row.message.item;
+        const notified = new Map(echo.store.itemNotified(project.id, item.id).map((entry) => [entry.recipient, entry.wa_message_id]));
+        // Sent in a digest: everyone who gets the inbox saw it there.
+        if (echo.store.socialItem(project.id, item.id)?.state === 'digested') {
+            for (const member of recipients()) if (!notified.has(member.person.phone)) notified.set(member.person.phone, null);
+        }
+        const author = who(item) === 'Biri' ? 'birinin' : genitive(who(item));
+        const text = `✅ ${person.name}, ${author} ${accusative(item)} cevapladı: “${excerpt(row.message.draft, 300)}”`;
+        for (const [phone, waId] of notified) {
+            if (phone === person.phone) continue;
+            const other = echo.personByPhone(phone);
+            if (!other) continue;
+            echo.enqueue({
+                project: project.id,
+                itemId: String(item.id),
+                kind: 'inbox_note',
+                person: other,
+                message: { text, item, ...(waId ? { replyTo: waId } : {}), onlyInWindow: true },
+                dedupeKey: `${project.id}:inbox-replied:${row.id}:${phone}`,
+            });
+        }
     }
 
     /** TryPost could not send it: the draft is closed (its request_id would replay the failure); "Düzenle" starts a new one. */
@@ -413,22 +514,18 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
             if (REPLIER_ACTIONS.has(action) && !canReply(person)) return say(NO_PERMISSION);
 
             if (action === 'ib_reply') {
-                let current = item;
-                try {
-                    const json = await api('GET', itemPath(item));
-                    current = { ...item, ...(json?.data ?? json ?? {}) };
-                } catch (error) {
-                    if (error.status === 404) return say('Bu etkileşim artık bulunamadı; silinmiş olabilir.');
-                    // TryPost unreachable: the notification's copy is enough to ask for the text.
-                }
+                // TryPost unreachable: the notification's copy is enough to ask for the text.
+                const fetched = await fetchCurrent(item);
+                if (fetched.gone) return say('Bu etkileşim artık bulunamadı; silinmiş olabilir.');
+                const current = slim(fetched.item);
                 if (current.can_reply === false) return offerRead(echo, person, current, 'Bu etkileşime buradan cevap verilemiyor.', messageId);
                 if (windowClosed(current, echo.store.now())) return offerRead(echo, person, current, '⌛ Bu etkileşimin cevap süresi dolmuş.', messageId);
                 echo.store.setSession(person.phone, row.id, 'inbox_reply');
-                const replied = echo.store.socialItem(project.id, item.id)?.replied_by;
+                const previous = previousReply(echo, item, fetched.item);
                 say(
                     [
                         `✍️ Cevabını yaz: ${label(current)}, ${who(current)}: “${excerpt(current.text, 80)}”`,
-                        ...(replied ? [`Not: ${replied} bu etkileşime zaten cevap verdi.`] : []),
+                        ...(previous ? [replyNote(previous, echo.store.now())] : []),
                         'Göndermeden önce sana göstereceğim. Vazgeçmek için "iptal" yaz.',
                     ].join('\n'),
                 );
@@ -470,15 +567,25 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
             }
             const item = row.message.item;
             if (!item) return say('Bu mesaja cevap yazılamıyor.');
-            if (item.can_reply === false) return offerRead(echo, person, item, 'Bu etkileşime buradan cevap verilemiyor.', messageId);
-            if (windowClosed(item, echo.store.now())) return offerRead(echo, person, item, '⌛ Bu etkileşimin cevap süresi dolmuş.', messageId);
+            // Fresh from TryPost: whether it can still be answered, and whether someone already did (Echo, Hermes or the panel).
+            const fetched = await fetchCurrent(item);
+            if (fetched.gone) return say('Bu etkileşim artık bulunamadı; silinmiş olabilir.');
+            const current = slim(fetched.item);
+            if (current.can_reply === false) return offerRead(echo, person, current, 'Bu etkileşime buradan cevap verilemiyor.', messageId);
+            if (windowClosed(current, echo.store.now())) return offerRead(echo, person, current, '⌛ Bu etkileşimin cevap süresi dolmuş.', messageId);
+            const previous = previousReply(echo, item, fetched.item);
             const draft = String(text).trim();
             // A new draft for a draft replaces it: its "Gönder" no longer sends.
             if (row.kind === 'inbox_confirm' && !echo.store.decision(row.id, person.phone)) {
                 echo.store.startDecision(row.id, person.phone, 'replaced', messageId);
                 echo.store.applyDecision(row.id, person.phone);
             }
-            const head = `📝 Şu cevabı göndereyim mi?\n${label(item)}, ${who(item)}: “${excerpt(item.text, 80)}”`;
+            const head = [
+                '📝 Şu cevabı göndereyim mi?',
+                `${label(item)}, ${who(item)}: “${excerpt(item.text, 80)}”`,
+                // Already answered: sending another one takes an explicit "Yine de gönder".
+                ...(previous ? [replyNote(previous, echo.store.now())] : []),
+            ].join('\n');
             let body = `${head}\n\n${draft}`;
             if (body.length > CONFIRM_LIMIT) {
                 echo.enqueue({
@@ -499,12 +606,13 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
                 message: {
                     text: body,
                     buttons: [
-                        { action: 'ib_send', title: 'Gönder' },
+                        { action: 'ib_send', title: previous ? 'Yine de gönder' : 'Gönder' },
                         { action: 'ib_edit', title: 'Düzenle' },
                         { action: 'ib_cancel', title: 'İptal' },
                     ],
                     item,
                     draft,
+                    ...(previous ? { answered: true } : {}),
                     requestId: replyRequestId(project.id, messageId),
                     replyTo: messageId,
                     onlyInWindow: true,

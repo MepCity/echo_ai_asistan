@@ -322,6 +322,9 @@ export function createStore(db, now = () => Date.now()) {
         socialRecent: q(`SELECT COUNT(*) AS count FROM social_items WHERE project = ? AND state IN ('notified', 'digested') AND notified_at > ?`),
         socialMark: q(`UPDATE social_items SET state = ?, notified_at = ? WHERE project = ? AND item_id = ?`),
         socialReplied: q(`UPDATE social_items SET replied_by = ?, replied_at = ? WHERE project = ? AND item_id = ?`),
+        itemNotified: q(`SELECT recipient, wa_message_id FROM outbox WHERE project = ? AND item_id = ? AND kind = 'inbox' ORDER BY id`),
+        itemSentDrafts: q(`SELECT o.message_json, d.phone, d.decided_at FROM outbox o JOIN decisions d ON d.outbox_id = o.id
+            WHERE o.project = ? AND o.item_id = ? AND o.kind = 'inbox_confirm' AND d.action = 'send' AND d.state = 'applied' ORDER BY d.decided_at`),
         checkReply: q(`INSERT INTO reply_checks (outbox_id, phone, project, next_check_at, created_at) VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(outbox_id, phone) DO NOTHING`),
         replyChecksDue: q(`SELECT * FROM reply_checks WHERE project = ? AND next_check_at <= ? ORDER BY next_check_at LIMIT ?`),
@@ -469,6 +472,11 @@ export function createStore(db, now = () => Date.now()) {
         socialRecent: (project, sinceMs) => Number(statements.socialRecent.get(project, sinceMs).count),
         socialMark: (project, itemId, state) => statements.socialMark.run(state, now(), project, String(itemId)),
         socialReplied: (project, itemId, by) => statements.socialReplied.run(by, now(), project, String(itemId)),
+        /** Who got an item's own notification (one 'inbox' row per person) and its WhatsApp message id. */
+        itemNotified: (project, itemId) => statements.itemNotified.all(project, String(itemId)),
+        /** Replies to an item sent through Echo: the draft and who sent it, oldest first. */
+        itemSentDrafts: (project, itemId) =>
+            statements.itemSentDrafts.all(project, String(itemId)).map((row) => ({ phone: row.phone, draft: JSON.parse(row.message_json).draft ?? '', at: row.decided_at })),
         /** Remembers to re-check a reply TryPost had not sent yet (kept as it is when already waiting). */
         checkReply: (outboxId, phone, project, delayMs) => statements.checkReply.run(outboxId, phone, project, now() + delayMs, now()),
         replyChecksDue: (project, limit = 20) => statements.replyChecksDue.all(project, now(), limit),

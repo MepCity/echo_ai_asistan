@@ -164,7 +164,14 @@ function fakeTryPost(clock) {
     function handleInbox(method, id, action, body) {
         const item = inbox.get(id);
         if (!item) return json(404, { message: 'not found' });
-        if (method === 'GET' && !action) return json(200, { data: item });
+        // Like InboxItemPayload::detail: the item (top level, no `data`) with the replies sent from TryPost, oldest first.
+        if (method === 'GET' && !action) {
+            const sent = replies
+                .filter((reply) => reply.itemId === id)
+                .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))
+                .map((reply) => ({ id: reply.id, status: reply.status, text: reply.text, error: reply.error ?? null, created_at: reply.createdAt, ...(reply.author ? { author: reply.author } : {}) }));
+            return json(200, { ...item, status: 'unread', thread: [], replies: sent });
+        }
         if (method === 'POST' && action === 'read') {
             reads.push(id);
             return json(200, { data: { ...item, read: true } });
@@ -177,7 +184,14 @@ function fakeTryPost(clock) {
             if (item.reply_window_ends_at && Date.parse(item.reply_window_ends_at) <= clock.t) answer = [409, { message: 'The reply window has closed.' }];
             else if (!body?.text || body.text.length > 1000) answer = [422, { message: 'invalid', errors: { text: ['Metin en fazla 1000 karakter olabilir.'] } }];
             else {
-                const reply = { id: `r${replies.length + 1}`, itemId: id, text: body.text, requestId: body.request_id, status: replyStatuses.shift() ?? 'sent' };
+                const reply = {
+                    id: `r${replies.length + 1}`,
+                    itemId: id,
+                    text: body.text,
+                    requestId: body.request_id,
+                    status: replyStatuses.shift() ?? 'sent',
+                    createdAt: new Date(clock.t).toISOString(),
+                };
                 replies.push(reply);
                 if (body?.request_id) replyResults.set(body.request_id, reply);
                 return json(201, { id: reply.id, status: reply.status });
@@ -216,6 +230,10 @@ function fakeTryPost(clock) {
         replies,
         reads,
         replyStatuses,
+        /** A reply sent outside Echo (Hermes or the panel); TryPost may or may not say who wrote it. */
+        outsideReply(itemId, text, { author = null, at = clock.t } = {}) {
+            replies.push({ id: `r${replies.length + 1}`, itemId, text, status: 'sent', createdAt: new Date(at).toISOString(), ...(author ? { author } : {}) });
+        },
         setDown: (value) => (down = value),
         setLegacy: (value) => (legacy = value),
         /** Someone decides in the panel (the API token's user is Echo's, so approved_by says nothing). */
@@ -2402,6 +2420,95 @@ describe('social inbox: who may reply', () => {
         assert.deepEqual(t.whatsapp.last(PHONES.mehmet).interactive.action.buttons.map((button) => button.reply.title), ['Hepsi okundu']);
         assert.deepEqual(t.whatsapp.last(PHONES.yasir).interactive.action.buttons.map((button) => button.reply.title), ['Hermes’e bırak', 'Hepsi okundu']);
         assert.equal(t.whatsapp.last(PHONES.ayse).template.name, 'etkilesim_ozeti');
+    });
+});
+
+describe('social inbox: several people replying to the same item', () => {
+    let t;
+    beforeEach(async () => {
+        t = setup(); // Yasir and Ayşe may reply, Mehmet only gets the notification
+        for (const phone of [PHONES.yasir, PHONES.ayse, PHONES.mehmet]) await t.user.hello(phone);
+        await receiveItem(t, inboxItem());
+    });
+    const notificationOf = (phone) => t.whatsapp.to(phone).find((m) => /📥/.test(bodyOf(m)));
+    const confirmOf = (phone) => t.whatsapp.to(phone).filter((m) => /Şu cevabı göndereyim mi/.test(bodyOf(m))).at(-1);
+    const titles = (message) => message.interactive.action.buttons.map((button) => button.reply.title);
+    const answeredNotes = (phone) => t.whatsapp.to(phone).filter((m) => /^✅ .* cevapladı/.test(bodyOf(m)));
+    const yasirReplies = async (text = 'Cuma 18:00’de!') => {
+        await t.user.say(PHONES.yasir, text, notificationOf(PHONES.yasir).id);
+        await t.user.tap(PHONES.yasir, idsOf(confirmOf(PHONES.yasir))[0]);
+    };
+
+    it('shows a reply sent through Echo on "Cevapla" and asks "Yine de gönder" for a second one', async () => {
+        await yasirReplies();
+        t.clock.t += 5 * 60_000;
+        await t.user.tap(PHONES.ayse, idsOf(notificationOf(PHONES.ayse))[0]);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.ayse)), /Cevabını yaz: [\s\S]*\nNot: Yasir 15:00’te cevap verdi: “Cuma 18:00’de!”/);
+
+        await t.user.say(PHONES.ayse, 'Cuma 18:00, Mühendislik binası');
+        const confirm = confirmOf(PHONES.ayse);
+        assert.match(bodyOf(confirm), /Not: Yasir 15:00’te cevap verdi: “Cuma 18:00’de!”\n\nCuma 18:00, Mühendislik binası$/);
+        assert.deepEqual(titles(confirm), ['Yine de gönder', 'Düzenle', 'İptal']);
+        await t.user.tap(PHONES.ayse, idsOf(confirm)[0]);
+        assert.deepEqual(t.trypost.replies.map((reply) => reply.text), ['Cuma 18:00’de!', 'Cuma 18:00, Mühendislik binası']);
+    });
+
+    it('shows replies sent from Hermes or the panel, by author when TryPost names one, else "biri"', async () => {
+        t.trypost.outsideReply('i1', 'Panelden cevap', { at: Date.parse('2026-11-10T20:06:00Z') });
+        await t.user.tap(PHONES.yasir, idsOf(notificationOf(PHONES.yasir))[0]);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /\nNot: biri 10 Kasım 23:06’da cevap verdi: “Panelden cevap”/);
+
+        t.trypost.outsideReply('i1', 'Hermes’ten cevap', { author: { name: 'Bilal' }, at: Date.parse('2026-11-10T22:06:00Z') });
+        await t.user.say(PHONES.yasir, 'Bir cevap daha');
+        const confirm = confirmOf(PHONES.yasir);
+        assert.match(bodyOf(confirm), /\nNot: Bilal 01:06’da cevap verdi: “Hermes’ten cevap”/);
+        assert.deepEqual(titles(confirm), ['Yine de gönder', 'Düzenle', 'İptal']);
+        // A reply that failed on the platform does not count.
+        t.trypost.replies.length = 0;
+        t.trypost.replies.push({ id: 'rx', itemId: 'i1', text: 'olmadı', status: 'failed', createdAt: new Date(t.clock.t).toISOString() });
+        await t.user.say(PHONES.ayse, 'Merhaba', notificationOf(PHONES.ayse).id);
+        assert.doesNotMatch(bodyOf(confirmOf(PHONES.ayse)), /Not:/);
+        assert.deepEqual(titles(confirmOf(PHONES.ayse)), ['Gönder', 'Düzenle', 'İptal']);
+    });
+
+    it('falls back to the replies made through Echo when TryPost cannot be reached', async () => {
+        await yasirReplies();
+        t.trypost.setDown(true);
+        await t.user.say(PHONES.ayse, 'Teşekkürler', notificationOf(PHONES.ayse).id);
+        const confirm = confirmOf(PHONES.ayse);
+        assert.match(bodyOf(confirm), /\nNot: Yasir 15:00’te cevap verdi: “Cuma 18:00’de!”/);
+        assert.deepEqual(titles(confirm), ['Yine de gönder', 'Düzenle', 'İptal']);
+    });
+
+    it('tells the others who got the notification once the reply is sent, inside their window only', async () => {
+        t = setup();
+        await t.user.hello(PHONES.yasir);
+        await t.user.hello(PHONES.mehmet); // Ayşe has not written: her window is closed
+        await receiveItem(t, inboxItem());
+        t.trypost.replyStatuses.push('sending');
+        await yasirReplies();
+        assert.equal(answeredNotes(PHONES.mehmet).length, 0); // not sent yet
+
+        t.trypost.replies[0].status = 'sent';
+        await later(t, 31_000);
+        const [note] = answeredNotes(PHONES.mehmet);
+        assert.equal(bodyOf(note), '✅ Yasir, @ali’nin Instagram yorumunu cevapladı: “Cuma 18:00’de!”');
+        assert.equal(note.context.message_id, notificationOf(PHONES.mehmet).id);
+        assert.equal(answeredNotes(PHONES.yasir).length, 0);
+        assert.equal(answeredNotes(PHONES.ayse).length, 0);
+        assert.equal(t.whatsapp.to(PHONES.ayse).length, 1); // only the notification template
+        // Once only.
+        await later(t, 31 * 60_000);
+        assert.equal(answeredNotes(PHONES.mehmet).length, 1);
+    });
+
+    it('names the kind of item and the author in the note', async () => {
+        await receiveItem(t, inboxItem({ id: 'i2', kind: 'message', author: { name: 'Ayşe Kaya', handle: 'bilalkarabali' } }));
+        await t.user.say(PHONES.ayse, 'Merhaba!', t.whatsapp.last(PHONES.ayse).id);
+        await t.user.tap(PHONES.ayse, idsOf(confirmOf(PHONES.ayse))[0]);
+        assert.equal(bodyOf(answeredNotes(PHONES.yasir).at(-1)), '✅ Ayşe, @bilalkarabali’nin Instagram mesajını cevapladı: “Merhaba!”');
+        assert.equal(bodyOf(answeredNotes(PHONES.mehmet).at(-1)), '✅ Ayşe, @bilalkarabali’nin Instagram mesajını cevapladı: “Merhaba!”');
+        assert.equal(answeredNotes(PHONES.ayse).length, 0);
     });
 });
 
