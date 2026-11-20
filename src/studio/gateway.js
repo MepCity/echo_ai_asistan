@@ -1,19 +1,28 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { basename, extname, join, resolve, sep } from 'node:path';
-import { DEFAULT_IMAGE_MODEL, IMAGE_MODELS, MUSIC_MODEL, SPEECH_MODEL } from './config.js';
+import { DEFAULT_IMAGE_MODEL, IMAGE_MODELS, MUSIC_MODEL, SPEECH_MODEL, UNKNOWN_PERSON, personBucket } from './config.js';
 import { parseCredits, parseJob, parseJobIds, parseMediaId, parseUpload } from './higgsfield.js';
 
 /**
  * The studio gateway's tools: what Hermes may do with the club's Higgsfield
  * account, and nothing else. Hermes never sees Higgsfield's own tools or
  * credentials. Every generation goes through one path that checks, in order:
- * the request itself (allowlisted model, sizes), one generation at a time, the
- * cooldown, the daily counts, then Higgsfield's own cost estimate against the
- * per-request, daily, monthly and per-person credit caps. Only then is one
+ * the request itself (allowlisted model, sizes), one generation at a time (no
+ * other call in its submit window, and no earlier job still pending in the
+ * database), the cooldown, the daily counts, then Higgsfield's own cost
+ * estimate against the per-request, daily, monthly and per-person credit caps. Only then is one
  * job sent (count/batch_size 1, never unlimited or free generations unless the
  * config allows), and it is never sent again: a lost answer is recorded as
  * 'unknown' and counts against the limits.
+ *
+ * Per-person caps are best-effort: `requested_by` comes from the model, and
+ * Hermes cannot tell an MCP server who the WhatsApp sender of a call is (its
+ * MCP client sends only the tool arguments; headers are fixed per connection).
+ * A missing or unknown `requested_by` is charged to the shared 'bilinmiyor'
+ * bucket with the same cap, so leaving it out never skips a cap, but a model
+ * could still name someone else. The real guard is the global per-request,
+ * daily and monthly caps.
  *
  * The finished file is kept exactly as Higgsfield made it (same bytes, format
  * and size; its sha256 is stored). WhatsApp gets a copy as a preview (it
@@ -43,12 +52,14 @@ const REFERENCE_EXT = new Set(['png', 'jpg', 'jpeg', 'webp']);
 
 export const MESSAGES = {
     busy: 'Şu an başka bir üretim sürüyor; o bitince tekrar deneyebilirsin.',
+    pending: (id) => `Önceki üretim (generation_id: ${id}) hâlâ hazırlanıyor; o bitmeden yeni üretim başlatmıyorum. Birkaç dakika sonra get_generation ile sonucunu alıp tekrar deneyebilirsin.`,
     cooldown: (sec) => `Üretimler arasında kısa bir bekleme süresi var; yaklaşık ${sec} saniye sonra tekrar deneyebilirsin.`,
     dailyImages: 'Bugünkü görsel üretim sınırı doldu, yarın tekrar deneyebilirsin.',
     dailyMusic: 'Bugünkü müzik üretim sınırı doldu, yarın tekrar deneyebilirsin.',
     dailySpeech: 'Bugünkü seslendirme sınırı doldu, yarın tekrar deneyebilirsin.',
     dailyCredits: (left) => `Bugünkü kredi sınırı bu istek için yetmiyor (kalan yaklaşık ${left} kredi). Yarın tekrar deneyebilirsin.`,
     monthlyCredits: 'Bu ayki kredi sınırı doldu; yeni üretim için ay başını beklemek ya da yöneticinin sınırı artırması gerekiyor.',
+    unknownPerson: (left) => `Kimin istediği belirtilmeyen üretimler için bugünkü ortak kredi sınırı doldu (kalan yaklaşık ${left} kredi). İsteyen kişiyi requested_by ile belirt ya da yarın tekrar dene.`,
     perPerson: (left) => `Bugün senin adına kullanılabilecek kredi sınırı doldu (kalan yaklaşık ${left} kredi). Yarın tekrar deneyebilirsin.`,
     tooExpensive: (cost, max) => `Bu istek yaklaşık ${cost} kredi tutuyor; tek seferde en fazla ${max} krediye izin var. Daha sade bir istekle (daha düşük çözünürlük ya da daha kısa süre) deneyebilirsin.`,
     noEstimate: 'Bu isteğin maliyetini doğrulayamadım, bu yüzden üretmedim. Biraz sonra tekrar deneyebilirsin.',
@@ -121,7 +132,12 @@ export function imageSize(bytes) {
  * fetchImpl (downloads, presigned uploads), sleep, log.
  */
 export function createStudioGateway({ settings, store, higgsfield, auth = null, trypost = null, fetchImpl = globalThis.fetch, sleep = (ms) => new Promise((done) => setTimeout(done, ms)), log = () => {} }) {
+    // In-process lock for the submit window (estimate → send → job id). Jobs still running after
+    // that are found in the database (status 'submitting' / 'submitted'), see settlePending.
     let inFlight = false;
+    // Rows a jobs_wait check is running for, so two checks never store the same job twice.
+    const settling = new Set();
+    const staleMs = settings.pendingStaleMin * 60_000;
     const now = () => store.now();
     const today = () => dayOf(now(), settings.timeZone);
     const newId = () => `gen_${now().toString(36)}${randomBytes(3).toString('hex')}`;
@@ -281,6 +297,16 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
 
     /** Waits for a job (polling jobs_wait), then stores its file. Returns the final row. */
     async function finish(id, jobId, deadline) {
+        if (settling.has(id)) return store.get(id);
+        settling.add(id);
+        try {
+            return await finishOnce(id, jobId, deadline);
+        } finally {
+            settling.delete(id);
+        }
+    }
+
+    async function finishOnce(id, jobId, deadline) {
         let job = { status: 'unknown', terminal: false };
         do {
             try {
@@ -304,6 +330,27 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         return store.get(id);
     }
 
+    /**
+     * Brings sent-but-unfinished jobs up to date: one jobs_wait look for each 'submitted' job (a
+     * finished one becomes completed/failed), and a job pending longer than pendingStaleMin is marked
+     * 'unknown' (it still counts against the limits). Returns the rows still pending.
+     */
+    async function settlePending({ check = true } = {}) {
+        for (const row of store.pending()) {
+            if (now() - row.created_at >= staleMs) {
+                store.update(row.id, { status: 'unknown', reason: `pending over ${settings.pendingStaleMin} min (last status ${row.status})` });
+                log('warn', 'studio generation stale, marked unknown', row.id, row.status);
+            } else if (check && row.status === 'submitted' && row.job_id && !settling.has(row.id)) {
+                try {
+                    await finish(row.id, row.job_id, now());
+                } catch (error) {
+                    log('warn', 'studio pending check failed', row.id, error.message);
+                }
+            }
+        }
+        return store.pending();
+    }
+
     function failedMessage(row) {
         const why = row.reason ?? '';
         if (/nsfw|ip_detected/i.test(why)) return 'Higgsfield bu içeriği güvenlik/telif kuralları nedeniyle üretmedi. İsteği değiştirerek tekrar deneyebilirsin.';
@@ -314,14 +361,17 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
     async function generate(attempt) {
         const { kind, requestedBy } = attempt;
         if (inFlight) refuseAttempt(attempt, MESSAGES.busy);
-        const before = usageNumbers();
-        if (before.cooldownLeft > 0) refuseAttempt(attempt, MESSAGES.cooldown(before.cooldownLeft));
-        const dailyCount = { image: [limits.dailyImages, MESSAGES.dailyImages], music: [limits.dailyMusic, MESSAGES.dailyMusic], speech: [limits.dailySpeech, MESSAGES.dailySpeech] }[kind];
-        if (before.counts[kind] >= dailyCount[0]) refuseAttempt(attempt, dailyCount[1]);
-        if (before.monthCredits >= limits.monthlyCredits) refuseAttempt(attempt, MESSAGES.monthlyCredits);
-
         inFlight = true;
         try {
+            // A job sent earlier may still be running (the call that sent it answered "still preparing").
+            const [pending] = await settlePending();
+            if (pending) refuseAttempt(attempt, MESSAGES.pending(pending.id));
+            const before = usageNumbers();
+            if (before.cooldownLeft > 0) refuseAttempt(attempt, MESSAGES.cooldown(before.cooldownLeft));
+            const dailyCount = { image: [limits.dailyImages, MESSAGES.dailyImages], music: [limits.dailyMusic, MESSAGES.dailyMusic], speech: [limits.dailySpeech, MESSAGES.dailySpeech] }[kind];
+            if (before.counts[kind] >= dailyCount[0]) refuseAttempt(attempt, dailyCount[1]);
+            if (before.monthCredits >= limits.monthlyCredits) refuseAttempt(attempt, MESSAGES.monthlyCredits);
+
             const params = { ...attempt.params };
             if (attempt.reference) params.medias = [{ value: await resolveReference(attempt.reference), role: 'image_references' }];
             const estimateTool = kind === 'image' ? 'estimate_image_cost' : 'estimate_audio_cost';
@@ -339,13 +389,15 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             const usage = usageNumbers();
             if (usage.dayCredits + cost > limits.dailyCredits) refuseAttempt({ ...attempt, params }, MESSAGES.dailyCredits(usage.remaining.credits), cost);
             if (usage.monthCredits + cost > limits.monthlyCredits) refuseAttempt({ ...attempt, params }, MESSAGES.monthlyCredits, cost);
-            if (requestedBy && settings.people.includes(requestedBy)) {
-                const spent = store.personCredits(usage.day, requestedBy);
-                if (spent + cost > limits.perPersonDailyCredits) refuseAttempt({ ...attempt, params }, MESSAGES.perPerson(round(Math.max(0, limits.perPersonDailyCredits - spent))), cost);
+            // Best-effort (requested_by is the model's word); a missing or unknown one shares the 'bilinmiyor' cap.
+            const spent = store.personCredits(usage.day, requestedBy);
+            if (spent + cost > limits.perPersonDailyCredits) {
+                const left = round(Math.max(0, limits.perPersonDailyCredits - spent));
+                refuseAttempt({ ...attempt, params }, requestedBy === UNKNOWN_PERSON ? MESSAGES.unknownPerson(left) : MESSAGES.perPerson(left), cost);
             }
 
             const id = newId();
-            store.insert({ id, day: usage.day, month: usage.day.slice(0, 7), tool: attempt.tool, kind, model: params.model, params: publicParams(params), estimated: cost, status: 'submitting', requestedBy: requestedBy ?? null });
+            store.insert({ id, day: usage.day, month: usage.day.slice(0, 7), tool: attempt.tool, kind, model: params.model, params: publicParams(params), estimated: cost, status: 'submitting', requestedBy });
             const deadline = now() + settings.jobTimeoutSec * 1000;
             let answer;
             try {
@@ -383,7 +435,10 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
     const voiceKeys = Object.keys(settings.voices);
     const aspectRatios = [...new Set(settings.imageModels.flatMap((model) => IMAGE_MODELS[model].aspectRatios))];
     const platformKeys = Object.keys(settings.platformAspectRatios);
-    const requestedByProp = { type: 'string', description: 'İsteyen kişinin Echo kişi anahtarı (ör. "yasir"), biliniyorsa. Sadece kayıt ve kişi başı sınır için; kimlik doğrulaması değildir.' };
+    const requestedByProp = {
+        type: 'string',
+        description: `İsteyen kişinin Echo kişi anahtarı (ör. "yasir"). Sadece kayıt ve kişi başı sınır için; kimlik doğrulaması değildir. Boş ya da bilinmeyen anahtar ortak "${UNKNOWN_PERSON}" sınırından düşer.`,
+    };
     const generationIdProp = { type: 'string', description: 'generate_image / generate_audio sonucundaki generation_id (gen_…).' };
 
     const tools = [
@@ -496,7 +551,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             `Bugün (${usage.day}, İstanbul): ${round(usage.dayCredits)}/${limits.dailyCredits} kredi; ${usage.counts.image}/${limits.dailyImages} görsel, ${usage.counts.music}/${limits.dailyMusic} müzik, ${usage.counts.speech}/${limits.dailySpeech} seslendirme.`,
             `Bu ay: ${round(usage.monthCredits)}/${limits.monthlyCredits} kredi.`,
             `Tek istekte en fazla ${limits.maxCreditsPerRequest} kredi; üretimler arası ${limits.cooldownSec} sn.`,
-            inFlight ? 'Şu an bir üretim sürüyor.' : usage.cooldownLeft > 0 ? `Yeni üretim için ${usage.cooldownLeft} sn beklemek gerekiyor.` : 'Yeni üretim başlatılabilir.',
+            inFlight || store.pending().length ? 'Şu an bir üretim sürüyor.' : usage.cooldownLeft > 0 ? `Yeni üretim için ${usage.cooldownLeft} sn beklemek gerekiyor.` : 'Yeni üretim başlatılabilir.',
         ];
         const status = auth?.status?.();
         if (status && !status.connected) lines.push('Higgsfield bağlantısı kurulmamış; yöneticinin sunucuda giriş yapması gerekiyor.');
@@ -511,7 +566,11 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
 
     async function getGeneration({ generation_id: id }) {
         let row = requireGeneration(id);
-        if (row.status === 'submitted' && row.job_id) row = (await finish(row.id, row.job_id, now()));
+        if (row.status === 'submitted' || row.status === 'submitting') {
+            await settlePending({ check: false });
+            row = store.get(row.id);
+        }
+        if (row.status === 'submitted' && row.job_id) row = await finish(row.id, row.job_id, now());
         if (row.status === 'completed') return describeResult(row, usageNumbers(), ['(Bu sonuç daha önce başlatılmış üretime ait; yeni kredi harcanmadı.)']);
         if (row.status === 'failed') return failedMessage(row);
         if (row.status === 'unknown') return 'Bu üretimin sonucu bilinmiyor (Higgsfield cevap vermedi). Tekrar denemiyorum.';
@@ -532,7 +591,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
 
     async function generateImage(args) {
         const model = args.model ?? DEFAULT_IMAGE_MODEL;
-        const attempt = { tool: 'generate_image', kind: 'image', model, requestedBy: args.requested_by ?? null };
+        const attempt = { tool: 'generate_image', kind: 'image', model, requestedBy: personBucket(args.requested_by, settings.people) };
         if (/video|seedance|kling|veo|sora|wan|hailuo|minimax/i.test(model)) refuseAttempt(attempt, MESSAGES.video);
         if (!settings.imageModels.includes(model)) refuseAttempt(attempt, MESSAGES.unknownModel(settings.imageModels.join(', ')));
         const spec = IMAGE_MODELS[model];
@@ -565,7 +624,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
     async function generateAudio(args) {
         const kind = args.kind;
         if (kind === 'speech') {
-            const attempt = { tool: 'generate_audio', kind: 'speech', model: SPEECH_MODEL, requestedBy: args.requested_by ?? null };
+            const attempt = { tool: 'generate_audio', kind: 'speech', model: SPEECH_MODEL, requestedBy: personBucket(args.requested_by, settings.people) };
             const text = String(args.text ?? '').trim();
             if (!text) refuseAttempt(attempt, 'Seslendirilecek metin boş.');
             if (text.length > settings.speechMaxChars) refuseAttempt(attempt, `Metin çok uzun; en fazla ${settings.speechMaxChars} karakter seslendirebilirim.`);
@@ -577,7 +636,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             return generate({ ...attempt, params });
         }
         if (kind === 'music') {
-            const attempt = { tool: 'generate_audio', kind: 'music', model: MUSIC_MODEL, requestedBy: args.requested_by ?? null };
+            const attempt = { tool: 'generate_audio', kind: 'music', model: MUSIC_MODEL, requestedBy: personBucket(args.requested_by, settings.people) };
             const prompt = String(args.prompt ?? '').trim();
             if (!prompt) refuseAttempt(attempt, 'Müzik tarifi boş; tarz, tempo ve duyguyu yaz.');
             const duration = Math.round(Number(args.duration ?? 30));
@@ -669,5 +728,10 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             }
         },
         usage: usageNumbers,
+        /** Background check of sent jobs (completes or fails finished ones, marks stale ones 'unknown'); skipped while a generation is being sent. */
+        async checkPending() {
+            if (inFlight) return;
+            await settlePending();
+        },
     };
 }

@@ -17,6 +17,8 @@ import { join } from 'node:path';
  *     "platformAspectRatios": { "instagram": "4:5", ... },
  *     "voices": { "kadin": { "id": "<voice id>", "label": "Kadın" }, ... }, "defaultVoice": "kadin",
  *     "allowUnlim": false, "allowFreeGens": false,
+ *     "jobTimeoutSec": 180,            // how long one generate call waits for its job before answering "still preparing"
+ *     "pendingStaleMin": 15,           // a job pending longer than this is marked 'unknown' and no longer blocks
  *     "previewDir": "...", "hermesPreviewDir": "...", "referenceDirs": ["..."], "brandKitFile": "..."
  *   }
  * }
@@ -157,6 +159,8 @@ export function normalizeStudio(raw, config, env = process.env) {
         speechMaxChars: number(value.speechMaxChars, 1500, 'speechMaxChars', 1),
         musicMaxSec: Math.min(number(value.musicMaxSec, 60, 'musicMaxSec', 3), 60),
         jobTimeoutSec: number(value.jobTimeoutSec, 180, 'jobTimeoutSec', 1),
+        // A sent job still pending after this long is marked 'unknown' (still counted) and stops blocking new ones.
+        pendingStaleMin: number(value.pendingStaleMin, 15, 'pendingStaleMin', 1),
         waitSliceSec: Math.min(number(value.waitSliceSec, 10, 'waitSliceSec', 0), 15),
         maxDownloadMb: number(value.maxDownloadMb, 50, 'maxDownloadMb', 1),
         whatsappPreviewMaxMb: number(value.whatsappPreviewMaxMb, 5, 'whatsappPreviewMaxMb', 0),
@@ -169,4 +173,17 @@ export function normalizeStudio(raw, config, env = process.env) {
         brandKitFile: value.brandKitFile ?? env.STUDIO_BRAND_KIT ?? join(dataDir, 'brand-kit.md'),
         people: config.people.map((person) => person.id),
     };
+}
+
+/**
+ * The per-person bucket of a generation whose `requested_by` is missing or not a
+ * known person key. It has the same daily cap as a person, so leaving
+ * `requested_by` out never skips the per-person cap.
+ */
+export const UNKNOWN_PERSON = 'bilinmiyor';
+
+/** The bucket `requestedBy` is charged to: a known person key, else UNKNOWN_PERSON. */
+export function personBucket(requestedBy, people) {
+    const key = typeof requestedBy === 'string' ? requestedBy.trim() : '';
+    return key && key !== UNKNOWN_PERSON && people.includes(key) ? key : UNKNOWN_PERSON;
 }

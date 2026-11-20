@@ -8,8 +8,10 @@ import { DatabaseSync } from 'node:sqlite';
  *   the Europe/Istanbul calendar day and month it was made in (limits count by
  *   them). `status`: 'refused' (never sent), 'submitting' (sent, no answer yet),
  *   'submitted' (Higgsfield took it, job id known), 'completed', 'failed',
- *   'unknown' (the answer was lost: it may have run and cost credits, so it
- *   counts against the limits and is never sent again).
+ *   'unknown' (the answer was lost, or the job stayed pending past the stale
+ *   limit: it may have run and cost credits, so it counts against the limits
+ *   and is never sent again). `requested_by` is the person key the model gave,
+ *   or 'bilinmiyor' (shared bucket) when it gave none or an unknown one.
  * - attachments: generated images uploaded to TryPost (post id, upload sha256).
  */
 export function openStudioDatabase(dir) {
@@ -124,6 +126,10 @@ export function createStudioStore(db, now = () => Date.now()) {
         },
         personCredits(day, person) {
             return Number(db.prepare(`SELECT ${credits} AS credits FROM generations WHERE day = ? AND requested_by = ? AND ${SPENT}`).get(day, person).credits);
+        },
+        /** Sent jobs not yet finished ('submitting' or 'submitted'), oldest first: while one exists no new generation starts. */
+        pending() {
+            return db.prepare("SELECT * FROM generations WHERE status IN ('submitting', 'submitted') ORDER BY created_at, rowid").all();
         },
         /** Time of the last generation sent to Higgsfield (for the cooldown), or null. */
         lastSentAt() {

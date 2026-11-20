@@ -324,10 +324,18 @@ TikTok vb. hiçbir Higgsfield aracı Hermes'e açılmaz, geçit de bunları ça�
 her zaman 1, `use_unlim` false (config `allowUnlim` açmadıkça), `use_free_gens` gönderilmez.
 Her üretimden önce Higgsfield'in `estimate_*_cost` aracıyla fiyat sorulur. Sınırlar
 (`config.json` → `studio.limits`, varsayılanlar): tek istekte ≤10 kredi; üretimler arası 60 sn;
-aynı anda tek üretim; İstanbul gününe göre günde ≤40 kredi, ≤15 görsel, ≤5 müzik, ≤20
-seslendirme; ayda ≤400 kredi; `requested_by` bilinen bir kişiyse kişi başı günde ≤20 kredi
-(Hermes kimliği kanıtlayamaz; asıl koruma genel sınırlardır). Başarısız ya da cevabı kaybolan
-üretim asla tekrar gönderilmez (cevabı kaybolan "unknown" sayılır ve sınırlara dahildir). Her
+aynı anda tek üretim (Higgsfield'e gönderilmiş ama bitmemiş bir iş, `submitting`/`submitted`,
+veritabanında durdukça yeni üretim reddedilir; `get_generation`, bir sonraki üretim denemesi ve
+dakikada bir arka plan kontrolü biten işi `completed`/`failed` yapar; `studio.pendingStaleMin`
+(15 dk) geçen iş "unknown" olur, sınırlara sayılır ve artık engellemez); İstanbul gününe göre
+günde ≤40 kredi, ≤15 görsel, ≤5 müzik, ≤20 seslendirme; ayda ≤400 kredi; kişi başı günde ≤20
+kredi. **Kişi başı sınır en iyi çabadır:** `requested_by`'ı model yazar; Hermes MCP sunucusuna
+çağrıyı kimin (hangi WhatsApp numarasının) yaptığını iletmez (MCP istemcisi yalnızca araç
+argümanlarını gönderir, başlıklar bağlantı başına sabittir). `requested_by` boş ya da bilinmeyen
+bir anahtarsa üretim ortak `bilinmiyor` kovasına, aynı sınırla yazılır (boş bırakmak sınırı
+atlatmaz), ama model başka bir kişinin adını yazabilir. Asıl koruma tek istek, günlük ve aylık
+genel sınırlardır. Başarısız ya da cevabı kaybolan üretim asla tekrar gönderilmez (cevabı
+kaybolan "unknown" sayılır ve sınırlara dahildir). Her
 deneme (reddedilenler dahil) `/data/studio/studio.db` → `generations` tablosunda.
 
 **Dosyalar:** Higgsfield'in verdiği dosya **olduğu gibi** (aynı bayt, biçim, çözünürlük; sha256

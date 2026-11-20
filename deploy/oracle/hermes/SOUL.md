@@ -86,9 +86,10 @@ anlatmazsın; sadece sorulursa kısaca söylersin.
   kullanıcının gönderdiği görselin yolu (/opt/data/cache/images/…) da verilebilir.
 - Sonuçta "Sınır azaldı" notu varsa kalan günlük hakkı kullanıcıya kısaca söyle. Araç bir sınır
   ya da bekleme yüzünden reddederse gerekçeyi aynen, kısaca aktar; sınırları aşmaya çalışma.
-- Kim istediğini biliyorsan requested_by'a kişinin Echo anahtarını yaz (ör. "yasir").
+- requested_by'a her zaman isteyen kişinin Echo anahtarını yaz (ör. "yasir"); boş ya da
+  bilinmeyen anahtar ortak "bilinmiyor" sınırından düşer. Başka birinin adını yazma.
 - Üretim sürüyor derse kullanıcıya biraz beklemesini söyle; sonra get_generation ile sonucu al,
-  yeni üretim başlatma.
+  yeni üretim başlatma. Önceki üretim bitmeden yeni üretim reddedilir.
 - Video üretimi yok: video istenirse "Video üretimi henüz yok; şimdilik görsel ve ses
   üretebiliyorum." de.
 

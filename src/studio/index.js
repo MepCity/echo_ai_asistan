@@ -35,6 +35,18 @@ if (settings.project) {
 
 const gateway = createStudioGateway({ settings, store, higgsfield, auth, trypost, log });
 const server = createStudioServer({ gateway, token: process.env.ECHO_STUDIO_TOKEN, log });
+// Jobs still running when their generate call answered "still preparing": finish them (or mark
+// them 'unknown' past studio.pendingStaleMin) even if nobody asks with get_generation.
+let checking = false;
+const pendingTimer = setInterval(() => {
+    if (checking) return;
+    checking = true;
+    gateway
+        .checkPending()
+        .catch((error) => log('warn', 'studio pending check failed', error.message))
+        .finally(() => (checking = false));
+}, 60_000);
+pendingTimer.unref();
 server.listen(settings.port, () => {
     const status = auth.status();
     log('info', `listening on :${settings.port}; Higgsfield ${status.connected ? `connected (${status.method})` : 'NOT connected (run src/studio/login.js)'}; TryPost project ${settings.project ?? 'none'}`);
