@@ -106,8 +106,28 @@ if [ ! -f "$DATA/SOUL.md" ] || grep -q 'echo-managed' "$DATA/SOUL.md"; then
 else
   echo "SOUL.md senin duzenledigin haliyle birakildi."
 fi
+# --- Turkish approval card: Hermes plugin echo_onay_tr ------------------------------------------
+# Hermes writes the middle of its WhatsApp approval card in fixed English (tool name, "UNTRUSTED",
+# a JSON dump) with no setting to change it. The plugin (plugins/echo_onay_tr/__init__.py) swaps only
+# that text for a short Turkish summary of TryPost and studio calls; the approval itself is unchanged.
+# If a Hermes update moves the code it wraps, it does nothing and Hermes' own card is shown (checked
+# at the end of this script). Kept in step with the repo unless plugin.yaml loses its echo-managed line.
+PLUGIN_SRC=$HERE/plugins/echo_onay_tr
+PLUGIN_DST=$DATA/plugins/echo_onay_tr
+mkdir -p "$DATA/plugins"
+if [ ! -f "$PLUGIN_DST/plugin.yaml" ] || grep -q 'echo-managed' "$PLUGIN_DST/plugin.yaml"; then
+  mkdir -p "$PLUGIN_DST"
+  for file in plugin.yaml __init__.py render.py; do
+    install -m 644 "$PLUGIN_SRC/$file" "$PLUGIN_DST/$file"
+  done
+  rm -rf "$PLUGIN_DST/__pycache__"
+  echo "Turkce onay mesaji eklentisi kopyalandi: $PLUGIN_DST"
+else
+  echo "$PLUGIN_DST senin duzenledigin haliyle birakildi."
+fi
+
 python3 -I "$HERE/configure.py" "$DATA/config.yaml"
-echo "config.yaml: saglayici openai-codex (secilen model korunur), TryPost MCP (OAuth, yazma araclari onayli), studio MCP (Higgsfield gorsel/ses; uretim ve TryPost'a ekleme onayli), riskli araclar kapali, profil teklifi ve komut ipuclari kapali, dil tr; onay mesaji Turkce (locales/tr.yaml)."
+echo "config.yaml: saglayici openai-codex (secilen model korunur), TryPost MCP (OAuth, yazma araclari onayli), studio MCP (Higgsfield gorsel/ses; uretim ve TryPost'a ekleme onayli), riskli araclar kapali, profil teklifi ve komut ipuclari kapali, dil tr; onay mesaji Turkce (locales/tr.yaml + echo_onay_tr eklentisi)."
 
 # --- Studio gateway (Higgsfield images/audio): brand kit, shared folders, bearer secret ------------
 bash "$HERE/studio-prepare.sh"
@@ -198,6 +218,7 @@ fi
 
 # --- Config again (Hermes may have migrated it on first start), restart --------------------------
 python3 -I "$HERE/configure.py" "$DATA/config.yaml"
+restarted_at=$(date +%s)
 compose restart studio hermes
 # Ongoing chats replay the system prompt stored when they began; this makes each one rebuild it
 # once from the new SOUL.md on its next message (history is kept).
@@ -205,6 +226,27 @@ if compose exec -T hermes hermes sessions refresh-prompts >/dev/null 2>&1; then
   echo "Acik sohbetler bir sonraki mesajda yeni SOUL.md ile devam edecek."
 else
   echo "UYARI: sohbet istemleri yenilenemedi; sonra tekrar: bash $HERE/hermes.sh sessions refresh-prompts"
+fi
+
+# --- Did the Turkish approval card load? (status.json is written by the plugin when Hermes loads it) ---
+plugin_ok=""
+for _ in $(seq 1 20); do
+  if [ -f "$PLUGIN_DST/status.json" ] && [ "$(jq -r '.time // 0' "$PLUGIN_DST/status.json" 2>/dev/null || echo 0)" -ge "$restarted_at" ]; then
+    plugin_ok=$(jq -r '.ok' "$PLUGIN_DST/status.json")
+    break
+  fi
+  sleep 3
+done
+if [ "$plugin_ok" = true ]; then
+  echo "Onay mesaji: $(jq -r '.message' "$PLUGIN_DST/status.json")"
+elif [ "$plugin_ok" = false ]; then
+  echo "UYARI: $(jq -r '.message' "$PLUGIN_DST/status.json")"
+  echo "  Onaylar yine calisir (Onayla/Vazgec ayni); sadece metin Ingilizce ve uzun kalir. Hermes'in yeni surumu"
+  echo "  eklentinin sardigi kodu degistirmis olabilir: deploy/oracle/hermes/plugins/echo_onay_tr/__init__.py guncellenmeli."
+else
+  echo "UYARI: echo_onay_tr eklentisi Hermes acildiktan sonra durum yazmadi (yuklenmemis olabilir)."
+  echo "  Onaylar yine calisir; metin Hermes'in kendi Ingilizce metni olur. Kontrol: bash $HERE/hermes.sh plugins list"
+  echo "  ve ilk mesajdan sonra: cat $PLUGIN_DST/status.json"
 fi
 
 # --- Echo forwards to Hermes ------------------------------------------------------------------------

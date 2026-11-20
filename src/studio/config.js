@@ -14,6 +14,7 @@ import { join } from 'node:path';
  *                 "dailyMusic": 5, "dailySpeech": 20, "monthlyCredits": 400, "perPersonDailyCredits": 20 },
  *     "imageModels": ["gpt_image_2_6", "nano_banana_2_1", "recraft_v4_1"],   // may only narrow the built-in allowlist
  *     "imageFormat": "png",            // gpt_image_2_6 output_format: png | jpeg | webp
+ *     "approxCredits": { "image": { "gpt_image_2_6": { "1k": 1.5 } } },   // approval card estimate (see APPROX_CREDITS)
  *     "platformAspectRatios": { "instagram": "4:5", ... },
  *     "voices": { "kadin": { "id": "<voice id>", "label": "Kadın" }, ... }, "defaultVoice": "kadin",
  *     "allowUnlim": false, "allowFreeGens": false,
@@ -33,7 +34,7 @@ import { join } from 'node:path';
 export const IMAGE_MODELS = {
     gpt_image_2_6: {
         label: 'GPT Image 2.6 (genel amaçlı, yazı ve referans görselle iyi)',
-        resolutions: ['2k'],
+        resolutions: ['1k', '2k'],
         aspectRatios: ['1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16', '4:5', '5:4', '21:9'],
         references: true,
     },
@@ -52,6 +53,26 @@ export const IMAGE_MODELS = {
     },
 };
 export const DEFAULT_IMAGE_MODEL = 'gpt_image_2_6';
+/** Every image model generates at 1k unless the request explicitly asks for 2k (or, nano_banana_2_1 only, 4k). */
+export const DEFAULT_IMAGE_RESOLUTION = '1k';
+
+/**
+ * Approximate credits per generation, for the Turkish approval card Hermes shows before a call
+ * (the card is drawn before the gateway is called, so it cannot use Higgsfield's live estimate).
+ * The gateway still asks Higgsfield for the exact price before sending anything; when an earlier
+ * generation with the same model and resolution exists, its estimate is shown instead of this table.
+ * config.json `studio.approxCredits` may override any value (same shape).
+ */
+export const APPROX_CREDITS = {
+    image: {
+        gpt_image_2_6: { '1k': 1.5, '2k': 2.75 },
+        nano_banana_2_1: { '1k': 1.5, '2k': 2 },
+        // Only 2k is known (8); 1k is assumed the same until a real estimate is seen.
+        recraft_v4_1: { '1k': 8, '2k': 8 },
+    },
+    speech: 1,
+    musicPerMinute: 9,
+};
 export const SPEECH_MODEL = 'elevenlabs_v4';
 export const MUSIC_MODEL = 'elevenlabs_music_v2_5';
 
@@ -150,6 +171,7 @@ export function normalizeStudio(raw, config, env = process.env) {
         imageModels,
         imageFormat,
         platformAspectRatios: { ...PLATFORM_ASPECT_RATIOS, ...(value.platformAspectRatios ?? {}) },
+        approxCredits: approxCredits(value.approxCredits),
         voices,
         defaultVoice,
         brandColors: value.brandColors ?? BRAND_COLORS,
@@ -175,6 +197,17 @@ export function normalizeStudio(raw, config, env = process.env) {
         referenceDirs,
         brandKitFile: value.brandKitFile ?? env.STUDIO_BRAND_KIT ?? join(dataDir, 'brand-kit.md'),
         people: config.people.map((person) => person.id),
+    };
+}
+
+function approxCredits(raw) {
+    const value = raw && typeof raw === 'object' ? raw : {};
+    const image = {};
+    for (const model of Object.keys(IMAGE_MODELS)) image[model] = { ...APPROX_CREDITS.image[model], ...(value.image?.[model] ?? {}) };
+    return {
+        image,
+        speech: number(value.speech, APPROX_CREDITS.speech, 'approxCredits.speech'),
+        musicPerMinute: number(value.musicPerMinute, APPROX_CREDITS.musicPerMinute, 'approxCredits.musicPerMinute'),
     };
 }
 

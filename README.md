@@ -315,9 +315,33 @@ yalnızca şu araçları verir:
 | `studio_usage` | bugünkü/aylık kullanım, kalan sınırlar, bekleme | yok |
 | `get_generation` | başlamış bir üretimin sonucu (yeni kredi harcamaz) | yok |
 | `get_original_file` | asıl dosyayı WhatsApp'a belge olarak göndermek için yol | yok |
-| `generate_image` | tek görsel: `gpt_image_2_6` (varsayılan, high/2k), `nano_banana_2_1` (≤4k), `recraft_v4_1` (≤2k, vektör/tipografi, marka renkleri) | WhatsApp'ta onay |
+| `generate_image` | tek görsel, varsayılan **1k** (2k yalnızca `yuksek_cozunurluk: true` / `resolution: "2k"`, 4k yalnızca açıkça ve sadece Nano Banana): `gpt_image_2_6` (varsayılan, high), `nano_banana_2_1`, `recraft_v4_1` (vektör/tipografi, marka renkleri) | WhatsApp'ta onay |
 | `generate_audio` | `speech` (`elevenlabs_v4`, ≤1500 karakter) ya da `music` (`elevenlabs_music_v2_5`, ≤60 sn) | onay |
 | `attach_to_trypost` | üretilen görselin **asıl dosyasını** TryPost'a yükler; `post_id` varsa ekler, yoksa `social_account_id` için yeni taslak | onay |
+
+`generate_image`, `generate_audio` ve `attach_to_trypost` isteğe bağlı bir `ozet` alır: Hermes'in
+yazdığı tek satırlık Türkçe özet; yalnızca onay mesajında ve "hazır" bildiriminde görünür.
+
+**Türkçe onay mesajı:** Hermes'in onay kartının ortası normalde sabit İngilizce ("MCP tool … on
+UNTRUSTED server … Arguments: {json}") ve WhatsApp'ın 1024 karakter sınırını aşınca uzun metni önce
+ayrı bir mesaj olarak, sonra kesik kartı gönderiyor. Hermes'te bu metni değiştiren bir ayar, dil
+anahtarı ya da kanca yok; bu yüzden `deploy/oracle/hermes/plugins/echo_onay_tr` adlı küçük bir Hermes
+eklentisi (`setup-hermes.sh` → `/opt/hermes/data/plugins/`, `configure.py` → `plugins.enabled`)
+yalnızca TryPost ve studio araçlarının kart metnini kısa Türkçe bir özetle değiştirir (≤600 karakter,
+tek mesaj): ör. "🎨 Görsel üretilecek · Instagram (4:5) · yaklaşık 1.5 kredi / Konu: …", "📝 TryPost'ta
+taslak oluşturulacak · Instagram / Metin: “…”", "💬 Yorum ya da mesaja cevap gidecek". Onay kapısı
+aynen kalır (aynı Onayla/Vazgeç, aynı süre); yazma araçları asla kendiliğinden onaylanmaz. Kredi tahmini
+studio'nun `POST /approval-hint` ucundan gelir (aynı modelin son gerçek tahmini, yoksa
+`studio.approxCredits` tablosu: GPT 1k 1,5 / 2k 2,75; Nano 1k 1,5 / 2k 2; Recraft 8). Hermes
+güncellemesi eklentinin sardığı kodu değiştirirse eklenti hiçbir şey yapmaz, Hermes'in kendi kartı
+çıkar; `setup-hermes.sh` (ve `update.sh`) sonunda durumu yazar (`/opt/hermes/data/plugins/echo_onay_tr/status.json`).
+
+**Geç biten üretim:** Üretim çağrısı "hâlâ hazırlanıyor" dediyse ve iş sonra arka plan kontrolünde
+biterse, studio isteyen kişiye (`requested_by` → `config.json` `people[].phone`, yalnızca asistanı
+kullanabilen kişiler) WhatsApp'tan kısa bir "🎨 … hazır." mesajı ve önizlemeyi kendisi gönderir
+(Echo'nun WhatsApp anahtarıyla). `requested_by` bilinmiyorsa, sonuç zaten `get_generation` ile
+gösterildiyse ya da üretim 23 saatten eskiyse gönderilmez. Tek deneme: gönderilemezse (ör. 24 saat
+penceresi dışında) loglanır, tekrar denenmez.
 
 Model listesi sunucuda sabittir (allowlist); video modelleri, preset'ler, GPU, web sitesi, reklam,
 TikTok vb. hiçbir Higgsfield aracı Hermes'e açılmaz, geçit de bunları çağıramaz. `count`/`batch_size`

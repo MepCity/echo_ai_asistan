@@ -19,6 +19,9 @@ export function bearerMatches(header, secret) {
  * POST /mcp takes a JSON-RPC message (or a batch) and answers with JSON.
  * Every request needs `Authorization: Bearer <ECHO_STUDIO_TOKEN>` (Hermes
  * sends it from its mcp_servers headers). GET /health is open (no details).
+ * POST /approval-hint {tool, arguments} (same bearer) answers what the WhatsApp approval card shows
+ * before a studio tool runs ({ credits, aspect_ratio, ... }); it records nothing and never calls
+ * Higgsfield (Hermes' echo_onay_tr plugin asks it).
  */
 export function createStudioServer({ gateway, token, log = () => {}, name = 'echo-studio', version = '1.0.0' }) {
     if (!token || String(token).length < 16) throw new Error('ECHO_STUDIO_TOKEN must be set (at least 16 characters)');
@@ -71,10 +74,21 @@ export function createStudioServer({ gateway, token, log = () => {}, name = 'ech
     async function handle(request, response) {
         const path = new URL(request.url, 'http://studio').pathname.replace(/\/+$/, '') || '/';
         if (path === '/health' && request.method === 'GET') return send(response, 200, { ok: true });
-        if (path !== '/mcp') return send(response, 404, 'not found');
+        if (path !== '/mcp' && path !== '/approval-hint') return send(response, 404, 'not found');
         if (!bearerMatches(request.headers.authorization, token)) {
             log('warn', 'studio request without a valid bearer rejected');
             return send(response, 401, { error: 'unauthorized' }, { 'WWW-Authenticate': 'Bearer' });
+        }
+        if (path === '/approval-hint') {
+            if (request.method !== 'POST') return send(response, 405, 'method not allowed', { Allow: 'POST' });
+            let hintBody;
+            try {
+                hintBody = JSON.parse((await readBody(request, 16 * 1024)) ?? '');
+            } catch {
+                return send(response, 400, { error: 'bad request' });
+            }
+            const args = hintBody?.arguments && typeof hintBody.arguments === 'object' ? hintBody.arguments : {};
+            return send(response, 200, gateway.approvalHint ? gateway.approvalHint(String(hintBody?.tool ?? ''), args) : {});
         }
         if (request.method === 'DELETE') return send(response, 200, 'ok');
         if (request.method !== 'POST') return send(response, 405, 'method not allowed', { Allow: 'POST, DELETE' });
@@ -98,6 +112,18 @@ export function createStudioServer({ gateway, token, log = () => {}, name = 'ech
         }
         const answer = await handleMessage(body);
         return answer ? send(response, 200, answer) : send(response, 202, '');
+    }
+
+    /** The request body as text, or null when it is larger than `max`. */
+    async function readBody(request, max) {
+        const chunks = [];
+        let size = 0;
+        for await (const chunk of request) {
+            size += chunk.length;
+            if (size > max) return null;
+            chunks.push(chunk);
+        }
+        return Buffer.concat(chunks).toString('utf8');
     }
 
     const server = createServer((request, response) => {

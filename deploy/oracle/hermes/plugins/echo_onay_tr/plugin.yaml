@@ -1,0 +1,7 @@
+# echo-managed: setup-hermes.sh copies this folder to /opt/hermes/data/plugins/echo_onay_tr and
+# configure.py adds "echo_onay_tr" to plugins.enabled. See __init__.py.
+name: echo_onay_tr
+version: "1.0.0"
+kind: standalone
+description: "Echo: TryPost ve studio araclarinin WhatsApp onay mesaji kisa ve Turkce (onay kapisi aynen kalir)."
+author: Echo

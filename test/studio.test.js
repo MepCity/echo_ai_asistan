@@ -14,6 +14,8 @@ import { rawAnswerOf, recoverGeneration } from '../src/studio/recover.js';
 import { createHiggsfieldAuth, createTokenFile, parsePasted } from '../src/studio/oauth.js';
 import { bearerMatches, createStudioServer } from '../src/studio/server.js';
 import { createStudioStore, openStudioDatabase } from '../src/studio/store.js';
+import { createStudioNotifier } from '../src/studio/notify.js';
+import { OUTSIDE_WINDOW, WhatsAppError } from '../src/whatsapp.js';
 
 const dirs = [];
 const tempDir = () => {
@@ -126,13 +128,13 @@ function fakeTryPost({ posts = ['post-1'] } = {}) {
     };
 }
 
-function setup({ studio = {}, start = Date.parse('2026-11-20T09:00:00Z'), higgsfield = fakeHiggsfield(), fetchImpl = downloadFetch(), trypost = fakeTryPost() } = {}) {
+function setup({ studio = {}, start = Date.parse('2026-11-20T09:00:00Z'), higgsfield = fakeHiggsfield(), fetchImpl = downloadFetch(), trypost = fakeTryPost(), notify = null } = {}) {
     const dataDir = tempDir();
     const config = echoConfig(dataDir);
     const settings = normalizeStudio({ waitSliceSec: 1, ...studio }, config, { STUDIO_PREVIEW_DIR: join(dataDir, 'hermes-preview'), STUDIO_BRAND_KIT: join(dataDir, 'brand-kit.md') });
     const clock = { now: start };
     const store = createStudioStore(openStudioDatabase(':memory:'), () => clock.now);
-    const gateway = createStudioGateway({ settings, store, higgsfield, trypost, fetchImpl, sleep: async (ms) => (clock.now += ms) });
+    const gateway = createStudioGateway({ settings, store, higgsfield, trypost, fetchImpl, sleep: async (ms) => (clock.now += ms), notify });
     return { gateway, store, settings, higgsfield, trypost, clock, dataDir };
 }
 
@@ -189,7 +191,7 @@ describe('studio gateway: tools and allowlist', () => {
         assert.equal(params.use_free_gens, undefined);
         assert.equal(params.aspect_ratio, '9:16');
         assert.equal(params.quality, 'high');
-        assert.equal(params.resolution, '2k');
+        assert.equal(params.resolution, '1k', 'images are 1k unless 2k is asked for');
         const estimate = higgsfield.calls.find((item) => item.name === 'estimate_image_cost');
         assert.deepEqual(estimate.args.params, params, 'the estimate prices exactly what is sent');
     });
@@ -947,5 +949,244 @@ describe('studio: unmatched answers, raw copy and recovery', () => {
         assert.equal(store.get('gen_old').recovered_at, null);
         assert.equal(recoverGeneration(store, 'gen_old', JOB).ok, true);
         createStudioStore(openStudioDatabase(dir)); // opening again is a no-op
+    });
+});
+
+describe('studio: image resolution (1k unless asked)', () => {
+    it('every model generates at 1k by default', async () => {
+        const { gateway, higgsfield, clock } = setup({ studio: { limits: { cooldownSec: 0, maxCreditsPerRequest: 20 } } });
+        for (const model of ['gpt_image_2_6', 'nano_banana_2_1', 'recraft_v4_1']) {
+            const result = await image(gateway, { model });
+            assert.equal(result.isError, false, result.text);
+            clock.now += 1000;
+            assert.equal(higgsfield.generated().at(-1).args.params.resolution, '1k', model);
+        }
+        assert.equal(higgsfield.generated()[0].args.params.quality, 'high');
+    });
+
+    it('2k only when asked (yuksek_cozunurluk or resolution "2k"); 4k only by name and only on nano_banana_2_1', async () => {
+        const { gateway, higgsfield, clock } = setup({ studio: { limits: { cooldownSec: 0 } } });
+        await image(gateway, { yuksek_cozunurluk: true });
+        clock.now += 1000;
+        assert.equal(higgsfield.generated().at(-1).args.params.resolution, '2k');
+        await image(gateway, { resolution: '2k', model: 'recraft_v4_1' });
+        clock.now += 1000;
+        assert.equal(higgsfield.generated().at(-1).args.params.resolution, '2k');
+        await image(gateway, { model: 'nano_banana_2_1', yuksek_cozunurluk: true });
+        clock.now += 1000;
+        assert.equal(higgsfield.generated().at(-1).args.params.resolution, '2k', 'yuksek_cozunurluk never means 4k');
+        await image(gateway, { model: 'nano_banana_2_1', resolution: '4k' });
+        clock.now += 1000;
+        assert.equal(higgsfield.generated().at(-1).args.params.resolution, '4k');
+        assert.match((await image(gateway, { resolution: '4k' })).text, /gpt_image_2_6 için çözünürlük 1k \/ 2k olabilir/);
+        assert.equal(higgsfield.generated().length, 4);
+    });
+
+    it('generate_image, generate_audio and attach_to_trypost accept an ozet; it is kept as the summary', async () => {
+        const { gateway, store } = setup();
+        for (const name of ['generate_image', 'generate_audio', 'attach_to_trypost']) {
+            const tool = gateway.tools.find((item) => item.name === name);
+            assert.equal(tool.inputSchema.properties.ozet.type, 'string', name);
+        }
+        assert.equal((await image(gateway, { ozet: '  8 Mart\nafişi ' })).isError, false);
+        assert.equal(store.recent().at(-1).summary, '8 Mart afişi');
+    });
+});
+
+describe('studio: approval card hint', () => {
+    it('static per-model table: gpt 1k 1.5 / 2k 2.75, nano 1k 1.5 / 2k 2, recraft 8; platform ratio', () => {
+        const { gateway } = setup();
+        assert.deepEqual(gateway.approvalHint('generate_image', { platform: 'instagram' }), { aspect_ratio: '4:5', resolution: '1k', credits: 1.5 });
+        assert.equal(gateway.approvalHint('generate_image', { yuksek_cozunurluk: true }).credits, 2.75);
+        assert.equal(gateway.approvalHint('generate_image', { model: 'nano_banana_2_1' }).credits, 1.5);
+        assert.equal(gateway.approvalHint('generate_image', { model: 'nano_banana_2_1', resolution: '2k' }).credits, 2);
+        assert.equal(gateway.approvalHint('generate_image', { model: 'recraft_v4_1', resolution: '2k' }).credits, 8);
+        assert.equal(gateway.approvalHint('generate_image', { aspect_ratio: '16:9' }).aspect_ratio, '16:9');
+        assert.deepEqual(gateway.approvalHint('generate_audio', { kind: 'speech' }), { credits: 1 });
+        assert.deepEqual(gateway.approvalHint('generate_audio', { kind: 'music', duration: 30 }), { duration: 30, credits: 4.5 });
+        assert.deepEqual(gateway.approvalHint('attach_to_trypost', {}), {});
+    });
+
+    it('config.json studio.approxCredits overrides the table; a real earlier estimate of the same model and resolution wins', async () => {
+        const higgsfield = fakeHiggsfield({ estimate: 1.75 });
+        const { gateway } = setup({ higgsfield, studio: { approxCredits: { image: { gpt_image_2_6: { '1k': 1.25 } } } } });
+        assert.equal(gateway.approvalHint('generate_image', {}).credits, 1.25);
+        await image(gateway);
+        assert.equal(gateway.approvalHint('generate_image', {}).credits, 1.75);
+        assert.equal(gateway.approvalHint('generate_image', { resolution: '2k' }).credits, 2.75, 'other resolution: still the table');
+    });
+
+    it('POST /approval-hint needs the bearer and records nothing', async () => {
+        const { gateway, store } = setup();
+        const server = createStudioServer({ gateway, token: TOKEN });
+        await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+        const url = `http://127.0.0.1:${server.address().port}/approval-hint`;
+        const post = (body, token = TOKEN) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body });
+        try {
+            assert.equal((await post('{}', null)).status, 401);
+            const answer = await post(JSON.stringify({ tool: 'generate_image', arguments: { platform: 'x' } }));
+            assert.equal(answer.status, 200);
+            assert.deepEqual(await answer.json(), { aspect_ratio: '16:9', resolution: '1k', credits: 1.5 });
+            assert.equal((await post('not json')).status, 400);
+            assert.equal(store.recent().length, 0);
+        } finally {
+            server.close();
+        }
+    });
+});
+
+describe('studio: "ready" message for a generation that finished late', () => {
+    const sender = ({ fail = null } = {}) => {
+        const sent = [];
+        const notify = async (message) => {
+            sent.push(message);
+            if (fail) throw fail;
+            return { ok: true };
+        };
+        return { sent, notify };
+    };
+    async function startedLate(options = {}, args = { requested_by: 'yasir', ozet: '8 Mart afişi' }) {
+        const higgsfield = fakeHiggsfield({ jobStatus: 'in_progress' });
+        const env = setup({ higgsfield, studio: { jobTimeoutSec: 1, limits: { cooldownSec: 0 } }, ...options });
+        assert.match((await image(env.gateway, args)).text, /hâlâ hazırlanıyor/);
+        const id = env.store.recent().at(-1).id;
+        assert.equal(env.store.get(id).notify_state, 'waiting');
+        return { ...env, id };
+    }
+
+    it('the background check sends the preview to the requester once', async () => {
+        const { sent, notify } = sender();
+        const { gateway, store, higgsfield, id } = await startedLate({ notify });
+        await gateway.checkPending();
+        assert.equal(sent.length, 0, 'still running: nothing yet');
+        higgsfield.jobStatus = 'completed';
+        await gateway.checkPending();
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0].requestedBy, 'yasir');
+        assert.equal(sent[0].text, '🎨 8 Mart afişi hazır.\nGönderiye eklemek ya da değiştirmek için bana yazman yeterli.');
+        assert.equal(sent[0].mime, 'image/png');
+        assert.deepEqual(readFileSync(sent[0].file), PNG);
+        assert.equal(store.get(id).notify_state, 'sent');
+        await gateway.checkPending();
+        assert.equal(sent.length, 1, 'never twice');
+    });
+
+    it('a failed late generation is reported in one short line', async () => {
+        const { sent, notify } = sender();
+        const { gateway, higgsfield } = await startedLate({ notify });
+        higgsfield.jobStatus = 'failed';
+        await gateway.checkPending();
+        assert.equal(sent.length, 1);
+        assert.match(sent[0].text, /^❌ 8 Mart afişi üretilemedi\./);
+        assert.equal(sent[0].file, undefined);
+    });
+
+    it('no message when get_generation already gave the result to Hermes', async () => {
+        const { sent, notify } = sender();
+        const { gateway, store, higgsfield, id } = await startedLate({ notify });
+        higgsfield.jobStatus = 'completed';
+        assert.match((await call(gateway, 'get_generation', { generation_id: id })).text, /Üretim tamamlandı/);
+        await gateway.checkPending();
+        assert.equal(sent.length, 0);
+        assert.equal(store.get(id).notify_state, 'shown');
+    });
+
+    it('an unknown requester ("bilinmiyor") gets nothing; it is left for get_generation', async () => {
+        const { sent, notify } = sender();
+        const { gateway, store, higgsfield, id } = await startedLate({ notify }, { requested_by: 'someone' });
+        higgsfield.jobStatus = 'completed';
+        await gateway.checkPending();
+        assert.equal(sent.length, 0);
+        assert.equal(store.get(id).notify_state, 'skipped');
+        assert.match((await call(gateway, 'get_generation', { generation_id: id })).text, /Üretim tamamlandı/);
+    });
+
+    it('a send that fails is logged and never retried', async () => {
+        const { sent, notify } = sender({ fail: new Error('network down') });
+        const { gateway, store, higgsfield, id } = await startedLate({ notify });
+        higgsfield.jobStatus = 'completed';
+        await gateway.checkPending();
+        await gateway.checkPending();
+        assert.equal(sent.length, 1);
+        assert.equal(store.get(id).notify_state, 'failed');
+    });
+
+    it('a late job that finishes after ~23 h is not pushed (outside the WhatsApp window)', async () => {
+        const { sent, notify } = sender();
+        const { gateway, store, higgsfield, clock, id } = await startedLate({ notify });
+        clock.now += 16 * 60_000;
+        await gateway.checkPending();
+        assert.equal(store.get(id).status, 'late');
+        clock.now += 23 * 3_600_000;
+        higgsfield.jobStatus = 'completed';
+        await gateway.checkPending();
+        assert.equal(store.get(id).status, 'completed');
+        assert.equal(sent.length, 0);
+        assert.equal(store.get(id).notify_state, 'skipped');
+    });
+
+    it('a result returned by the generate call itself is never pushed', async () => {
+        const { sent, notify } = sender();
+        const { gateway, store } = setup({ notify });
+        assert.match((await image(gateway, { requested_by: 'yasir' })).text, /Üretim tamamlandı/);
+        await gateway.checkPending();
+        assert.equal(sent.length, 0);
+        assert.equal(store.recent().at(-1).notify_state, null);
+    });
+});
+
+describe('studio notifier (WhatsApp)', () => {
+    const people = echoConfig(tempDir()).people;
+    const fakeWhatsApp = ({ fail = null } = {}) => {
+        const calls = [];
+        return {
+            calls,
+            async uploadMedia({ bytes, mimeType, filename }) {
+                calls.push({ upload: { size: bytes.length, mimeType, filename } });
+                return 'media-1';
+            },
+            async send(payload) {
+                calls.push({ send: payload });
+                if (fail) throw fail;
+                return 'wamid.1';
+            },
+        };
+    };
+
+    it('uploads the image and sends it with the text as caption, only to the known person', async () => {
+        const dir = tempDir();
+        const file = join(dir, 'gen_1.png');
+        writeFileSync(file, PNG);
+        const whatsapp = fakeWhatsApp();
+        const notify = createStudioNotifier({ whatsapp, people, allowedPeople: ['yasir'] });
+        assert.deepEqual(await notify({ requestedBy: 'yasir', text: '🎨 8 Mart afişi hazır.', file, mime: 'image/png' }), { ok: true });
+        assert.deepEqual(whatsapp.calls[0].upload, { size: PNG.length, mimeType: 'image/png', filename: 'gen_1.png' });
+        assert.deepEqual(whatsapp.calls[1].send, { to: '905550000001', type: 'image', image: { id: 'media-1', caption: '🎨 8 Mart afişi hazır.' } });
+        assert.equal((await notify({ requestedBy: 'ayse', text: 'x' })).ok, false, 'not allowed to use the assistant');
+        assert.equal((await notify({ requestedBy: 'nobody', text: 'x' })).ok, false);
+        assert.equal(whatsapp.calls.length, 2);
+    });
+
+    it('text only for a file WhatsApp cannot show (webp); audio goes after the text', async () => {
+        const dir = tempDir();
+        const webp = join(dir, 'a.webp');
+        writeFileSync(webp, Buffer.alloc(100));
+        const mp3 = join(dir, 'a.mp3');
+        writeFileSync(mp3, MP3);
+        const whatsapp = fakeWhatsApp();
+        const notify = createStudioNotifier({ whatsapp, people });
+        await notify({ requestedBy: 'ayse', text: 'Görsel hazır.', file: webp, mime: 'image/webp' });
+        assert.deepEqual(whatsapp.calls[0].send, { to: '905550000002', type: 'text', text: { body: 'Görsel hazır.', preview_url: false } });
+        await notify({ requestedBy: 'ayse', text: '🎵 Müzik hazır.', file: mp3, mime: 'audio/mpeg' });
+        assert.equal(whatsapp.calls[2].send.type, 'text');
+        assert.deepEqual(whatsapp.calls[3].send, { to: '905550000002', type: 'audio', audio: { id: 'media-1' } });
+    });
+
+    it('outside the 24-hour window: { ok: false } with the reason, no throw', async () => {
+        const logs = [];
+        const whatsapp = fakeWhatsApp({ fail: new WhatsAppError('Re-engagement message', { code: OUTSIDE_WINDOW }) });
+        const notify = createStudioNotifier({ whatsapp, people, log: (...parts) => logs.push(parts.join(' ')) });
+        assert.deepEqual(await notify({ requestedBy: 'yasir', text: 'x' }), { ok: false, reason: 'outside the 24-hour window' });
+        assert.match(logs[0], /not retried/);
     });
 });

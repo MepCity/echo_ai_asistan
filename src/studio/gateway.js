@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { basename, extname, join, resolve, sep } from 'node:path';
-import { DEFAULT_IMAGE_MODEL, IMAGE_MODELS, MUSIC_MODEL, SPEECH_MODEL, UNKNOWN_PERSON, personBucket } from './config.js';
+import { DEFAULT_IMAGE_MODEL, DEFAULT_IMAGE_RESOLUTION, IMAGE_MODELS, MUSIC_MODEL, SPEECH_MODEL, UNKNOWN_PERSON, personBucket } from './config.js';
 import { answerExcerpt, parseCredits, parseJob, parseJobIds, parseMediaId, parseUpload, rawAnswer } from './higgsfield.js';
 
 /**
@@ -133,9 +133,10 @@ export function imageSize(bytes) {
 /**
  * deps: settings (normalizeStudio), store (createStudioStore), higgsfield ({ call }),
  * auth ({ status }), trypost ({ uploadMedia, request, projectName, imageLimitMb } | null),
- * fetchImpl (downloads, presigned uploads), sleep, log.
+ * fetchImpl (downloads, presigned uploads), sleep, log, notify (createStudioNotifier, or null: late
+ * generations are then only returned by get_generation).
  */
-export function createStudioGateway({ settings, store, higgsfield, auth = null, trypost = null, fetchImpl = globalThis.fetch, sleep = (ms) => new Promise((done) => setTimeout(done, ms)), log = () => {} }) {
+export function createStudioGateway({ settings, store, higgsfield, auth = null, trypost = null, fetchImpl = globalThis.fetch, sleep = (ms) => new Promise((done) => setTimeout(done, ms)), log = () => {}, notify = null }) {
     // In-process lock for the submit window (estimate → send → job id). Jobs still running after
     // that are found in the database (status 'submitting' / 'submitted'), see settlePending.
     let inFlight = false;
@@ -176,7 +177,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
 
     /** Records a refused attempt and throws its message. */
     function refuseAttempt(attempt, message, estimated = null) {
-        store.insert({ id: newId(), day: today(), month: today().slice(0, 7), tool: attempt.tool, kind: attempt.kind, model: attempt.model, params: attempt.params ? publicParams(attempt.params) : null, estimated, status: 'refused', reason: message, requestedBy: attempt.requestedBy });
+        store.insert({ id: newId(), day: today(), month: today().slice(0, 7), tool: attempt.tool, kind: attempt.kind, model: attempt.model, params: attempt.params ? publicParams(attempt.params) : null, estimated, status: 'refused', reason: message, requestedBy: attempt.requestedBy, summary: attempt.summary });
         refuse(message);
     }
 
@@ -435,7 +436,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             }
 
             const id = newId();
-            store.insert({ id, day: usage.day, month: usage.day.slice(0, 7), tool: attempt.tool, kind, model: params.model, params: publicParams(params), estimated: cost, status: 'submitting', requestedBy });
+            store.insert({ id, day: usage.day, month: usage.day.slice(0, 7), tool: attempt.tool, kind, model: params.model, params: publicParams(params), estimated: cost, status: 'submitting', requestedBy, summary: attempt.summary });
             const deadline = now() + settings.jobTimeoutSec * 1000;
             let answer;
             try {
@@ -465,11 +466,91 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             const row = (await finish(id, jobId, deadline));
             if (row.status === 'completed') return describeResult(row, usageNumbers());
             if (row.status === 'failed') refuse(failedMessage(row));
-            return `Üretim hâlâ hazırlanıyor (generation_id: ${row.id}). Kullanıcıya biraz sürdüğünü söyle; birkaç dakika sonra get_generation ile sonucu al. Yeni bir üretim başlatma.`;
+            // The requester is told on WhatsApp when the background check finishes it (notifyFinished).
+            store.markNotify(row.id, null, 'waiting');
+            return `Üretim hâlâ hazırlanıyor (generation_id: ${row.id}). Kullanıcıya biraz sürdüğünü ve hazır olunca önizlemenin WhatsApp'tan kendiliğinden geleceğini söyle; sorarsa get_generation ile sonucu al. Yeni bir üretim başlatma.`;
         } finally {
             inFlight = false;
         }
     }
+
+    // ---- approval card hint and "ready" notification ------------------------------------------
+
+    /**
+     * What the WhatsApp approval card shows before a studio tool runs (the Hermes plugin
+     * echo_onay_tr asks GET /approval-hint): the aspect ratio and the approximate credits. Higgsfield
+     * is not asked (the card must come at once); the latest real estimate of the same model and
+     * resolution is used when there is one, else settings.approxCredits. Nothing is recorded.
+     */
+    function approvalHint(tool, args = {}) {
+        const hint = {};
+        if (tool === 'generate_image') {
+            const model = settings.imageModels.includes(args.model) ? args.model : DEFAULT_IMAGE_MODEL;
+            const resolution = ['1k', '2k', '4k'].includes(args.resolution) ? args.resolution : args.yuksek_cozunurluk === true ? '2k' : DEFAULT_IMAGE_RESOLUTION;
+            const aspect = (args.platform && settings.platformAspectRatios[args.platform]) || (typeof args.aspect_ratio === 'string' ? args.aspect_ratio : '1:1');
+            hint.aspect_ratio = aspect;
+            hint.resolution = resolution;
+            const seen = store.recentEstimates('image', model).find((row) => {
+                const params = row.params ? JSON.parse(row.params) : {};
+                return (params.resolution ?? '2k') === resolution;
+            });
+            const credits = seen?.estimated_credits ?? settings.approxCredits.image[model]?.[resolution];
+            if (Number.isFinite(credits)) hint.credits = round(credits);
+        } else if (tool === 'generate_audio') {
+            if (args.kind === 'speech') hint.credits = round(settings.approxCredits.speech);
+            if (args.kind === 'music') {
+                const duration = Math.min(Math.max(Math.round(Number(args.duration ?? 30)) || 30, 3), settings.musicMaxSec);
+                hint.duration = duration;
+                hint.credits = round((settings.approxCredits.musicPerMinute * duration) / 60);
+            }
+        }
+        return hint;
+    }
+
+    const READY_ICON = { image: '🎨', speech: '🔊', music: '🎵' };
+    const KIND_NAME = { image: 'Görsel', speech: 'Seslendirme', music: 'Müzik' };
+    // Meta's customer-service window is 24 h from the person's last message; a generation this old is not pushed.
+    const NOTIFY_MAX_AGE_MS = 23 * 3_600_000;
+
+    function readyText(row) {
+        const what = row.summary || KIND_NAME[row.kind] || 'Üretim';
+        if (row.status === 'completed') {
+            const next = row.kind === 'image' ? "Gönderiye eklemek ya da değiştirmek için bana yazman yeterli." : 'Dinleyip ne yapmak istediğini bana yazabilirsin.';
+            return `${READY_ICON[row.kind] ?? '✅'} ${what} hazır.\n${next}`;
+        }
+        return `❌ ${what} üretilemedi. Kendiliğimden tekrar denemiyorum; istersen isteği değiştirip yeniden başlatabiliriz.`;
+    }
+
+    /** Tells requesters about generations that finished after their call answered "still preparing". One attempt each. */
+    async function notifyFinished() {
+        for (const row of store.toNotify()) {
+            if (!notify || row.requested_by === UNKNOWN_PERSON || !row.requested_by) {
+                store.markNotify(row.id, 'waiting', 'skipped');
+                continue;
+            }
+            if (now() - row.created_at > NOTIFY_MAX_AGE_MS) {
+                store.markNotify(row.id, 'waiting', 'skipped');
+                log('info', 'studio ready notification skipped (older than the WhatsApp window)', row.id);
+                continue;
+            }
+            // 'sending' first: a crash mid-send never sends twice.
+            if (!store.markNotify(row.id, 'waiting', 'sending')) continue;
+            const media = row.status === 'completed' && row.file ? { file: row.file, mime: row.mime } : {};
+            let result;
+            try {
+                result = await notify({ requestedBy: row.requested_by, text: readyText(row), ...media });
+            } catch (error) {
+                result = { ok: false, reason: error.message };
+            }
+            store.markNotify(row.id, 'sending', result?.ok ? 'sent' : 'failed');
+            log(result?.ok ? 'info' : 'warn', `studio ready notification ${result?.ok ? 'sent' : 'failed'}`, row.id, row.requested_by, result?.ok ? '' : String(result?.reason ?? ''));
+        }
+    }
+
+    const summaryOf = (value) => {
+        const text = typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+        return text ? text.slice(0, 200) : null;
+    };
 
     // ---- tools ------------------------------------------------------------------------------
 
@@ -480,6 +561,9 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         type: 'string',
         description: `İsteyen kişinin Echo kişi anahtarı (ör. "yasir"). Sadece kayıt ve kişi başı sınır için; kimlik doğrulaması değildir. Boş ya da bilinmeyen anahtar ortak "${UNKNOWN_PERSON}" sınırından düşer.`,
     };
+    // Shown on the WhatsApp approval card (the Hermes plugin echo_onay_tr) and in the "ready" message of a
+    // late generation. Display only: it never reaches Higgsfield or TryPost.
+    const ozetProp = { type: 'string', maxLength: 200, description: 'Kullanıcıya gösterilecek tek satırlık Türkçe özet (ör. "8 Mart Dünya Kadınlar Günü afişi"). Onay mesajında ve "hazır" bildiriminde görünür; her zaman doldur.' };
     const generationIdProp = { type: 'string', description: 'generate_image / generate_audio sonucundaki generation_id (gen_…).' };
 
     const tools = [
@@ -514,7 +598,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         {
             name: 'generate_image',
             description:
-                'Kulübün Higgsfield hesabıyla TEK bir görsel üretir; kredi harcar (genelde 2-8 kredi). Önce get_brand_kit oku, kullanıcıya ne üretileceğini ve yaklaşık krediyi söyle. Hedef platformu "platform" ile ver: oran ona göre seçilir, sonradan kırpma gerekmez. Başarısız olursa kendiliğinden tekrar deneme.',
+                'Kulübün Higgsfield hesabıyla TEK bir görsel üretir; kredi harcar (varsayılan 1k: yaklaşık 1,5 kredi; 2k: 2-3; Recraft 8). Önce get_brand_kit oku, kullanıcıya ne üretileceğini ve yaklaşık krediyi söyle. Hedef platformu "platform" ile ver: oran ona göre seçilir, sonradan kırpma gerekmez. "ozet" alanına Türkçe tek satırlık özet yaz. Başarısız olursa kendiliğinden tekrar deneme.',
             inputSchema: {
                 type: 'object',
                 properties: {
@@ -522,9 +606,11 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
                     platform: { type: 'string', enum: platformKeys, description: `Hedef platform; oranı belirler (${platformKeys.map((key) => `${key} ${settings.platformAspectRatios[key]}`).join(', ')}).` },
                     aspect_ratio: { type: 'string', enum: aspectRatios, description: 'Platform verilmediyse en-boy oranı.' },
                     model: { type: 'string', enum: settings.imageModels, description: `Varsayılan ${DEFAULT_IMAGE_MODEL}. ${settings.imageModels.map((model) => `${model}: ${IMAGE_MODELS[model].label}`).join('; ')}.` },
-                    resolution: { type: 'string', enum: ['1k', '2k', '4k'], description: 'Sadece nano_banana_2_1 için 4k; varsayılan 2k. Sosyal medya için 2k yeterli.' },
+                    resolution: { type: 'string', enum: ['1k', '2k', '4k'], description: 'Varsayılan 1k (sosyal medya için yeterli, en ucuzu). 2k sadece kullanıcı baskı, büyük ekran ya da "yüksek çözünürlük" derse; 4k sadece nano_banana_2_1 ile ve kullanıcı açıkça 4k isterse.' },
+                    yuksek_cozunurluk: { type: 'boolean', description: 'true: 2k üret (resolution "2k" ile aynı). Sadece kullanıcı baskı, büyük ekran ya da "yüksek çözünürlük" isterse.' },
                     style: { type: 'string', enum: IMAGE_MODELS.recraft_v4_1.styles, description: 'Sadece recraft_v4_1: standard, vector (logo/ikon/tipografi), utility, utility_vector.' },
                     reference_image: { type: 'string', description: 'İsteğe bağlı referans: "logo" ya da "logo-dark" (kulüp logosu), önceki bir üretim (gen_…) ya da kullanıcının gönderdiği görselin yolu (/opt/data/cache/images/…).' },
+                    ozet: ozetProp,
                     requested_by: requestedByProp,
                 },
                 required: ['prompt'],
@@ -545,6 +631,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
                     prompt: { type: 'string', description: 'music: müziğin tarifi (tarz, tempo, duygu).', maxLength: 2000 },
                     duration: { type: 'number', minimum: 3, maximum: settings.musicMaxSec, description: `music: saniye (en fazla ${settings.musicMaxSec}).` },
                     instrumental: { type: 'boolean', description: 'music: sözsüz (varsayılan true).' },
+                    ozet: ozetProp,
                     requested_by: requestedByProp,
                 },
                 required: ['kind'],
@@ -564,6 +651,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
                     post_id: { type: 'string', description: 'Görselin ekleneceği TryPost gönderisinin id’si (taslak).' },
                     social_account_id: { type: 'string', description: 'post_id yoksa: yeni taslağın hesabı (TryPost araçlarından alınan social_account_id).' },
                     content: { type: 'string', description: 'post_id yoksa: yeni taslağın metni (isteğe bağlı).', maxLength: 10000 },
+                    ozet: ozetProp,
                 },
                 required: ['generation_id'],
                 additionalProperties: false,
@@ -613,6 +701,8 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             await settleRow(row);
             row = store.get(row.id);
         }
+        // Hermes shows this answer itself, so the background "ready" message is no longer needed.
+        if (row.status === 'completed' || row.status === 'failed') store.markNotify(row.id, 'waiting', 'shown');
         if (row.status === 'completed') return describeResult(row, usageNumbers(), ['(Bu sonuç daha önce başlatılmış üretime ait; yeni kredi harcanmadı.)']);
         if (row.status === 'failed') return failedMessage(row);
         if (row.status === 'unknown' && !row.job_id) return MESSAGES.unmatched(row.id);
@@ -635,7 +725,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
 
     async function generateImage(args) {
         const model = args.model ?? DEFAULT_IMAGE_MODEL;
-        const attempt = { tool: 'generate_image', kind: 'image', model, requestedBy: personBucket(args.requested_by, settings.people) };
+        const attempt = { tool: 'generate_image', kind: 'image', model, requestedBy: personBucket(args.requested_by, settings.people), summary: summaryOf(args.ozet) };
         if (/video|seedance|kling|veo|sora|wan|hailuo|minimax/i.test(model)) refuseAttempt(attempt, MESSAGES.video);
         if (!settings.imageModels.includes(model)) refuseAttempt(attempt, MESSAGES.unknownModel(settings.imageModels.join(', ')));
         const spec = IMAGE_MODELS[model];
@@ -648,14 +738,15 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             if (!aspect) refuseAttempt(attempt, `Bilinmeyen platform. Seçenekler: ${platformKeys.join(', ')}.`);
         }
         if (!spec.aspectRatios.includes(aspect)) refuseAttempt(attempt, `${model} bu oranı (${aspect}) desteklemiyor. Desteklenenler: ${spec.aspectRatios.join(', ')}.`);
-        const resolution = args.resolution ?? '2k';
+        // 1k unless the request explicitly asks for more (yuksek_cozunurluk → 2k; 4k only by name, nano_banana_2_1 only).
+        const resolution = args.resolution ?? (args.yuksek_cozunurluk === true ? '2k' : DEFAULT_IMAGE_RESOLUTION);
         if (!spec.resolutions.includes(resolution)) refuseAttempt(attempt, `${model} için çözünürlük ${spec.resolutions.join(' / ')} olabilir.`);
         if (args.reference_image && !spec.references) refuseAttempt(attempt, `${model} referans görsel almıyor; referans için gpt_image_2_6 ya da nano_banana_2_1 kullan.`);
 
         // Built here from the allowlist: nothing else Hermes sends reaches Higgsfield.
         const params = { model, prompt, aspect_ratio: aspect, batch_size: 1, count: 1, use_unlim: settings.allowUnlim };
         if (settings.allowFreeGens) params.use_free_gens = true;
-        if (model === 'gpt_image_2_6') Object.assign(params, { quality: 'high', resolution: '2k', output_format: settings.imageFormat });
+        if (model === 'gpt_image_2_6') Object.assign(params, { quality: 'high', resolution, output_format: settings.imageFormat });
         if (model === 'nano_banana_2_1') params.resolution = resolution;
         if (model === 'recraft_v4_1') {
             const style = args.style ?? 'standard';
@@ -668,7 +759,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
     async function generateAudio(args) {
         const kind = args.kind;
         if (kind === 'speech') {
-            const attempt = { tool: 'generate_audio', kind: 'speech', model: SPEECH_MODEL, requestedBy: personBucket(args.requested_by, settings.people) };
+            const attempt = { tool: 'generate_audio', kind: 'speech', model: SPEECH_MODEL, requestedBy: personBucket(args.requested_by, settings.people), summary: summaryOf(args.ozet) };
             const text = String(args.text ?? '').trim();
             if (!text) refuseAttempt(attempt, 'Seslendirilecek metin boş.');
             if (text.length > settings.speechMaxChars) refuseAttempt(attempt, `Metin çok uzun; en fazla ${settings.speechMaxChars} karakter seslendirebilirim.`);
@@ -680,7 +771,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             return generate({ ...attempt, params });
         }
         if (kind === 'music') {
-            const attempt = { tool: 'generate_audio', kind: 'music', model: MUSIC_MODEL, requestedBy: personBucket(args.requested_by, settings.people) };
+            const attempt = { tool: 'generate_audio', kind: 'music', model: MUSIC_MODEL, requestedBy: personBucket(args.requested_by, settings.people), summary: summaryOf(args.ozet) };
             const prompt = String(args.prompt ?? '').trim();
             if (!prompt) refuseAttempt(attempt, 'Müzik tarifi boş; tarz, tempo ve duyguyu yaz.');
             const duration = Math.round(Number(args.duration ?? 30));
@@ -696,6 +787,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
 
     const SAFE_ID = /^[A-Za-z0-9-]{1,64}$/;
 
+    // ozet is display-only (the approval card); it is accepted and ignored here.
     async function attachToTryPost({ generation_id: id, post_id: postId, social_account_id: accountId, content }) {
         const row = requireGeneration(id);
         if (row.kind !== 'image') {
@@ -776,6 +868,8 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         async checkPending() {
             if (inFlight) return;
             await settlePending({ late: true });
+            await notifyFinished();
         },
+        approvalHint,
     };
 }

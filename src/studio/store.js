@@ -17,6 +17,11 @@ import { DatabaseSync } from 'node:sqlite';
  *   `raw_answer`: a raw copy (~8 KB) of a generate answer no job id could be read from.
  *   `recovered_at`: when an admin attached a job id by hand (studio.sh recover); the stale/late
  *   clocks then run from it instead of created_at.
+ *   `summary`: the one-line Turkish summary (`ozet`) Hermes gave, for the "ready" notification.
+ *   `notify_state`: whether the requester still has to be told about this generation on WhatsApp:
+ *   NULL (the generate call answered with the result, nothing to tell), 'waiting' (the call answered
+ *   "still preparing"), 'shown' (get_generation answered it, Hermes showed it), 'sending', 'sent',
+ *   'failed' (one attempt, never retried) or 'skipped' (no known requester, or too late).
  * - attachments: generated images uploaded to TryPost (post id, upload sha256).
  */
 export function openStudioDatabase(dir) {
@@ -84,6 +89,8 @@ export function openStudioDatabase(dir) {
     for (const [name, type] of [
         ['raw_answer', 'TEXT'],
         ['recovered_at', 'INTEGER'],
+        ['summary', 'TEXT'],
+        ['notify_state', 'TEXT'],
     ]) {
         if (!have.has(name)) db.exec(`ALTER TABLE generations ADD COLUMN ${name} ${type}`);
     }
@@ -100,9 +107,9 @@ export function createStudioStore(db, now = () => Date.now()) {
         insert(row) {
             const time = now();
             db.prepare(
-                `INSERT INTO generations (id, created_at, updated_at, day, month, tool, kind, model, params, estimated_credits, status, reason, requested_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            ).run(row.id, time, time, row.day, row.month, row.tool, row.kind, row.model ?? null, row.params ? JSON.stringify(row.params) : null, row.estimated ?? null, row.status, row.reason ?? null, row.requestedBy ?? null);
+                `INSERT INTO generations (id, created_at, updated_at, day, month, tool, kind, model, params, estimated_credits, status, reason, requested_by, summary)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            ).run(row.id, time, time, row.day, row.month, row.tool, row.kind, row.model ?? null, row.params ? JSON.stringify(row.params) : null, row.estimated ?? null, row.status, row.reason ?? null, row.requestedBy ?? null, row.summary ?? null);
         },
         update(id, fields) {
             const columns = {
@@ -122,6 +129,7 @@ export function createStudioStore(db, now = () => Date.now()) {
                 params: 'params',
                 rawAnswer: 'raw_answer',
                 recoveredAt: 'recovered_at',
+                notifyState: 'notify_state',
             };
             const sets = [];
             const values = [];
@@ -171,6 +179,20 @@ export function createStudioStore(db, now = () => Date.now()) {
         lastSentAt() {
             const row = db.prepare("SELECT MAX(created_at) AS at FROM generations WHERE status IN ('submitting', 'submitted', 'late', 'completed', 'unknown', 'failed')").get();
             return row?.at ?? null;
+        },
+        /** Generations whose requester still has to be told they finished ('waiting' and completed/failed), oldest first. */
+        toNotify() {
+            return db.prepare("SELECT * FROM generations WHERE notify_state = 'waiting' AND status IN ('completed', 'failed') ORDER BY created_at, rowid").all();
+        },
+        /** Moves notify_state from `from` to `to`; true when this call made the change (so only one sender wins). */
+        markNotify(id, from, to) {
+            return db.prepare('UPDATE generations SET notify_state = ?, updated_at = ? WHERE id = ? AND notify_state IS ?').run(to, now(), id, from).changes === 1;
+        },
+        /** Higgsfield's estimates of the latest sent generations of a model (newest first), with their params. */
+        recentEstimates(kind, model, limit = 20) {
+            return db
+                .prepare(`SELECT estimated_credits, params FROM generations WHERE kind = ? AND model = ? AND estimated_credits IS NOT NULL ORDER BY rowid DESC LIMIT ?`)
+                .all(kind, model, limit);
         },
         addAttachment(row) {
             db.prepare('INSERT INTO attachments (generation_id, created_at, project, post_id, created_post, sha256, status, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(

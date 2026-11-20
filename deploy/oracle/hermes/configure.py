@@ -56,14 +56,15 @@ STUDIO_GRANT_PREFIX = "mcp:studio/"
 
 # Hermes' user overlay ($HERMES_HOME/locales/<lang>.yaml, agent/i18n_layers.py): plainer
 # Turkish for the approval card's frame and buttons than the bundled locales/tr.yaml. The
-# card's middle (tool name and arguments) is fixed English in Hermes and cannot be changed;
-# SOUL.md has Hermes say in Turkish, just before it, what will be sent.
+# card's middle is fixed English in Hermes; the echo_onay_tr plugin (plugins/echo_onay_tr,
+# copied by setup-hermes.sh) replaces it with a short Turkish summary for TryPost and studio
+# tools, and its one-line note follows the "Not:" label below.
 LOCALE_MARKER = "# echo-managed: setup-hermes.sh bu dosyayi yeniler. Kendi metnini korumak icin bu satiri sil."
 LOCALE_TR = {
     "gateway": {
         "exec_approval": {
             "header": "Onayın gerekiyor",
-            "reason_label": "Ayrıntı",
+            "reason_label": "Not",
             "deadline": "{window} içinde cevap vermezsen hiçbir şey yapılmaz.",
             "timed_out_notice": "⌛ {window} içinde onay gelmedi; işlem yapılmadı. Hâlâ istiyorsan tekrar söyle.",
         },
@@ -75,6 +76,11 @@ LOCALE_TR = {
         },
     },
 }
+
+# Hermes plugin (deploy/oracle/hermes/plugins/<name>, copied to $HERMES_HOME/plugins by
+# setup-hermes.sh). User plugins are opt-in through plugins.enabled. One listed under
+# plugins.disabled stays off (Hermes then shows its own English approval text).
+ECHO_PLUGINS = ["echo_onay_tr"]
 
 # onboarding.seen flags (Hermes agent/onboarding.py) marked as already shown.
 ONBOARDING_SEEN_FLAGS = [
@@ -153,6 +159,12 @@ def main(path):
         disabled = [disabled]
     agent["disabled_toolsets"] = disabled + [name for name in DISABLED_TOOLSETS if name not in disabled]
     config["agent"] = agent
+
+    plugins = config.get("plugins") if isinstance(config.get("plugins"), dict) else {}
+    enabled = plugins.get("enabled") if isinstance(plugins.get("enabled"), list) else []
+    disabled = plugins.get("disabled") if isinstance(plugins.get("disabled"), list) else []
+    plugins["enabled"] = enabled + [name for name in ECHO_PLUGINS if name not in enabled and name not in disabled]
+    config["plugins"] = plugins
 
     # First-contact onboarding (agent/onboarding.py): profile_build "off" drops the
     # "build a short profile of you" offer; the latched `seen` flags keep Hermes from

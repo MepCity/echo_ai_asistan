@@ -60,6 +60,13 @@ background, accent #1e6bf5, light #f1f5f9".
 Görseli hedef platformun oranında üret; sonradan kırpılmasın. Birden fazla platform için her
 oran ayrı bir üretimdir (ayrı kredi).
 
+## Çözünürlük
+
+Varsayılan 1k: Instagram, LinkedIn ve X için yeterli, en ucuzu (GPT Image ve Nano Banana yaklaşık
+1,5 kredi). 2k (`yuksek_cozunurluk: true`) yalnızca baskı, büyük ekran/projeksiyon ya da açıkça
+"yüksek çözünürlük" istendiğinde (GPT Image ~2,75, Nano Banana ~2 kredi). 4k yalnızca açıkça
+istenirse ve sadece Nano Banana ile.
+
 ## Şablonlar (prompt iskeletleri)
 
 Köşeli parantezleri doldur. Görsel prompt'ları İngilizce daha iyi sonuç verir; metinler Türkçe.

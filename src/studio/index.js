@@ -3,6 +3,8 @@ import { loadConfig } from '../config.js';
 import { createTryPostProject } from '../projects/trypost.js';
 import { normalizeStudio } from './config.js';
 import { createStudioGateway } from './gateway.js';
+import { createStudioNotifier } from './notify.js';
+import { createWhatsAppClient } from '../whatsapp.js';
 import { createHiggsfieldClient } from './higgsfield.js';
 import { createHiggsfieldAuth, createTokenFile } from './oauth.js';
 import { createStudioServer } from './server.js';
@@ -33,7 +35,10 @@ if (settings.project) {
     trypost = { uploadMedia: adapter.uploadMedia, request: adapter.request, imageLimitMb: Number(project.mediaLimitsMb?.image ?? 10) };
 }
 
-const gateway = createStudioGateway({ settings, store, higgsfield, auth, trypost, log });
+// A generation that finishes after its call answered "still preparing" is pushed to the person who
+// asked (config.json people[].phone), with Echo's own WhatsApp credentials; see notify.js.
+const notify = createStudioNotifier({ whatsapp: createWhatsAppClient(config.whatsapp), people: config.people, allowedPeople: config.assistant?.allowedPeople ?? null, log });
+const gateway = createStudioGateway({ settings, store, higgsfield, auth, trypost, log, notify });
 const server = createStudioServer({ gateway, token: process.env.ECHO_STUDIO_TOKEN, log });
 // Jobs still running when their generate call answered "still preparing": finish them (or mark
 // them 'unknown' past studio.pendingStaleMin) even if nobody asks with get_generation.
