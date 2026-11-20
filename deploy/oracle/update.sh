@@ -34,6 +34,8 @@ fi
 if [ -f "$HERMES_ENV" ]; then
   echo "==> studio (Higgsfield) hazirligi"
   bash "$APP/deploy/oracle/hermes/studio-prepare.sh"
+  echo "==> render (video) hazirligi"
+  bash "$APP/deploy/oracle/render/render-prepare.sh"
 fi
 echo "==> build and start"
 compose up -d --build

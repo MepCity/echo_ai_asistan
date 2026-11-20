@@ -1,7 +1,8 @@
 # Echo on one VM: Echo (no published port) behind Caddy (HTTPS via Let's Encrypt), and
 # optionally Hermes Agent (profile "hermes", no published port; only Echo reaches it at
 # http://hermes:8090/whatsapp/webhook) with the studio gateway (profile "hermes", only Hermes
-# reaches it at http://studio:8091/mcp). Set up both with deploy/oracle/hermes/setup-hermes.sh.
+# reaches it at http://studio:8091/mcp) and the render service (profile "hermes", only studio reaches
+# it, on an internal network without internet). Set up with deploy/oracle/hermes/setup-hermes.sh.
 # Run: docker compose -f /opt/echo/app/deploy/oracle/docker-compose.yml --env-file /opt/echo/.env up -d --build
 #      (add --profile hermes once Hermes is set up; update.sh does that by itself)
 name: echo
@@ -87,8 +88,45 @@ services:
       - echo-data:/data
       - /opt/hermes/data/cache/generated/echo-studio:/opt/data/cache/generated/echo-studio
       - /opt/hermes/data/cache/images:/opt/data/cache/images:ro
+    # default: Hermes, Higgsfield, TryPost; render: the render service (no route out).
+    networks: [default, render]
     restart: unless-stopped
     logging: *logging
+
+  render:
+    # Render service (src/render, deploy/oracle/render/Dockerfile): the studio's videos (Chromium +
+    # ffmpeg, whisper.cpp subtitles). Only the studio reaches it (http://render:8092, bearer
+    # ECHO_RENDER_TOKEN, made by render/render-prepare.sh). It is only on the internal "render"
+    # network (no internet), gets no env_file (no WhatsApp/Higgsfield/TryPost secrets), runs as a
+    # non-root user on a read-only root with a tmpfs /tmp, and is capped so an OOM or a runaway job
+    # only ever kills this container: mem_limit (no swap), cpus, pids, and the highest OOM score.
+    profiles: ["hermes"]
+    build:
+      context: ../..
+      dockerfile: deploy/oracle/render/Dockerfile
+    image: echo-render:local
+    # tini as PID 1: reaps Chromium's child processes after a killed job.
+    init: true
+    environment:
+      ECHO_RENDER_TOKEN: ${ECHO_RENDER_TOKEN:-}
+      RENDER_TIMEOUT_SEC: ${RENDER_TIMEOUT_SEC:-300}
+    networks: [render]
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1.5
+    mem_limit: 3g
+    memswap_limit: 3g
+    pids_limit: 256
+    oom_score_adj: 1000
+    restart: unless-stopped
+    logging: *logging
+
+networks:
+  render:
+    internal: true
 
 volumes:
   echo-data:
