@@ -14,6 +14,9 @@ import { DatabaseSync } from 'node:sqlite';
  *   the stale limit, or a late job passed lateMaxHours: it may have run and cost credits, so it counts against the limits
  *   and is never sent again). `requested_by` is the person key the model gave,
  *   or 'bilinmiyor' (shared bucket) when it gave none or an unknown one.
+ *   `raw_answer`: a raw copy (~8 KB) of a generate answer no job id could be read from.
+ *   `recovered_at`: when an admin attached a job id by hand (studio.sh recover); the stale/late
+ *   clocks then run from it instead of created_at.
  * - attachments: generated images uploaded to TryPost (post id, upload sha256).
  */
 export function openStudioDatabase(dir) {
@@ -76,6 +79,14 @@ export function openStudioDatabase(dir) {
             reason TEXT
         );
     `);
+    // Columns added after the first release: added in place to an existing studio.db.
+    const have = new Set(db.prepare('PRAGMA table_info(generations)').all().map((column) => column.name));
+    for (const [name, type] of [
+        ['raw_answer', 'TEXT'],
+        ['recovered_at', 'INTEGER'],
+    ]) {
+        if (!have.has(name)) db.exec(`ALTER TABLE generations ADD COLUMN ${name} ${type}`);
+    }
     return db;
 }
 
@@ -109,6 +120,8 @@ export function createStudioStore(db, now = () => Date.now()) {
                 height: 'height',
                 model: 'model',
                 params: 'params',
+                rawAnswer: 'raw_answer',
+                recoveredAt: 'recovered_at',
             };
             const sets = [];
             const values = [];
@@ -127,6 +140,10 @@ export function createStudioStore(db, now = () => Date.now()) {
         },
         get(id) {
             return db.prepare('SELECT * FROM generations WHERE id = ?').get(id) ?? null;
+        },
+        /** The row (other than `exceptId`) that already has this job id, or null. */
+        byJobId(jobId, exceptId = '') {
+            return db.prepare('SELECT * FROM generations WHERE lower(job_id) = lower(?) AND id != ?').get(jobId, exceptId) ?? null;
         },
         usage(day, month) {
             const daily = db.prepare(`SELECT kind, COUNT(*) AS count, ${credits} AS credits FROM generations WHERE day = ? AND ${SPENT} GROUP BY kind`).all(day);

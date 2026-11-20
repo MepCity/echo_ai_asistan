@@ -101,7 +101,11 @@ export function createHiggsfieldClient({ url, auth, fetchImpl = globalThis.fetch
     };
 
     return {
-        /** Calls one allowed tool; returns { text, structured, isError }. */
+        /**
+         * Calls one allowed tool; returns { text, structured, meta, content, isError }: `text` joins the
+         * text parts, `structured` is structuredContent, `meta` the result's _meta (widget state), and
+         * `content` the raw content parts (kept for parsing and for the raw copy of odd answers).
+         */
         async call(name, args = {}) {
             if (!HIGGSFIELD_TOOLS.has(name)) throw Object.assign(new Error(`Higgsfield tool ${name} is not allowed`), { notAllowed: true });
             let result;
@@ -115,7 +119,13 @@ export function createHiggsfieldClient({ url, auth, fetchImpl = globalThis.fetch
                 .filter((part) => part?.type === 'text')
                 .map((part) => part.text)
                 .join('\n');
-            return { text, structured: result?.structuredContent ?? null, isError: Boolean(result?.isError) };
+            return {
+                text,
+                structured: result?.structuredContent ?? null,
+                meta: result?._meta ?? null,
+                content: Array.isArray(result?.content) ? result.content : [],
+                isError: Boolean(result?.isError),
+            };
         },
         reset: resetSession,
     };
@@ -200,29 +210,176 @@ export function parseCredits({ text, structured }) {
     return match ? Number(match[1]) : null;
 }
 
-/** The job ids a generate_* answer names. */
-export function parseJobIds({ text, structured }) {
-    const ids = [];
-    for (const object of objects(structured)) {
-        const id = object.job_id ?? object.jobId ?? (Array.isArray(object.job_ids) ? null : null);
-        if (typeof id === 'string' && UUID.test(id)) ids.push(id);
-        if (Array.isArray(object.job_ids)) ids.push(...object.job_ids.filter((item) => typeof item === 'string' && UUID.test(item)));
-    }
-    if (!ids.length) {
-        const { tables, values } = parseCompact(text);
-        for (const rows of Object.values(tables)) {
-            for (const row of rows) {
-                const id = row.job_id ?? row.id;
-                if (id && UUID.test(id)) ids.push(id.match(UUID)[0]);
-            }
+// A job id is a UUID: jobs_wait's schema takes nothing else (placeholders like "<first actual job ID>" never match).
+const isUuid = (value) => typeof value === 'string' && new RegExp(`^${UUID.source}$`, 'i').test(value.trim());
+const isJobToken = isUuid;
+// Keys that name a job id outright, keys that hold a list of them.
+const JOB_ID_KEYS = ['job_id', 'jobId', 'generation_id', 'generationId'];
+const JOB_LIST_KEYS = ['job_ids', 'jobIds', 'generation_ids', 'generationIds'];
+// A bare `id` counts only inside one of these (parent key) or next to one of these (sibling keys).
+const JOB_PARENTS = new Set(['jobs', 'job', 'generations', 'generation', 'results', 'result', 'job_set', 'jobset', 'job_sets', 'items']);
+const JOB_SIBLINGS = ['status', 'job_set_id', 'job_set_type', 'result_url', 'results'];
+
+/** Parses a string that is a JSON object or array (whole, or the first {...}/[...] span in it); else undefined. */
+function jsonIn(text) {
+    const value = String(text ?? '').trim();
+    if (!value) return undefined;
+    const tries = [value];
+    const object = value.indexOf('{');
+    const array = value.indexOf('[');
+    if (object >= 0) tries.push(value.slice(object, value.lastIndexOf('}') + 1));
+    if (array >= 0) tries.push(value.slice(array, value.lastIndexOf(']') + 1));
+    for (const candidate of tries) {
+        if (!/^[[{]/.test(candidate)) continue;
+        try {
+            const parsed = JSON.parse(candidate);
+            if (parsed && typeof parsed === 'object') return parsed;
+        } catch {
+            // not JSON
         }
-        if (!ids.length && values.job_id && UUID.test(values.job_id)) ids.push(values.job_id.match(UUID)[0]);
     }
-    if (!ids.length) {
-        const match = String(text ?? '').match(new RegExp(`job[_ ]?id[^0-9a-f]{0,6}(${UUID.source})`, 'i'));
-        if (match) ids.push(match[1]);
+    return undefined;
+}
+
+/** Collects job ids from a JSON value, depth-first in document order; JSON inside strings is walked too. */
+function collectJobIds(value, parentKey, push, depth = 0) {
+    if (depth > 40 || value === null || value === undefined) return;
+    if (typeof value === 'string') {
+        if (/^\s*[[{]/.test(value)) {
+            const parsed = jsonIn(value);
+            if (parsed !== undefined) collectJobIds(parsed, parentKey, push, depth + 1);
+        }
+        return;
     }
-    return [...new Set(ids)];
+    if (Array.isArray(value)) {
+        for (const item of value) collectJobIds(item, parentKey, push, depth + 1);
+        return;
+    }
+    if (typeof value !== 'object') return;
+    for (const key of JOB_ID_KEYS) if (isJobToken(value[key])) push(value[key]);
+    for (const key of JOB_LIST_KEYS) {
+        if (Array.isArray(value[key])) for (const item of value[key]) if (isJobToken(item)) push(item);
+    }
+    const parent = String(parentKey ?? '').toLowerCase();
+    if (isJobToken(value.id) && (JOB_PARENTS.has(parent) || JOB_SIBLINGS.some((key) => key in value))) push(value.id);
+    for (const [key, item] of Object.entries(value)) {
+        if (item && (typeof item === 'object' || typeof item === 'string')) collectJobIds(item, key, push, depth + 1);
+    }
+}
+
+/** The text parts of an answer (each content text part, else the joined text). */
+function textParts(answer) {
+    const parts = (answer.content ?? []).filter((part) => part?.type === 'text' && typeof part.text === 'string').map((part) => part.text);
+    return parts.length ? parts : [String(answer.text ?? '')];
+}
+
+/**
+ * The live generate_image answer (Nov 2026) is text:
+ *   Submitted 1 job. If a widget is visible, it polls automatically — …
+ *   - 8517fd80-1a96-419f-95a6-9312eb81e152  "prompt…"If the user requests …
+ * i.e. "Submitted N job(s)" and one "- <uuid>" bullet per job. Returns those ids in order, or [].
+ */
+function submittedBullets(text) {
+    if (!/\bSubmitted\s+\d+\s+jobs?\b/i.test(text)) return [];
+    const ids = [];
+    for (const line of text.split(/\r?\n/)) {
+        const match = line.match(new RegExp(`^\\s*[-*•]\\s+(${UUID.source})`, 'i'));
+        if (match && !ids.includes(match[1])) ids.push(match[1]);
+    }
+    return ids;
+}
+
+/**
+ * The job ids a generate_* answer names, in order, without duplicates. First the live format
+ * ("Submitted N job(s)" + "- <uuid>" bullets, see submittedBullets); then, in order:
+ * structuredContent, _meta, other content parts (resources), every JSON text part (all walked
+ * recursively for job_id/jobId/generation_id, job_ids/jobIds lists, and `id` inside jobs/
+ * generations/results/job_set/items or next to a `status`), compact tables whose header has
+ * `job_id` or `id`, a "job_id: …" line, "job id … <uuid>" in the text, and last of all the one
+ * UUID the text contains (only when it contains exactly one).
+ */
+export function parseJobIds(answer) {
+    const { structured = null, meta = null } = answer ?? {};
+    const ids = [];
+    const push = (id) => {
+        const value = String(id).trim();
+        if (!ids.includes(value)) ids.push(value);
+    };
+    const texts = textParts(answer ?? {});
+    const text = texts.join('\n');
+    for (const id of submittedBullets(text)) push(id);
+    collectJobIds(structured, null, push);
+    collectJobIds(meta, null, push);
+    for (const part of answer?.content ?? []) if (part && part.type !== 'text') collectJobIds(part, null, push);
+    for (const part of texts) {
+        const parsed = jsonIn(part);
+        if (parsed !== undefined) collectJobIds(parsed, null, push);
+    }
+    const { tables, values } = parseCompact(text);
+    for (const rows of Object.values(tables)) {
+        for (const row of rows) {
+            const id = 'job_id' in row ? row.job_id : row.id;
+            if (isJobToken(id)) push(id);
+        }
+    }
+    if (ids.length) return ids;
+    if (isJobToken(values.job_id)) push(values.job_id);
+    if (isJobToken(values.jobId)) push(values.jobId);
+    if (ids.length) return ids;
+    const match = text.match(new RegExp(`job[_ ]?id[^0-9a-f]{0,6}(${UUID.source})`, 'i'));
+    if (match) return [match[1]];
+    const uuids = [...new Set((text.match(new RegExp(UUID.source, 'gi')) ?? []).map((id) => id.toLowerCase()))];
+    return uuids.length === 1 ? [text.match(UUID)[0]] : [];
+}
+
+const RAW_LIMIT = 8 * 1024;
+const clip = (value, max) => (value.length > max ? `${value.slice(0, max)}…[+${value.length - max}]` : value);
+
+/** A raw copy of an answer (text parts, structuredContent, _meta, other content parts), at most ~8 KB. */
+export function rawAnswer(answer) {
+    const json = (value) => {
+        try {
+            return JSON.stringify(value);
+        } catch {
+            return String(value);
+        }
+    };
+    const others = (answer?.content ?? []).filter((part) => part?.type !== 'text');
+    const sections = [
+        ['content text', String(answer?.text ?? '')],
+        ['structuredContent', answer?.structured == null ? '' : json(answer.structured)],
+        ['_meta', answer?.meta == null ? '' : json(answer.meta)],
+        ['other content', others.length ? json(others) : ''],
+    ].filter(([, body]) => body);
+    // Short sections keep everything; the longer ones share the rest of the room.
+    const room = new Map();
+    let budget = RAW_LIMIT - 64 * sections.length;
+    let left = sections.length;
+    for (const [name, body] of [...sections].sort((a, b) => a[1].length - b[1].length)) {
+        const share = Math.max(0, Math.floor(budget / left--));
+        room.set(name, Math.min(body.length, share));
+        budget -= room.get(name);
+    }
+    const out = sections.map(([name, body]) => `--- ${name} ---\n${clip(body, room.get(name))}`);
+    return clip(out.join('\n'), RAW_LIMIT) || '(empty answer)';
+}
+
+/** Text safe for a log line: no bearer/JWT/long tokens, no secret-looking values, no URL query strings. */
+export function redactForLog(text) {
+    return String(text ?? '')
+        .replace(/(https?:\/\/[^\s"'<>?]+)\?[^\s"'<>]*/gi, '$1?[query removed]')
+        .replace(/\bBearer\s+[^\s"',]+/gi, 'Bearer [redacted]')
+        .replace(/\beyJ[\w-]+\.[\w-]+\.[\w-]*/g, '[token]')
+        .replace(/(["']?[\w-]*(?:token|secret|password|passwd|api[_-]?key|signature|authorization|credential|cookie|session)[\w-]*["']?\s*[:=]\s*["']?)[^\s"',&}\]]+/gi, '$1[redacted]')
+        .replace(/\b(?=[A-Za-z0-9_\-+/]*\d)(?=[A-Za-z0-9_\-+/]*[A-Za-z])[A-Za-z0-9_\-+/]{40,}={0,2}/g, '[redacted]');
+}
+
+/** A short one-line, redacted excerpt of an answer for the log. */
+export function answerExcerpt(answer, max = 300) {
+    const raw = [answer?.text, answer?.structured == null ? '' : JSON.stringify(answer.structured), answer?.meta == null ? '' : JSON.stringify(answer.meta)]
+        .filter(Boolean)
+        .join(' | ');
+    return clip(redactForLog(raw.replace(/\s+/g, ' ').trim()), max) || '(empty answer)';
 }
 
 /** One job's state from a jobs_wait answer: { status, url, error, terminal }. */

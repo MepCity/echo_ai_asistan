@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { basename, extname, join, resolve, sep } from 'node:path';
 import { DEFAULT_IMAGE_MODEL, IMAGE_MODELS, MUSIC_MODEL, SPEECH_MODEL, UNKNOWN_PERSON, personBucket } from './config.js';
-import { parseCredits, parseJob, parseJobIds, parseMediaId, parseUpload } from './higgsfield.js';
+import { answerExcerpt, parseCredits, parseJob, parseJobIds, parseMediaId, parseUpload, rawAnswer } from './higgsfield.js';
 
 /**
  * The studio gateway's tools: what Hermes may do with the club's Higgsfield
@@ -66,6 +66,8 @@ export const MESSAGES = {
     noEstimate: 'Bu isteğin maliyetini doğrulayamadım, bu yüzden üretmedim. Biraz sonra tekrar deneyebilirsin.',
     video: 'Video üretimi henüz yok; şimdilik sadece görsel ve ses üretebiliyorum.',
     unknownModel: (list) => `Bu model kullanılamıyor. Kullanılabilen görsel modelleri: ${list}.`,
+    unmatched: (id) =>
+        `Bu üretimin sonucu eşleştirilemedi (generation_id: ${id}): Higgsfield isteği aldı ama cevabından iş numarasını okuyamadım, bu yüzden sonucu kendim getiremiyorum. Krediyi boşa harcamamak için tekrar göndermiyorum. Bir yönetici Higgsfield'deki işi bu üretime bağlayarak sonucu kurtarabilir; kullanıcıya bunu söyle.`,
     lostAnswer: "Higgsfield'den cevap alamadım; üretim yine de yapılmış olabilir. Krediyi boşa harcamamak için tekrar denemiyorum; birkaç dakika sonra studio_usage ile durumu kontrol edebilirsin.",
     notFound: 'Bu üretimi bulamadım.',
     notReady: 'Bu üretim henüz tamamlanmadı.',
@@ -351,7 +353,8 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
      * - 'late': polled (when `check`) until it finishes; past lateMaxHours it becomes 'unknown'.
      */
     async function settleRow(row, { check = true } = {}) {
-        const age = now() - row.created_at;
+        // A row an admin recovered (studio.sh recover) is timed from the recovery, not from when it was sent.
+        const age = now() - (row.recovered_at ?? row.created_at);
         if (row.status === 'late') {
             if (age >= lateMs) {
                 store.update(row.id, { status: 'unknown', reason: `late over ${settings.lateMaxHours} h` });
@@ -450,7 +453,10 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             const [jobId] = parseJobIds(answer);
             const actual = /charged|spent|harcan/i.test(answer.text) ? parseCredits(answer) : null;
             if (!jobId) {
-                store.update(id, { status: 'unknown', reason: 'no job id in answer' });
+                // Higgsfield took it (and likely charged it) but no job id could be read: keep the raw
+                // answer so an admin can find the job and attach it (studio.sh raw / recover).
+                store.update(id, { status: 'unknown', reason: 'no job id in answer', rawAnswer: rawAnswer(answer), ...(actual !== null ? { actual } : {}) });
+                log('warn', 'studio generation answer has no job id, raw answer stored', id, attempt.tool, `excerpt: ${answerExcerpt(answer)}`);
                 refuse(MESSAGES.lostAnswer);
             }
             store.update(id, { status: 'submitted', jobId, ...(actual !== null ? { actual } : {}) });
@@ -609,6 +615,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         }
         if (row.status === 'completed') return describeResult(row, usageNumbers(), ['(Bu sonuç daha önce başlatılmış üretime ait; yeni kredi harcanmadı.)']);
         if (row.status === 'failed') return failedMessage(row);
+        if (row.status === 'unknown' && !row.job_id) return MESSAGES.unmatched(row.id);
         if (row.status === 'unknown') return 'Bu üretimin sonucu bilinmiyor (Higgsfield cevap vermedi). Tekrar denemiyorum.';
         if (row.status === 'late') return MESSAGES.late(row.id);
         return MESSAGES.notReady;

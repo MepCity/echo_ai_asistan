@@ -8,7 +8,9 @@ import { after, describe, it } from 'node:test';
 import { normalizeConfig } from '../src/config.js';
 import { normalizeStudio } from '../src/studio/config.js';
 import { MESSAGES, createStudioGateway, dayOf } from '../src/studio/gateway.js';
-import { createHiggsfieldClient, parseCompact, parseCredits, parseJob, parseJobIds } from '../src/studio/higgsfield.js';
+import { answerExcerpt, createHiggsfieldClient, parseCompact, parseCredits, parseJob, parseJobIds, rawAnswer, redactForLog } from '../src/studio/higgsfield.js';
+import { DatabaseSync } from 'node:sqlite';
+import { rawAnswerOf, recoverGeneration } from '../src/studio/recover.js';
 import { createHiggsfieldAuth, createTokenFile, parsePasted } from '../src/studio/oauth.js';
 import { bearerMatches, createStudioServer } from '../src/studio/server.js';
 import { createStudioStore, openStudioDatabase } from '../src/studio/store.js';
@@ -68,6 +70,7 @@ function fakeHiggsfield({ estimate = 2.75, jobStatus = 'completed', resultUrl = 
         jobStatus,
         resultUrl,
         generateError: null,
+        generateAnswer: null,
         waitGate: null,
         async call(name, args) {
             calls.push({ name, args });
@@ -76,6 +79,7 @@ function fakeHiggsfield({ estimate = 2.75, jobStatus = 'completed', resultUrl = 
             }
             if (name === 'generate_image' || name === 'generate_audio') {
                 if (fake.generateError) throw fake.generateError;
+                if (fake.generateAnswer) return fake.generateAnswer;
                 return { text: `jobs[1]{index,job_id,status}:\n  0,${JOB},queued`, structured: null, isError: false };
             }
             if (name === 'jobs_wait') {
@@ -764,5 +768,184 @@ describe('Higgsfield auth and client', () => {
         assert.deepEqual(parseJobIds({ text: '', structured: { jobs: [{ job_id: JOB }] } }), [JOB]);
         assert.equal(parseCredits({ text: 'Cost preflight for elevenlabs_v4: 0.23 credits (0.23 exact). No job submitted.' }), 0.23);
         assert.deepEqual(parsePasted('http://127.0.0.1:8976/callback?code=abc&state=xyz'), { code: 'abc', state: 'xyz', error: null });
+    });
+});
+
+// The text of a live generate_image answer (Nov 2026), verbatim.
+const LIVE_JOB = '8517fd80-1a96-419f-95a6-9312eb81e152';
+const LIVE_GENERATE_TEXT = `Submitted 1 job. If a widget is visible, it polls automatically — do not call job_status or show_generations as a follow-up poll. In text-only clients, use job_status with sync:true to poll for completion.
+- 8517fd80-1a96-419f-95a6-9312eb81e152  "simple flat blue gradient square, minimal"If the user requests a combined display ... show_generation_by_ids with jobs: [{"index":0,"job_id":"<first actual job ID>"},...] ...`;
+
+describe('parseJobIds shapes', () => {
+    const A = 'aaaaaaaa-1111-4111-8111-111111111111';
+    const B = 'bbbbbbbb-2222-4222-8222-222222222222';
+    const C = 'cccccccc-3333-4333-8333-333333333333';
+
+    it('the live answer: "Submitted N job" + "- <uuid>" bullets, the placeholder ignored', () => {
+        assert.deepEqual(parseJobIds({ text: LIVE_GENERATE_TEXT }), [LIVE_JOB]);
+        assert.deepEqual(parseJobIds({ text: LIVE_GENERATE_TEXT, content: [{ type: 'text', text: LIVE_GENERATE_TEXT }] }), [LIVE_JOB]);
+    });
+
+    it('several bullets keep their order', () => {
+        assert.deepEqual(parseJobIds({ text: `Submitted 2 jobs.\n- ${B}  "one"\n- ${A}  "two"\n- ${B} again` }), [B, A]);
+    });
+
+    it('job_id / jobId / generation_id anywhere in structuredContent', () => {
+        assert.deepEqual(parseJobIds({ structured: { data: { deep: [{ jobId: A }] } } }), [A]);
+        assert.deepEqual(parseJobIds({ structured: { generation_id: B } }), [B]);
+        assert.deepEqual(parseJobIds({ structured: { jobs: [{ job_id: JOB }] } }), [JOB]);
+    });
+
+    it('job_ids / jobIds lists, in order, deduped', () => {
+        assert.deepEqual(parseJobIds({ structured: { job_ids: [A, B, A] } }), [A, B]);
+        assert.deepEqual(parseJobIds({ structured: { result: { jobIds: [C, 'not-a-uuid'] } } }), [C]);
+    });
+
+    it('bare id only under jobs/generations/results/job_set/items or next to status', () => {
+        assert.deepEqual(parseJobIds({ structured: { jobs: [{ id: A }, { id: B }] } }), [A, B]);
+        assert.deepEqual(parseJobIds({ structured: { generations: [{ id: A }] } }), [A]);
+        assert.deepEqual(parseJobIds({ structured: { results: [{ id: B }] } }), [B]);
+        assert.deepEqual(parseJobIds({ structured: { job_set: { id: C } } }), [C]);
+        assert.deepEqual(parseJobIds({ structured: { items: [{ id: A, type: 'image' }] } }), [A]);
+        assert.deepEqual(parseJobIds({ structured: { thing: { id: B, status: 'queued' } } }), [B]);
+        assert.deepEqual(parseJobIds({ structured: { user: { id: A }, workspace: { id: B } } }), [], 'unrelated ids are not jobs');
+    });
+
+    it('walks _meta (widget state), resources and JSON inside strings', () => {
+        assert.deepEqual(parseJobIds({ meta: { 'openai/widgetState': { ui: { generations: [{ id: A, status: 'queued' }] } } } }), [A]);
+        assert.deepEqual(parseJobIds({ meta: { widget: { state: JSON.stringify({ job_set_id: C, jobs: [{ id: B }] }) } } }), [B]);
+        assert.deepEqual(parseJobIds({ content: [{ type: 'resource', resource: { uri: 'ui://x', text: JSON.stringify({ job_id: C }) } }] }), [C]);
+    });
+
+    it('JSON text blocks', () => {
+        assert.deepEqual(parseJobIds({ text: JSON.stringify({ jobs: [{ id: A, status: 'queued' }] }) }), [A]);
+        const content = [
+            { type: 'text', text: 'Started.' },
+            { type: 'text', text: JSON.stringify({ job_ids: [B] }) },
+        ];
+        assert.deepEqual(parseJobIds({ text: content.map((part) => part.text).join('\n'), content }), [B]);
+    });
+
+    it('order across sources: structuredContent, then _meta, then text; deduped', () => {
+        assert.deepEqual(parseJobIds({ structured: { job_id: A }, meta: { jobs: [{ id: B }, { id: A }] }, text: JSON.stringify({ job_id: C }) }), [A, B, C]);
+    });
+
+    it('compact tables with id or job_id in the header', () => {
+        assert.deepEqual(parseJobIds({ text: `items[2]{id,type,status}:\n  ${A},image,queued\n  ${B},image,queued` }), [A, B]);
+        assert.deepEqual(parseJobIds({ text: `jobs[1]{index,job_id,status}:\n  0,${C},queued` }), [C]);
+        assert.deepEqual(parseJobIds({ text: `media[1]{name,size}:\n  x.png,10` }), []);
+    });
+
+    it('"job_id: …" lines and "job id … <uuid>" text', () => {
+        assert.deepEqual(parseJobIds({ text: `status: queued\njob_id: ${A}` }), [A]);
+        assert.deepEqual(parseJobIds({ text: `Submitted. job_id=${JOB}` }), [JOB]);
+    });
+
+    it('last resort: exactly one UUID in the text, never two', () => {
+        assert.deepEqual(parseJobIds({ text: `Your image is on its way (${A}).` }), [A]);
+        assert.deepEqual(parseJobIds({ text: `Ref ${A} and ${A.toUpperCase()}` }), [A], 'the same UUID twice is one');
+        assert.deepEqual(parseJobIds({ text: `Media ${A}, workspace ${B}` }), []);
+        assert.deepEqual(parseJobIds({ text: 'Cost preflight for x: 2.75 credits (2.75 exact). No job submitted.' }), []);
+    });
+});
+
+describe('studio: unmatched answers, raw copy and recovery', () => {
+    const odd = { text: 'Your generation is being prepared in the widget.', structured: { widget: { job_set_id: 'set-1' } }, meta: { 'openai/outputTemplate': 'ui://higgsfield/generation', auth: 'Bearer abc.def', url: 'https://cdn.test/x.png?X-Amz-Signature=deadbeef&token=zzz' }, content: [], isError: false };
+
+    it('the live answer is submitted and polled with jobs_wait {index, job_id}', async () => {
+        const higgsfield = fakeHiggsfield();
+        higgsfield.generateAnswer = { text: LIVE_GENERATE_TEXT, structured: null, meta: null, content: [{ type: 'text', text: LIVE_GENERATE_TEXT }], isError: false };
+        const { gateway, store } = setup({ higgsfield });
+        await image(gateway);
+        const row = store.recent().at(-1);
+        assert.equal(row.job_id, LIVE_JOB);
+        const wait = higgsfield.calls.find((item) => item.name === 'jobs_wait');
+        assert.deepEqual(wait.args.jobs, [{ index: 0, job_id: LIVE_JOB }]);
+        assert.ok(wait.args.timeout_seconds <= 15);
+        assert.ok(!higgsfield.calls.some((item) => item.name === 'job_status'));
+    });
+
+    it('no job id: stores a raw copy, logs one redacted warn line, get_generation explains in Turkish', async () => {
+        const higgsfield = fakeHiggsfield();
+        higgsfield.generateAnswer = odd;
+        const logs = [];
+        const dataDir = tempDir();
+        const config = echoConfig(dataDir);
+        const settings = normalizeStudio({ waitSliceSec: 1 }, config, { STUDIO_PREVIEW_DIR: join(dataDir, 'p'), STUDIO_BRAND_KIT: join(dataDir, 'b.md') });
+        const store = createStudioStore(openStudioDatabase(':memory:'), () => Date.parse('2026-11-20T09:00:00Z'));
+        const gateway = createStudioGateway({ settings, store, higgsfield, fetchImpl: downloadFetch(), log: (...parts) => logs.push(parts.join(' ')) });
+        assert.equal((await image(gateway)).text, MESSAGES.lostAnswer);
+        const row = store.recent().at(-1);
+        assert.equal(row.status, 'unknown');
+        assert.equal(row.job_id, null);
+        assert.match(row.raw_answer, /--- content text ---\nYour generation/);
+        assert.match(row.raw_answer, /--- structuredContent ---\n\{"widget"/);
+        assert.match(row.raw_answer, /X-Amz-Signature=deadbeef/, 'the DB keeps the signed URL');
+        const warns = logs.filter((line) => line.startsWith('warn'));
+        assert.equal(warns.length, 1);
+        assert.match(warns[0], /no job id/);
+        assert.match(warns[0], /Your generation is being prepared/);
+        assert.ok(!/deadbeef|zzz|abc\.def/.test(warns[0]), warns[0]);
+        const answer = await call(gateway, 'get_generation', { generation_id: row.id });
+        assert.equal(answer.text, MESSAGES.unmatched(row.id));
+        assert.match(answer.text, /eşleştirilemedi/);
+        assert.match(answer.text, /yönetici/);
+    });
+
+    it('raw copies stay under ~8 KB and keep every section', () => {
+        const raw = rawAnswer({ text: 'x'.repeat(20_000), structured: { a: 'y'.repeat(20_000) }, meta: { m: 1 } });
+        assert.ok(raw.length <= 8 * 1024 + 32, String(raw.length));
+        assert.match(raw, /--- structuredContent ---/);
+        assert.match(raw, /--- _meta ---\n\{"m":1\}/);
+    });
+
+    it('log redaction drops tokens and URL query strings', () => {
+        const line = redactForLog('get https://cdn.test/a.png?X-Amz-Signature=s1&e=2 Authorization: Bearer abc123 {"access_token":"tok-1"} eyJhbGciOi.eyJzdWIi.sig k=AbCdEf0123456789AbCdEf0123456789AbCdEf0123');
+        assert.ok(!/s1|abc123|tok-1|eyJ|AbCdEf0123456789/.test(line), line);
+        assert.match(line, /https:\/\/cdn\.test\/a\.png\?\[query removed\]/);
+        assert.ok(answerExcerpt({ text: 'z'.repeat(1000) }).length < 320);
+    });
+
+    it('recover attaches the job id; the normal poll stores the result; raw prints the copy', async () => {
+        const higgsfield = fakeHiggsfield();
+        higgsfield.generateAnswer = odd;
+        const { gateway, store, clock } = setup({ higgsfield, studio: { limits: { cooldownSec: 0 } } });
+        await image(gateway);
+        const id = store.recent().at(-1).id;
+        clock.now += 30 * 3_600_000; // long after lateMaxHours: the clock restarts at the recovery
+        assert.equal(rawAnswerOf(store, id).ok, true);
+        assert.match(rawAnswerOf(store, id).message, /no job id in answer[\s\S]*--- content text ---/);
+        assert.equal(recoverGeneration(store, id, 'nope').ok, false);
+        assert.equal(recoverGeneration(store, 'gen_missing', JOB).ok, false);
+        const result = recoverGeneration(store, id, JOB);
+        assert.equal(result.ok, true, result.message);
+        assert.equal(store.get(id).status, 'submitted');
+        assert.equal(store.get(id).job_id, JOB);
+        assert.match(store.get(id).reason, /recovered by admin \(was unknown: no job id in answer\)/);
+        assert.equal(recoverGeneration(store, id, JOB).ok, false, 'only unknown/late rows');
+        await gateway.checkPending();
+        assert.equal(store.get(id).status, 'completed');
+        assert.ok(higgsfield.calls.some((item) => item.name === 'jobs_wait' && item.args.jobs[0].job_id === JOB));
+        assert.match((await call(gateway, 'get_generation', { generation_id: id })).text, /Üretim tamamlandı/);
+        assert.equal(higgsfield.generated().length, 1, 'nothing is sent again');
+    });
+
+    it('recover refuses a job id another row already has', async () => {
+        const { gateway, store, clock } = setup({ studio: { limits: { cooldownSec: 0 } } });
+        await image(gateway);
+        store.insert({ id: 'gen_lost', day: dayOf(clock.now, 'Europe/Istanbul'), month: '2026-11', tool: 'generate_image', kind: 'image', estimated: 3, status: 'unknown', requestedBy: 'yasir' });
+        assert.match(recoverGeneration(store, 'gen_lost', JOB).message, /zaten/);
+    });
+
+    it('an existing studio.db gets the new columns in place', () => {
+        const dir = tempDir();
+        const old = new DatabaseSync(join(dir, 'studio.db'));
+        old.exec("CREATE TABLE generations (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, day TEXT NOT NULL, month TEXT NOT NULL, tool TEXT NOT NULL, kind TEXT NOT NULL, model TEXT, params TEXT, estimated_credits REAL, actual_credits REAL, job_id TEXT, status TEXT NOT NULL, reason TEXT, requested_by TEXT, file TEXT, mime TEXT, bytes INTEGER, sha256 TEXT, width INTEGER, height INTEGER, source_url TEXT); INSERT INTO generations (id, created_at, updated_at, day, month, tool, kind, status, reason) VALUES ('gen_old', 1, 1, '2026-11-20', '2026-11', 'generate_image', 'image', 'unknown', 'no job id in answer');");
+        old.close();
+        const store = createStudioStore(openStudioDatabase(dir));
+        assert.equal(store.get('gen_old').raw_answer, null);
+        assert.equal(store.get('gen_old').recovered_at, null);
+        assert.equal(recoverGeneration(store, 'gen_old', JOB).ok, true);
+        createStudioStore(openStudioDatabase(dir)); // opening again is a no-op
     });
 });
