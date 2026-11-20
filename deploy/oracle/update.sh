@@ -6,6 +6,9 @@
 # copied to Hermes too).
 set -euo pipefail
 
+# In a function, so bash reads the whole file before git pull can change it.
+main() {
+
 APP=/opt/echo/app
 ENV_FILE=/opt/echo/.env
 COMPOSE_FILE=$APP/deploy/oracle/docker-compose.yml
@@ -19,8 +22,15 @@ PROFILES=()
 [ -f "$HERMES_ENV" ] && PROFILES=(--profile hermes)
 compose() { "${DOCKER[@]}" compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "${PROFILES[@]}" "$@"; }
 
-echo "==> git pull"
-git -C "$APP" pull --ff-only
+if [ -z "${ECHO_UPDATE_PULLED:-}" ]; then
+  echo "==> git pull"
+  git -C "$APP" pull --ff-only
+  # The pull may have changed this script; run the new copy so its steps (and their order) apply.
+  ECHO_UPDATE_PULLED=1 exec bash "$APP/deploy/oracle/update.sh" "$@"
+fi
+# Before any compose up: with the hermes profile, compose starts studio, and Docker would make
+# its missing bind-mount sources (brand-kit.md, shared folders) as root-owned directories.
+# Without $HERMES_ENV the profile is off and studio is not started.
 if [ -f "$HERMES_ENV" ]; then
   echo "==> studio (Higgsfield) hazirligi"
   bash "$APP/deploy/oracle/hermes/studio-prepare.sh"
@@ -43,3 +53,5 @@ for _ in $(seq 1 30); do
 done
 compose logs --tail 30
 fail "https://$ECHO_HOST/health is not answering."
+}
+main "$@"
