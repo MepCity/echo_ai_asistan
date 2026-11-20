@@ -316,11 +316,27 @@ yalnızca şu araçları verir:
 | `get_generation` | başlamış bir üretimin sonucu (yeni kredi harcamaz) | yok |
 | `get_original_file` | asıl dosyayı WhatsApp'a belge olarak göndermek için yol | yok |
 | `generate_image` | tek görsel, varsayılan **1k** (2k yalnızca `yuksek_cozunurluk: true` / `resolution: "2k"`, 4k yalnızca açıkça ve sadece Nano Banana): `gpt_image_2_6` (varsayılan, high), `nano_banana_2_1`, `recraft_v4_1` (vektör/tipografi, marka renkleri) | WhatsApp'ta onay |
+| `edit_image` | `gpt_image_2_6` ile görselden görsele düzenleme: önceki üretim (`generation_id`) ya da kullanıcının gönderdiği görsel (`kaynak_gorsel`) + `talimat`; aynı sınırlar, 1k | onay |
+| `add_logo` | gerçek kulüp logosunu (PNG) ImageMagick ile birebir ekler; asıl dosya değişmez, "final" PNG ayrı saklanır; **kredi harcamaz** | onay |
 | `generate_audio` | `speech` (`elevenlabs_v4`, ≤1500 karakter) ya da `music` (`elevenlabs_music_v2_5`, ≤60 sn) | onay |
-| `attach_to_trypost` | üretilen görselin **asıl dosyasını** TryPost'a yükler; `post_id` varsa ekler, yoksa `social_account_id` için yeni taslak | onay |
+| `attach_to_trypost` | üretilen görselin **asıl dosyasını** (logolu "final" varsa onu; `logosuz: true` ile asıl hali) TryPost'a yükler; `post_id` varsa ekler, yoksa `social_account_id` için yeni taslak | onay |
 
-`generate_image`, `generate_audio` ve `attach_to_trypost` isteğe bağlı bir `ozet` alır: Hermes'in
-yazdığı tek satırlık Türkçe özet; yalnızca onay mesajında ve "hazır" bildiriminde görünür.
+`generate_image`, `edit_image`, `add_logo`, `generate_audio` ve `attach_to_trypost` isteğe bağlı bir
+`ozet` alır: Hermes'in yazdığı tek satırlık Türkçe özet; yalnızca onay mesajında ve "hazır"
+bildiriminde görünür.
+
+**Yayına hazır afiş:** `generate_image` `baslik` (ve isteğe bağlı `alt_metin`) alır; geçit bunları,
+küçük "Marmara Yapay Zeka Kulübü" yazısını, tipografiyi ve Türkçe karakter uyarısını sabit bir
+kalıpla prompt'a ekler. `logo: true` (varsayılan, referans alan modellerde) gerçek logo PNG'sini
+(`deploy/oracle/brand/logo.png` lacivert yazılı, `logo-dark.png` beyaz yazılı; imaja kopyalanır)
+`image_references` olarak verir ve `logo_konum` köşesine (alt-sag, alt-sol, ust-sag, ust-sol)
+koymasını ister; `logo_zemin` (koyu/acik) hangi dosyanın verileceğini seçer. Logo Higgsfield'e bir
+kez `media_upload` ile yüklenir, media id `studio.db` → `assets` tablosunda saklanır (dosya değişince
+ya da `studio.logoMediaMaxDays`, varsayılan 7 gün sonra yeniden yüklenir). Modelin logosu bozuk
+çıkarsa `add_logo` gerçek logoyu görsel genişliğinin ~%12'si kadar, kenarlardan %5 içeride ekler;
+o köşenin ortalama parlaklığına göre koyu zeminde beyaz yazılı, açık zeminde lacivert logoyu seçer.
+Sunucudaki `/opt/echo/brand-kit.md` güncellemelerde değişmez; dağıtılan kitin
+`brand-kit-version` satırı daha yeniyse `studio-prepare.sh` (update.sh) bunu bir NOT ile söyler.
 
 **Türkçe onay mesajı:** Hermes'in onay kartının ortası normalde sabit İngilizce ("MCP tool … on
 UNTRUSTED server … Arguments: {json}") ve WhatsApp'ın 1024 karakter sınırını aşınca uzun metni önce

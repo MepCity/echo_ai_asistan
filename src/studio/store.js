@@ -22,7 +22,12 @@ import { DatabaseSync } from 'node:sqlite';
  *   NULL (the generate call answered with the result, nothing to tell), 'waiting' (the call answered
  *   "still preparing"), 'shown' (get_generation answered it, Hermes showed it), 'sending', 'sent',
  *   'failed' (one attempt, never retried) or 'skipped' (no known requester, or too late).
+ *   `logo_corner`: the corner (alt-sag, alt-sol, ust-sag, ust-sol) the club logo goes in, or NULL (no logo).
+ *   `final_*`: the "final" image (original + club logo, a new PNG with its own sha256), when made;
+ *   the original (`file`, `sha256`) is never changed. `final_variant`: logo or logo-dark.
  * - attachments: generated images uploaded to TryPost (post id, upload sha256).
+ * - assets: Higgsfield media ids of files the studio uploads itself (the club logo PNGs, key
+ *   "logo:<variant>"), with the sha256 of the uploaded file, so the logo is uploaded once, not per generation.
  */
 export function openStudioDatabase(dir) {
     let file = ':memory:';
@@ -83,6 +88,12 @@ export function openStudioDatabase(dir) {
             status TEXT NOT NULL,
             reason TEXT
         );
+        CREATE TABLE IF NOT EXISTS assets (
+            key TEXT PRIMARY KEY,
+            media_id TEXT NOT NULL,
+            sha256 TEXT,
+            created_at INTEGER NOT NULL
+        );
     `);
     // Columns added after the first release: added in place to an existing studio.db.
     const have = new Set(db.prepare('PRAGMA table_info(generations)').all().map((column) => column.name));
@@ -91,6 +102,11 @@ export function openStudioDatabase(dir) {
         ['recovered_at', 'INTEGER'],
         ['summary', 'TEXT'],
         ['notify_state', 'TEXT'],
+        ['logo_corner', 'TEXT'],
+        ['final_file', 'TEXT'],
+        ['final_bytes', 'INTEGER'],
+        ['final_sha256', 'TEXT'],
+        ['final_variant', 'TEXT'],
     ]) {
         if (!have.has(name)) db.exec(`ALTER TABLE generations ADD COLUMN ${name} ${type}`);
     }
@@ -107,9 +123,9 @@ export function createStudioStore(db, now = () => Date.now()) {
         insert(row) {
             const time = now();
             db.prepare(
-                `INSERT INTO generations (id, created_at, updated_at, day, month, tool, kind, model, params, estimated_credits, status, reason, requested_by, summary)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            ).run(row.id, time, time, row.day, row.month, row.tool, row.kind, row.model ?? null, row.params ? JSON.stringify(row.params) : null, row.estimated ?? null, row.status, row.reason ?? null, row.requestedBy ?? null, row.summary ?? null);
+                `INSERT INTO generations (id, created_at, updated_at, day, month, tool, kind, model, params, estimated_credits, status, reason, requested_by, summary, logo_corner)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            ).run(row.id, time, time, row.day, row.month, row.tool, row.kind, row.model ?? null, row.params ? JSON.stringify(row.params) : null, row.estimated ?? null, row.status, row.reason ?? null, row.requestedBy ?? null, row.summary ?? null, row.logoCorner ?? null);
         },
         update(id, fields) {
             const columns = {
@@ -130,6 +146,11 @@ export function createStudioStore(db, now = () => Date.now()) {
                 rawAnswer: 'raw_answer',
                 recoveredAt: 'recovered_at',
                 notifyState: 'notify_state',
+                logoCorner: 'logo_corner',
+                finalFile: 'final_file',
+                finalBytes: 'final_bytes',
+                finalSha256: 'final_sha256',
+                finalVariant: 'final_variant',
             };
             const sets = [];
             const values = [];
@@ -205,6 +226,13 @@ export function createStudioStore(db, now = () => Date.now()) {
                 row.status,
                 row.reason ?? null,
             );
+        },
+        /** A cached Higgsfield media id ({ key, media_id, sha256, created_at }) or null. */
+        getAsset(key) {
+            return db.prepare('SELECT * FROM assets WHERE key = ?').get(key) ?? null;
+        },
+        setAsset(key, mediaId, sha256 = null) {
+            db.prepare('INSERT INTO assets (key, media_id, sha256, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET media_id = excluded.media_id, sha256 = excluded.sha256, created_at = excluded.created_at').run(key, mediaId, sha256, now());
         },
         attachments(generationId) {
             return db.prepare('SELECT * FROM attachments WHERE generation_id = ? ORDER BY id').all(generationId);

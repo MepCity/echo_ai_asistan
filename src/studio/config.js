@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { DEFAULT_LOGO_DIR } from './compose.js';
 
 /**
  * Settings of the studio gateway (src/studio): the `studio` section of Echo's
@@ -21,6 +22,8 @@ import { join } from 'node:path';
  *     "jobTimeoutSec": 180,            // how long one generate call waits for its job before answering "still preparing"
  *     "pendingStaleMin": 15,           // a job pending longer than this stops blocking: one last check, then 'late' (or 'unknown' without a job id)
  *     "lateMaxHours": 24,              // a 'late' job is polled this long, then marked 'unknown'
+ *     "logoDir": "...",                // logo.png / logo-dark.png (default deploy/oracle/brand, or STUDIO_LOGO_DIR)
+ *     "logoMediaMaxDays": 7,           // re-upload the cached logo media to Higgsfield after this many days
  *     "previewDir": "...", "hermesPreviewDir": "...", "referenceDirs": ["..."], "brandKitFile": "..."
  *   }
  * }
@@ -196,6 +199,10 @@ export function normalizeStudio(raw, config, env = process.env) {
         hermesPreviewDir: value.hermesPreviewDir ?? previewDir,
         referenceDirs,
         brandKitFile: value.brandKitFile ?? env.STUDIO_BRAND_KIT ?? join(dataDir, 'brand-kit.md'),
+        // The club logo PNGs (logo.png, logo-dark.png; deploy/oracle/brand, shipped in the image).
+        logoDir: value.logoDir ?? env.STUDIO_LOGO_DIR ?? DEFAULT_LOGO_DIR,
+        // A cached Higgsfield media id of a logo is uploaded again after this many days (or when the file changes).
+        logoMediaMaxDays: number(value.logoMediaMaxDays, 7, 'logoMediaMaxDays', 0),
         people: config.people.map((person) => person.id),
     };
 }

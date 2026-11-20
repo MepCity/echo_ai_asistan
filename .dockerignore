@@ -5,6 +5,8 @@ node_modules
 data
 test
 deploy
+# The club logo PNGs (studio add_logo and the logo reference) ship in the image.
+!deploy/oracle/brand
 *.db
 config.json
 .env

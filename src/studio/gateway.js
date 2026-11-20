@@ -3,6 +3,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rename
 import { basename, extname, join, resolve, sep } from 'node:path';
 import { DEFAULT_IMAGE_MODEL, DEFAULT_IMAGE_RESOLUTION, IMAGE_MODELS, MUSIC_MODEL, SPEECH_MODEL, UNKNOWN_PERSON, personBucket } from './config.js';
 import { answerExcerpt, parseCredits, parseJob, parseJobIds, parseMediaId, parseUpload, rawAnswer } from './higgsfield.js';
+import { CORNER_NAMES, CORNER_PROMPT, DEFAULT_LOGO_CORNER, LOGO_CORNERS } from './compose.js';
 
 /**
  * The studio gateway's tools: what Hermes may do with the club's Higgsfield
@@ -29,6 +30,16 @@ import { answerExcerpt, parseCredits, parseJob, parseJobIds, parseMediaId, parse
  * and size; its sha256 is stored). WhatsApp gets a copy as a preview (it
  * recompresses images); TryPost gets the original bytes, server to server,
  * only through attach_to_trypost.
+ *
+ * Posters are finished by the model: the gateway appends the headline/subline
+ * (baslik, alt_metin) and the club name to the prompt in a fixed phrasing, and
+ * gives the real club logo PNG (uploaded once, media id cached in studio.db)
+ * as an image reference with where to place it. If the model's logo comes out
+ * wrong, add_logo composites the real PNG with ImageMagick (no credits): that
+ * makes a "final" PNG next to the untouched original, and the preview,
+ * get_original_file and attach_to_trypost use the final when there is one.
+ * edit_image is image-to-image with gpt_image_2_6 on an earlier generation or a
+ * picture the user sent, through the same limits as generate_image.
  */
 
 const MB = 1024 * 1024;
@@ -50,6 +61,10 @@ const EXTENSIONS = {
 };
 const MIME_BY_EXT = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', aac: 'audio/aac', ogg: 'audio/ogg' };
 const REFERENCE_EXT = new Set(['png', 'jpg', 'jpeg', 'webp']);
+const BASLIK_MAX = 120;
+const ALT_METIN_MAX = 200;
+/** edit_image always uses GPT Image 2.6 (image-to-image with references). */
+const EDIT_MODEL = 'gpt_image_2_6';
 
 export const MESSAGES = {
     busy: 'Şu an başka bir üretim sürüyor; o bitince tekrar deneyebilirsin.',
@@ -78,7 +93,73 @@ export const MESSAGES = {
     postScope: 'Bu gönderiyi Marmara AI çalışma alanında bulamadım; gönderi id’sini kontrol et.',
     needAccount: 'Yeni taslak için hangi hesaba (Instagram, LinkedIn, X…) hazırlanacağını bilmem gerekiyor; önce hesabı seç, sonra tekrar dene.',
     integrity: 'Saklanan dosya değişmiş görünüyor; güvenlik için yüklemiyorum. Yöneticiye haber ver.',
+    noCompositor: 'Logo ekleme bu sunucuda ayarlı değil (ImageMagick yok); yöneticiye haber ver.',
+    logoFailed: 'Logoyu görsele ekleyemedim; görsel değişmedi. Yöneticiye haber ver.',
+    logoFile: 'Kulüp logosu dosyası sunucuda bulunamadı; yöneticiye haber ver.',
+    notImage: 'Bu işlem sadece görseller için.',
+    editSource: 'Düzenlenecek görseli bulamadım. Önceki bir üretimin generation_id’sini (gen_…) ya da kullanıcının gönderdiği görselin yolunu ver.',
 };
+
+/** The club's name as it is written on posters. */
+export const CLUB_NAME = 'Marmara Yapay Zeka Kulübü';
+const TURKISH_LETTERS = 'ç ğ ı İ ö ş ü (and Ç Ğ Ö Ş Ü)';
+
+/** One line of text for the image, NFC (precomposed Turkish letters), no control characters, double quotes made single. */
+export function posterText(value) {
+    return String(value ?? '')
+        .normalize('NFC')
+        .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, ' ')
+        .replace(/["“”„«»]/g, "'")
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+const logoInstruction = (corner, which) =>
+    `Club logo: ${which} is the official ${CLUB_NAME} logo. Place that exact logo once, in the ${CORNER_PROMPT[corner]} corner, small (about 12% of the image width), about 5% in from the edges, on a calm, uncluttered area with good contrast. Reproduce it faithfully: same shapes, same colours, same proportions; do not redraw, restyle, distort or crop it, and do not add any other logo or emblem. Keep all text away from that corner.`;
+
+/**
+ * The prompt sent for generate_image: the caller's description, then (in a fixed phrasing) the exact
+ * headline, subline and club name to render, the typography, and where the logo reference goes.
+ * `logoCorner` null: no logo instruction.
+ */
+export function buildImagePrompt({ prompt, baslik = null, altMetin = null, logoCorner = null }) {
+    const parts = [String(prompt).trim()];
+    if (baslik) {
+        const lines = [
+            `Text in the image: render exactly the following text and no other words. It is Turkish; spell every word exactly as given, with the correct Turkish characters ${TURKISH_LETTERS}, no missing or replaced letters, no extra punctuation.`,
+            `Headline text, exactly: "${baslik}"`,
+        ];
+        if (altMetin) lines.push(`Subline text (smaller, below the headline), exactly: "${altMetin}"`);
+        lines.push(`Small text, exactly: "${CLUB_NAME}"`);
+        lines.push('Typography: clean modern sans-serif, bold headline, brand colours (deep navy #0f1c47, white #ffffff or light #f1f5f9, accent #1e6bf5, brand gradient #3278f6 to #3cbdfa), strong contrast with the background, crisp and legible at phone size, generous spacing, nothing cut off at the edges.');
+        parts.push(lines.join('\n'));
+    }
+    if (logoCorner) parts.push(logoInstruction(logoCorner, 'the last reference image'));
+    return parts.join('\n\n');
+}
+
+/** The prompt sent for edit_image: change only what the instruction says, keep the rest. */
+export function buildEditPrompt({ talimat, logoCorner = null }) {
+    const parts = [
+        `Edit the first reference image. Change only this: ${String(talimat).trim()}`,
+        `Keep everything else as it is: composition, colours, style, layout and any existing text. Any text you add or change must be spelled exactly as given, with the correct Turkish characters ${TURKISH_LETTERS}.`,
+    ];
+    if (logoCorner) parts.push(logoInstruction(logoCorner, 'the last reference image').replace('Place that exact logo once', 'The image must show that exact logo once').replace('Reproduce it faithfully', 'If the logo in the image differs from it, replace it with a faithful copy'));
+    return parts.join('\n\n');
+}
+
+/** The allowed aspect ratio closest to width/height. */
+export function nearestAspect(width, height, ratios) {
+    const target = Math.log(width / height);
+    let best = ratios[0];
+    let gap = Infinity;
+    for (const ratio of ratios) {
+        const [w, h] = ratio.split(':').map(Number);
+        const d = Math.abs(Math.log(w / h) - target);
+        if (d < gap) [best, gap] = [ratio, d];
+    }
+    return best;
+}
 
 export class Refusal extends Error {
     constructor(message) {
@@ -134,9 +215,10 @@ export function imageSize(bytes) {
  * deps: settings (normalizeStudio), store (createStudioStore), higgsfield ({ call }),
  * auth ({ status }), trypost ({ uploadMedia, request, projectName, imageLimitMb } | null),
  * fetchImpl (downloads, presigned uploads), sleep, log, notify (createStudioNotifier, or null: late
- * generations are then only returned by get_generation).
+ * generations are then only returned by get_generation),
+ * compositor (createLogoCompositor, or null: add_logo then refuses).
  */
-export function createStudioGateway({ settings, store, higgsfield, auth = null, trypost = null, fetchImpl = globalThis.fetch, sleep = (ms) => new Promise((done) => setTimeout(done, ms)), log = () => {}, notify = null }) {
+export function createStudioGateway({ settings, store, higgsfield, auth = null, trypost = null, fetchImpl = globalThis.fetch, sleep = (ms) => new Promise((done) => setTimeout(done, ms)), log = () => {}, notify = null, compositor = null }) {
     // In-process lock for the submit window (estimate → send → job id). Jobs still running after
     // that are found in the database (status 'submitting' / 'submitted'), see settlePending.
     let inFlight = false;
@@ -208,29 +290,56 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         return id;
     }
 
+    /**
+     * The Higgsfield media id of a club logo PNG (variant "logo" or "logo-dark"): uploaded once with
+     * media_upload, then the id cached in studio.db (assets) until the file changes or logoMediaMaxDays pass.
+     */
+    async function logoMedia(variant) {
+        const file = join(settings.logoDir, `${variant}.png`);
+        let bytes;
+        try {
+            bytes = readFileSync(file);
+        } catch {
+            refuse(MESSAGES.logoFile);
+        }
+        const sha256 = createHash('sha256').update(bytes).digest('hex');
+        const key = `logo:${variant}`;
+        const cached = store.getAsset(key);
+        if (cached && cached.sha256 === sha256 && now() - cached.created_at < settings.logoMediaMaxDays * 86_400_000) return cached.media_id;
+        const mediaId = await uploadReferenceFile(file);
+        store.setAsset(key, mediaId, sha256);
+        log('info', 'studio logo uploaded to Higgsfield', variant, mediaId);
+        return mediaId;
+    }
+
+    /** The real path of a picture the user sent (inside referenceDirs), or a refusal. */
+    function userImagePath(value) {
+        for (const dir of settings.referenceDirs) {
+            const root = resolve(dir);
+            let real;
+            try {
+                real = realpathSync(resolve(value));
+            } catch {
+                refuse('Referans görsel dosyasını bulamadım; kullanıcıdan görseli tekrar göndermesini iste.');
+            }
+            const rootReal = existsSync(root) ? realpathSync(root) : root;
+            if (real.startsWith(rootReal + sep)) return real;
+        }
+        refuse('Bu dosya referans olarak kullanılamaz; sadece kullanıcının WhatsApp’tan gönderdiği görseller ya da kulüp logosu kullanılabilir.');
+    }
+
     /** A Higgsfield media id (or job id) for a reference the caller named. */
     async function resolveReference(reference) {
         const value = String(reference).trim();
-        if (settings.logos[value]) return importReferenceUrl(settings.logos[value]);
+        if (value === 'logo' || value === 'logo-dark') return logoMedia(value);
         if (/^gen_[a-z0-9]+$/i.test(value)) {
             const row = store.get(value);
             if (!row || row.kind !== 'image' || row.status !== 'completed' || !row.job_id) refuse('Referans olarak verilen üretimi bulamadım.');
+            // A generation with the real logo composited (add_logo): that file is what the user saw.
+            if (row.final_file && existsSync(row.final_file)) return uploadReferenceFile(row.final_file);
             return row.job_id;
         }
-        if (value.startsWith('/')) {
-            for (const dir of settings.referenceDirs) {
-                const root = resolve(dir);
-                let real;
-                try {
-                    real = realpathSync(resolve(value));
-                } catch {
-                    refuse('Referans görsel dosyasını bulamadım; kullanıcıdan görseli tekrar göndermesini iste.');
-                }
-                const rootReal = existsSync(root) ? realpathSync(root) : root;
-                if (real.startsWith(rootReal + sep)) return uploadReferenceFile(real);
-            }
-            refuse('Bu dosya referans olarak kullanılamaz; sadece kullanıcının WhatsApp’tan gönderdiği görseller ya da kulüp logosu kullanılabilir.');
-        }
+        if (value.startsWith('/')) return uploadReferenceFile(userImagePath(value));
         let url;
         try {
             url = new URL(value);
@@ -270,11 +379,22 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
     }
 
     /** A copy of a stored file in the directory Hermes delivers from; returns its path as Hermes sees it. */
-    function exposeToHermes(row, suffix = '') {
+    function exposeToHermes(row, suffix = '', file = row.file) {
         mkdirSync(settings.previewDir, { recursive: true });
-        const name = `${row.id}${suffix}${extname(row.file)}`;
-        copyFileSync(row.file, join(settings.previewDir, name));
+        const name = `${row.id}${suffix}${extname(file)}`;
+        copyFileSync(file, join(settings.previewDir, name));
         return join(settings.hermesPreviewDir, name);
+    }
+
+    /**
+     * The file shown and sent for an image: the "final" (club logo composited by add_logo) when there is
+     * one and `original` is not asked for, else the original. { file, mime, bytes, sha256, final }.
+     */
+    function deliverable(row, { original = false } = {}) {
+        if (!original && row.kind === 'image' && row.final_file && existsSync(row.final_file)) {
+            return { file: row.final_file, mime: 'image/png', bytes: row.final_bytes, sha256: row.final_sha256, final: true };
+        }
+        return { file: row.file, mime: row.mime, bytes: row.bytes, sha256: row.sha256, final: false };
     }
 
     function describeResult(row, usage, extra = []) {
@@ -284,13 +404,20 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         lines.push(`Model: ${row.model}${params.aspect_ratio ? `, oran: ${params.aspect_ratio}` : ''}. Kredi: yaklaşık ${round(credits ?? 0)}.`);
         const meta = [row.mime, row.width ? `${row.width}x${row.height}` : null, `${(row.bytes / MB).toFixed(1)} MB`].filter(Boolean).join(', ');
         if (row.kind === 'image') {
-            if (row.bytes <= settings.whatsappPreviewMaxMb * MB) {
-                lines.push('Kullanıcıya önizlemeyi göstermek için cevabına ayrı bir satırda aynen şunu yaz:', `MEDIA:${exposeToHermes(row, '-preview')}`);
+            const shown = deliverable(row);
+            if (shown.bytes <= settings.whatsappPreviewMaxMb * MB) {
+                lines.push('Kullanıcıya önizlemeyi göstermek için cevabına ayrı bir satırda aynen şunu yaz:', `MEDIA:${exposeToHermes(row, shown.final ? '-final-preview' : '-preview', shown.file)}`);
                 lines.push('WhatsApp görseli sıkıştırır; bu sadece önizleme.');
             } else {
                 lines.push('Dosya WhatsApp önizlemesi için fazla büyük; kullanıcı görmek isterse get_original_file ile belge olarak gönder.');
             }
             lines.push(`Asıl dosya sunucuda değiştirilmeden saklı (${meta}). Gönderiye eklemek için attach_to_trypost kullan (WhatsApp'tan geçmez, kalite kaybı olmaz). Kullanıcı asıl dosyayı isterse get_original_file.`);
+            if (shown.final) lines.push(`Gerçek kulüp logosu eklenmiş hali (${CORNER_NAMES[row.logo_corner] ?? ''} köşe) kullanılıyor; logosuz asıl hali de saklı (logosuz: true).`);
+            const text = params.poster;
+            if (text?.baslik) {
+                lines.push(`Görseldeki yazıyı kontrol et: başlık “${text.baslik}”${text.alt_metin ? `, alt metin “${text.alt_metin}”` : ''}. Kullanıcı yazının yanlış olduğunu söylerse bir kez yeniden üretmeyi (ya da edit_image ile düzeltmeyi) teklif et; kendiliğinden tekrar üretme.`);
+            }
+            if (row.logo_corner && !shown.final) lines.push('Logo modele referans olarak verildi. Logo bozuk ya da yanlış çıktıysa add_logo ile gerçek logo kredi harcamadan eklenebilir.');
         } else {
             if (row.bytes <= WHATSAPP_AUDIO_MAX) {
                 lines.push('Kullanıcıya dinletmek için cevabına ayrı bir satırda aynen şunu yaz:', `MEDIA:${exposeToHermes(row)}`);
@@ -412,7 +539,12 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             if (before.monthCredits >= limits.monthlyCredits) refuseAttempt(attempt, MESSAGES.monthlyCredits);
 
             const params = { ...attempt.params };
-            if (attempt.reference) params.medias = [{ value: await resolveReference(attempt.reference), role: 'image_references' }];
+            // References in order (the prompt names "the first" / "the last" reference image).
+            const references = attempt.references ?? (attempt.reference ? [attempt.reference] : []);
+            if (references.length) {
+                params.medias = [];
+                for (const reference of references) params.medias.push({ value: await resolveReference(reference), role: 'image_references' });
+            }
             const estimateTool = kind === 'image' ? 'estimate_image_cost' : 'estimate_audio_cost';
             let estimate = null;
             try {
@@ -436,11 +568,13 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             }
 
             const id = newId();
-            store.insert({ id, day: usage.day, month: usage.day.slice(0, 7), tool: attempt.tool, kind, model: params.model, params: publicParams(params), estimated: cost, status: 'submitting', requestedBy, summary: attempt.summary });
+            // `record`: what the gateway keeps about the request beyond what is sent (headline, edit source).
+            store.insert({ id, day: usage.day, month: usage.day.slice(0, 7), tool: attempt.tool, kind, model: params.model, params: { ...publicParams(params), ...(attempt.record ?? {}) }, estimated: cost, status: 'submitting', requestedBy, summary: attempt.summary, logoCorner: attempt.logoCorner ?? null });
             const deadline = now() + settings.jobTimeoutSec * 1000;
             let answer;
             try {
-                answer = await higgsfield.call(attempt.tool, { params, context: 'Kulüp sosyal medya içeriği için tek üretim.' });
+                // edit_image is gpt_image_2_6 image-to-image: Higgsfield's generate_image with the image as a reference.
+                answer = await higgsfield.call(attempt.higgsfieldTool ?? attempt.tool, { params, context: 'Kulüp sosyal medya içeriği için tek üretim.' });
             } catch (error) {
                 // Sent, but no answer: it may have run. Counted, never sent again.
                 store.update(id, { status: 'unknown', reason: String(error.message).slice(0, 300) });
@@ -484,10 +618,15 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
      */
     function approvalHint(tool, args = {}) {
         const hint = {};
-        if (tool === 'generate_image') {
-            const model = settings.imageModels.includes(args.model) ? args.model : DEFAULT_IMAGE_MODEL;
+        if (tool === 'generate_image' || tool === 'edit_image') {
+            const model = tool === 'edit_image' ? EDIT_MODEL : settings.imageModels.includes(args.model) ? args.model : DEFAULT_IMAGE_MODEL;
             const resolution = ['1k', '2k', '4k'].includes(args.resolution) ? args.resolution : args.yuksek_cozunurluk === true ? '2k' : DEFAULT_IMAGE_RESOLUTION;
-            const aspect = (args.platform && settings.platformAspectRatios[args.platform]) || (typeof args.aspect_ratio === 'string' ? args.aspect_ratio : '1:1');
+            let sourceAspect = null;
+            if (tool === 'edit_image' && typeof args.generation_id === 'string') {
+                const source = store.get(args.generation_id);
+                sourceAspect = source?.params ? JSON.parse(source.params).aspect_ratio ?? null : null;
+            }
+            const aspect = (args.platform && settings.platformAspectRatios[args.platform]) || (typeof args.aspect_ratio === 'string' ? args.aspect_ratio : sourceAspect ?? '1:1');
             hint.aspect_ratio = aspect;
             hint.resolution = resolution;
             const seen = store.recentEstimates('image', model).find((row) => {
@@ -535,7 +674,8 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             }
             // 'sending' first: a crash mid-send never sends twice.
             if (!store.markNotify(row.id, 'waiting', 'sending')) continue;
-            const media = row.status === 'completed' && row.file ? { file: row.file, mime: row.mime } : {};
+            const shown = row.status === 'completed' && row.file ? deliverable(row) : null;
+            const media = shown ? { file: shown.file, mime: shown.mime } : {};
             let result;
             try {
                 result = await notify({ requestedBy: row.requested_by, text: readyText(row), ...media });
@@ -564,7 +704,8 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
     // Shown on the WhatsApp approval card (the Hermes plugin echo_onay_tr) and in the "ready" message of a
     // late generation. Display only: it never reaches Higgsfield or TryPost.
     const ozetProp = { type: 'string', maxLength: 200, description: 'Kullanıcıya gösterilecek tek satırlık Türkçe özet (ör. "8 Mart Dünya Kadınlar Günü afişi"). Onay mesajında ve "hazır" bildiriminde görünür; her zaman doldur.' };
-    const generationIdProp = { type: 'string', description: 'generate_image / generate_audio sonucundaki generation_id (gen_…).' };
+    const generationIdProp = { type: 'string', description: 'generate_image / edit_image / generate_audio sonucundaki generation_id (gen_…).' };
+    const logosuzProp = { type: 'boolean', description: 'true: add_logo ile eklenen logodan önceki asıl hali kullan. Varsayılan: logolu hali varsa o.' };
 
     const tools = [
         {
@@ -591,7 +732,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         {
             name: 'get_original_file',
             description: "Üretilen dosyanın asıl halini (sıkıştırılmamış) WhatsApp'ta belge olarak göndermek için yolunu verir. Kredi harcamaz.",
-            inputSchema: { type: 'object', properties: { generation_id: generationIdProp }, required: ['generation_id'], additionalProperties: false },
+            inputSchema: { type: 'object', properties: { generation_id: generationIdProp, logosuz: logosuzProp }, required: ['generation_id'], additionalProperties: false },
             annotations: { title: 'Asıl dosya', readOnlyHint: true, openWorldHint: false },
             handler: (args) => originalFile(args),
         },
@@ -602,14 +743,19 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             inputSchema: {
                 type: 'object',
                 properties: {
-                    prompt: { type: 'string', description: 'Marka kitine uygun, ayrıntılı görsel tarifi (İngilizce ya da Türkçe). Görselde yazı/logo istemekten kaçın; logo için boş köşe bırak.', maxLength: 4000 },
+                    prompt: { type: 'string', description: 'Marka kitine uygun, ayrıntılı görsel tarifi (İngilizce daha iyi): sahne, kompozisyon, renkler, yazının nerede duracağı. Başlık ve alt metni burada değil baslik/alt_metin alanlarında ver; geçit onları sabit bir kalıpla ekler.', maxLength: 4000 },
+                    baslik: { type: 'string', maxLength: BASLIK_MAX, description: 'Afişin Türkçe başlığı, görselde aynen yazılacak metin (ör. "8 Mart Dünya Kadınlar Günü"). Türkçe karakterleri doğru yaz. Verilirse görsele küçük harflerle "Marmara Yapay Zeka Kulübü" de yazılır.' },
+                    alt_metin: { type: 'string', maxLength: ALT_METIN_MAX, description: 'İsteğe bağlı kısa alt satır (tarih, yer, slogan), görselde aynen yazılır. baslik ile birlikte verilir.' },
+                    logo: { type: 'boolean', description: 'Varsayılan true (afişler için): gerçek kulüp logosu modele referans olarak verilir ve logo_konum köşesine yerleştirilmesi istenir. Sadece logosuz görsel istenirse false.' },
+                    logo_konum: { type: 'string', enum: LOGO_CORNERS, description: `Logonun köşesi (varsayılan ${DEFAULT_LOGO_CORNER}: sağ alt). Yazı bu köşeden uzak tutulur.` },
+                    logo_zemin: { type: 'string', enum: ['koyu', 'acik'], description: 'Logo köşesinin zemini: koyu (lacivert/koyu; beyaz yazılı logo, varsayılan) ya da acik (açık zemin; lacivert yazılı logo).' },
                     platform: { type: 'string', enum: platformKeys, description: `Hedef platform; oranı belirler (${platformKeys.map((key) => `${key} ${settings.platformAspectRatios[key]}`).join(', ')}).` },
                     aspect_ratio: { type: 'string', enum: aspectRatios, description: 'Platform verilmediyse en-boy oranı.' },
                     model: { type: 'string', enum: settings.imageModels, description: `Varsayılan ${DEFAULT_IMAGE_MODEL}. ${settings.imageModels.map((model) => `${model}: ${IMAGE_MODELS[model].label}`).join('; ')}.` },
                     resolution: { type: 'string', enum: ['1k', '2k', '4k'], description: 'Varsayılan 1k (sosyal medya için yeterli, en ucuzu). 2k sadece kullanıcı baskı, büyük ekran ya da "yüksek çözünürlük" derse; 4k sadece nano_banana_2_1 ile ve kullanıcı açıkça 4k isterse.' },
                     yuksek_cozunurluk: { type: 'boolean', description: 'true: 2k üret (resolution "2k" ile aynı). Sadece kullanıcı baskı, büyük ekran ya da "yüksek çözünürlük" isterse.' },
                     style: { type: 'string', enum: IMAGE_MODELS.recraft_v4_1.styles, description: 'Sadece recraft_v4_1: standard, vector (logo/ikon/tipografi), utility, utility_vector.' },
-                    reference_image: { type: 'string', description: 'İsteğe bağlı referans: "logo" ya da "logo-dark" (kulüp logosu), önceki bir üretim (gen_…) ya da kullanıcının gönderdiği görselin yolu (/opt/data/cache/images/…).' },
+                    reference_image: { type: 'string', description: 'İsteğe bağlı ek referans (stil ya da içerik için): önceki bir üretim (gen_…) ya da kullanıcının gönderdiği görselin yolu (/opt/data/cache/images/…). Logo için bunu değil logo alanını kullan.' },
                     ozet: ozetProp,
                     requested_by: requestedByProp,
                 },
@@ -618,6 +764,47 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             },
             annotations: { title: 'Görsel üret (kredi harcar)', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
             handler: (args) => generateImage(args),
+        },
+        {
+            name: 'edit_image',
+            description:
+                'Var olan bir görseli gpt_image_2_6 ile DÜZENLER (görselden görsele): önceki bir üretim (generation_id) ya da kullanıcının WhatsApp’tan gönderdiği görsel (kaynak_gorsel). Talimatta neyin değişeceğini yaz (Türkçe ya da İngilizce); geri kalan korunur. Yeni bir üretimdir: kredi harcar (1k yaklaşık 1,5), aynı sınırlar ve onay geçerli. "ozet" alanını doldur. Başarısız olursa kendiliğinden tekrar deneme.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    generation_id: { type: 'string', description: 'Düzenlenecek önceki üretim (gen_…).' },
+                    kaynak_gorsel: { type: 'string', description: 'generation_id yerine: kullanıcının gönderdiği görselin yolu (/opt/data/cache/images/…).' },
+                    talimat: { type: 'string', maxLength: 2000, description: 'Ne değişecek (ör. "başlığı \'Yapay Zeka Atölyesi\' yap", "arka planı lacivert yap", "sağ alttaki logoyu düzelt"). Yeni yazı varsa aynen ve Türkçe karakterleriyle yaz.' },
+                    logo: { type: 'boolean', description: 'Gerçek kulüp logosu referans olarak verilsin mi. Varsayılan: kaynak üretimde logo varsa true. Logo düzeltilecekse true.' },
+                    logo_konum: { type: 'string', enum: LOGO_CORNERS, description: 'Logonun köşesi (varsayılan kaynak üretimdeki ya da sağ alt).' },
+                    logo_zemin: { type: 'string', enum: ['koyu', 'acik'], description: 'Logo köşesinin zemini (varsayılan koyu).' },
+                    platform: { type: 'string', enum: platformKeys, description: 'İsteğe bağlı: başka orana çevirmek için. Verilmezse kaynağın oranı korunur.' },
+                    yuksek_cozunurluk: { type: 'boolean', description: 'true: 2k. Sadece kullanıcı açıkça isterse.' },
+                    ozet: ozetProp,
+                    requested_by: requestedByProp,
+                },
+                required: ['talimat'],
+                additionalProperties: false,
+            },
+            annotations: { title: 'Görseli düzenle (kredi harcar)', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+            handler: (args) => editImage(args),
+        },
+        {
+            name: 'add_logo',
+            description:
+                'Önceki bir görsele gerçek kulüp logosunu (PNG) birebir ekler; model çizmez, kredi harcamaz. Logo zeminin açık/koyu olmasına göre otomatik seçilir, görsel genişliğinin ~%12’si kadar. Modelin çizdiği logo bozuk çıktıysa ("logoyu düzelt") kullan. Asıl görsel değişmez; logolu hali ayrı saklanır ve önizleme, asıl dosya ve TryPost’a ekleme onu kullanır.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    generation_id: generationIdProp,
+                    konum: { type: 'string', enum: LOGO_CORNERS, description: 'Köşe: alt-sag (varsayılan ya da üretimdeki köşe), alt-sol, ust-sag, ust-sol.' },
+                    ozet: ozetProp,
+                },
+                required: ['generation_id'],
+                additionalProperties: false,
+            },
+            annotations: { title: 'Logo ekle (kredi harcamaz)', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            handler: (args) => addLogo(args),
         },
         {
             name: 'generate_audio',
@@ -651,6 +838,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
                     post_id: { type: 'string', description: 'Görselin ekleneceği TryPost gönderisinin id’si (taslak).' },
                     social_account_id: { type: 'string', description: 'post_id yoksa: yeni taslağın hesabı (TryPost araçlarından alınan social_account_id).' },
                     content: { type: 'string', description: 'post_id yoksa: yeni taslağın metni (isteğe bağlı).', maxLength: 10000 },
+                    logosuz: logosuzProp,
                     ozet: ozetProp,
                 },
                 required: ['generation_id'],
@@ -671,7 +859,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         const ratios = Object.entries(settings.platformAspectRatios)
             .map(([key, ratio]) => `${key}: ${ratio}`)
             .join(', ');
-        return `${text.trim()}\n\n---\nGeçitteki ayarlar: platform oranları ${ratios}. Logo referansı için reference_image "logo" ya da "logo-dark".`;
+        return `${text.trim()}\n\n---\nGeçitteki ayarlar: platform oranları ${ratios}. generate_image: baslik/alt_metin görsele aynen yazılır; logo (varsayılan true) gerçek logo dosyasını referans verir, logo_konum köşesine (${LOGO_CORNERS.join(', ')}). Logo bozuk çıkarsa add_logo (kredi harcamaz). Düzeltme için edit_image.`;
     }
 
     function usageText() {
@@ -711,15 +899,16 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         return MESSAGES.notReady;
     }
 
-    function originalFile({ generation_id: id }) {
+    function originalFile({ generation_id: id, logosuz }) {
         const row = requireGeneration(id);
         if (row.status !== 'completed' || !row.file) refuse(MESSAGES.notReady);
-        const path = exposeToHermes(row, '-original');
+        const shown = deliverable(row, { original: logosuz === true });
+        const path = exposeToHermes(row, shown.final ? '-final' : '-original', shown.file);
         return [
             'Asıl dosyayı belge olarak göndermek için cevabına ayrı satırlarda aynen şunları yaz:',
             `MEDIA:${path}`,
             '[[as_document]]',
-            `(${row.mime}, ${(row.bytes / MB).toFixed(1)} MB; belge olarak gönderilen dosya WhatsApp'ta sıkıştırılmaz.)`,
+            `(${shown.mime}, ${(shown.bytes / MB).toFixed(1)} MB${shown.final ? ', gerçek kulüp logosu eklenmiş hali; logosuz hali için logosuz: true' : ''}; belge olarak gönderilen dosya WhatsApp'ta sıkıştırılmaz.)`,
         ].join('\n');
     }
 
@@ -742,9 +931,21 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         const resolution = args.resolution ?? (args.yuksek_cozunurluk === true ? '2k' : DEFAULT_IMAGE_RESOLUTION);
         if (!spec.resolutions.includes(resolution)) refuseAttempt(attempt, `${model} için çözünürlük ${spec.resolutions.join(' / ')} olabilir.`);
         if (args.reference_image && !spec.references) refuseAttempt(attempt, `${model} referans görsel almıyor; referans için gpt_image_2_6 ya da nano_banana_2_1 kullan.`);
+        const baslik = posterText(args.baslik);
+        const altMetin = posterText(args.alt_metin);
+        if (baslik.length > BASLIK_MAX) refuseAttempt(attempt, `Başlık çok uzun (en fazla ${BASLIK_MAX} karakter); afişte kısa başlık daha iyi okunur.`);
+        if (altMetin.length > ALT_METIN_MAX) refuseAttempt(attempt, `Alt metin çok uzun (en fazla ${ALT_METIN_MAX} karakter).`);
+        if (altMetin && !baslik) refuseAttempt(attempt, 'alt_metin için baslik da ver.');
+        const corner = args.logo_konum ?? DEFAULT_LOGO_CORNER;
+        if (!LOGO_CORNERS.includes(corner)) refuseAttempt(attempt, `logo_konum ${LOGO_CORNERS.join(', ')} olabilir.`);
+        // The real logo goes to the model as a reference: only models that take references (not Recraft).
+        const logo = args.logo !== false && spec.references;
+        if (args.logo === true && !spec.references) refuseAttempt(attempt, `${model} referans görsel almadığı için logoyu veremiyorum; gpt_image_2_6 kullan ya da sonra add_logo ile ekle.`);
+        const logoCorner = logo ? corner : null;
 
         // Built here from the allowlist: nothing else Hermes sends reaches Higgsfield.
-        const params = { model, prompt, aspect_ratio: aspect, batch_size: 1, count: 1, use_unlim: settings.allowUnlim };
+        const fullPrompt = buildImagePrompt({ prompt, baslik: baslik || null, altMetin: altMetin || null, logoCorner });
+        const params = { model, prompt: fullPrompt, aspect_ratio: aspect, batch_size: 1, count: 1, use_unlim: settings.allowUnlim };
         if (settings.allowFreeGens) params.use_free_gens = true;
         if (model === 'gpt_image_2_6') Object.assign(params, { quality: 'high', resolution, output_format: settings.imageFormat });
         if (model === 'nano_banana_2_1') params.resolution = resolution;
@@ -753,7 +954,101 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             if (!spec.styles.includes(style)) refuseAttempt(attempt, `recraft_v4_1 stili ${spec.styles.join(', ')} olabilir.`);
             Object.assign(params, { resolution, model_type: style, colors: settings.brandColors.slice(0, 10) });
         }
-        return generate({ ...attempt, params, reference: args.reference_image ?? null });
+        const references = [];
+        if (args.reference_image) references.push(args.reference_image);
+        if (logo) references.push(logoVariant(args.logo_zemin));
+        const record = baslik ? { poster: { baslik, ...(altMetin ? { alt_metin: altMetin } : {}) } } : {};
+        return generate({ ...attempt, params, references, logoCorner, record });
+    }
+
+    /** The logo file for the background of its corner: logo-dark.png (light lettering) on dark, logo.png on light. */
+    const logoVariant = (zemin) => (zemin === 'acik' ? 'logo' : 'logo-dark');
+
+    async function editImage(args) {
+        const model = EDIT_MODEL;
+        const spec = IMAGE_MODELS[model];
+        const attempt = { tool: 'edit_image', higgsfieldTool: 'generate_image', kind: 'image', model, requestedBy: personBucket(args.requested_by, settings.people), summary: summaryOf(args.ozet) };
+        if (!settings.imageModels.includes(model)) refuseAttempt(attempt, MESSAGES.unknownModel(settings.imageModels.join(', ')));
+        const talimat = String(args.talimat ?? '').normalize('NFC').trim();
+        if (!talimat) refuseAttempt(attempt, 'Düzenleme talimatı boş; neyin değişeceğini yaz.');
+        if (talimat.length > 2000) refuseAttempt(attempt, 'Talimat çok uzun (en fazla 2000 karakter).');
+        if (Boolean(args.generation_id) === Boolean(args.kaynak_gorsel)) refuseAttempt(attempt, MESSAGES.editSource);
+
+        let source;
+        let aspect = null;
+        let sourceCorner = null;
+        if (args.generation_id) {
+            const row = store.get(String(args.generation_id));
+            if (!row || row.kind !== 'image' || row.status !== 'completed' || !row.job_id) refuseAttempt(attempt, MESSAGES.editSource);
+            source = row.id;
+            aspect = row.params ? JSON.parse(row.params).aspect_ratio ?? null : null;
+            if (!aspect && row.width) aspect = nearestAspect(row.width, row.height, spec.aspectRatios);
+            sourceCorner = row.logo_corner;
+        } else {
+            const value = String(args.kaynak_gorsel);
+            if (!value.startsWith('/')) refuseAttempt(attempt, MESSAGES.editSource);
+            source = userImagePath(value);
+            let size = null;
+            try {
+                size = imageSize(readFileSync(source));
+            } catch {
+                size = null;
+            }
+            if (size) aspect = nearestAspect(size.width, size.height, spec.aspectRatios);
+        }
+        if (args.platform) {
+            aspect = settings.platformAspectRatios[args.platform];
+            if (!aspect) refuseAttempt(attempt, `Bilinmeyen platform. Seçenekler: ${platformKeys.join(', ')}.`);
+        }
+        aspect ??= '1:1';
+        if (!spec.aspectRatios.includes(aspect)) aspect = nearestAspect(...aspect.split(':').map(Number), spec.aspectRatios);
+        const corner = args.logo_konum ?? sourceCorner ?? DEFAULT_LOGO_CORNER;
+        if (!LOGO_CORNERS.includes(corner)) refuseAttempt(attempt, `logo_konum ${LOGO_CORNERS.join(', ')} olabilir.`);
+        const logo = args.logo ?? Boolean(sourceCorner);
+        const logoCorner = logo ? corner : null;
+        const resolution = args.yuksek_cozunurluk === true ? '2k' : DEFAULT_IMAGE_RESOLUTION;
+
+        const params = { model, prompt: buildEditPrompt({ talimat, logoCorner }), aspect_ratio: aspect, batch_size: 1, count: 1, use_unlim: settings.allowUnlim, quality: 'high', resolution, output_format: settings.imageFormat };
+        if (settings.allowFreeGens) params.use_free_gens = true;
+        const references = [source];
+        if (logo) references.push(logoVariant(args.logo_zemin));
+        const record = { edit: { source: args.generation_id ? source : 'kullanici-gorseli', talimat: talimat.slice(0, 300) } };
+        return generate({ ...attempt, params, references, logoCorner, record });
+    }
+
+    // Per generation: one add_logo at a time.
+    const composing = new Set();
+
+    async function addLogo({ generation_id: id, konum }) {
+        const row = requireGeneration(id);
+        if (row.kind !== 'image') refuse(MESSAGES.notImage);
+        if (row.status !== 'completed' || !row.file) refuse(MESSAGES.notReady);
+        if (!compositor) refuse(MESSAGES.noCompositor);
+        const corner = konum ?? row.logo_corner ?? DEFAULT_LOGO_CORNER;
+        if (!LOGO_CORNERS.includes(corner)) refuse(`konum ${LOGO_CORNERS.join(', ')} olabilir.`);
+        const original = readFileSync(row.file);
+        if (createHash('sha256').update(original).digest('hex') !== row.sha256) refuse(MESSAGES.integrity);
+        const size = row.width && row.height ? { width: row.width, height: row.height } : imageSize(original);
+        if (!size) refuse(MESSAGES.logoFailed);
+        if (composing.has(row.id)) refuse(MESSAGES.busy);
+        composing.add(row.id);
+        let made;
+        try {
+            // Always from the untouched original, so a second add_logo (another corner) never stacks logos.
+            made = await compositor.apply({ input: row.file, output: join(settings.originalsDir, `${row.id}-final.png`), width: size.width, height: size.height, corner });
+        } catch (error) {
+            log('warn', 'studio add_logo failed', row.id, error.message);
+            refuse(MESSAGES.logoFailed);
+        } finally {
+            composing.delete(row.id);
+        }
+        store.update(row.id, { logoCorner: corner, finalFile: made.file, finalBytes: made.bytes, finalSha256: made.sha256, finalVariant: made.variant });
+        log('info', 'studio logo composited', row.id, corner, made.variant);
+        const updated = store.get(row.id);
+        const lines = [`Gerçek kulüp logosu eklendi (${CORNER_NAMES[corner]} köşe, ${made.variant === 'logo-dark' ? 'koyu zemin için açık renkli' : 'açık zemin için lacivert'} logo). Kredi harcanmadı. generation_id: ${row.id}`];
+        if (made.bytes <= settings.whatsappPreviewMaxMb * MB) lines.push('Kullanıcıya göstermek için cevabına ayrı bir satırda aynen şunu yaz:', `MEDIA:${exposeToHermes(updated, '-final-preview', made.file)}`);
+        lines.push('Bundan sonra önizleme, get_original_file ve attach_to_trypost logolu hali kullanır; logosuz asıl hali saklı (logosuz: true).');
+        return lines.join('\n');
     }
 
     async function generateAudio(args) {
@@ -788,7 +1083,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
     const SAFE_ID = /^[A-Za-z0-9-]{1,64}$/;
 
     // ozet is display-only (the approval card); it is accepted and ignored here.
-    async function attachToTryPost({ generation_id: id, post_id: postId, social_account_id: accountId, content }) {
+    async function attachToTryPost({ generation_id: id, post_id: postId, social_account_id: accountId, content, logosuz }) {
         const row = requireGeneration(id);
         if (row.kind !== 'image') {
             store.addAttachment({ generationId: row.id, project: settings.project ?? '-', status: 'refused', reason: 'audio' });
@@ -796,9 +1091,11 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         }
         if (!trypost || !settings.project) refuse(MESSAGES.noProject);
         if (row.status !== 'completed' || !row.file) refuse(MESSAGES.notReady);
-        const bytes = readFileSync(row.file);
+        // The final (real logo composited by add_logo) when there is one, else the original; byte for byte.
+        const shown = deliverable(row, { original: logosuz === true });
+        const bytes = readFileSync(shown.file);
         const sha256 = createHash('sha256').update(bytes).digest('hex');
-        if (sha256 !== row.sha256) refuse(MESSAGES.integrity);
+        if (sha256 !== shown.sha256) refuse(MESSAGES.integrity);
         const limitMb = trypost.imageLimitMb ?? TRYPOST_IMAGE_MB;
         if (bytes.length > limitMb * MB) refuse(`Dosya ${(bytes.length / MB).toFixed(1)} MB; TryPost en fazla ${limitMb} MB görsel kabul ediyor. 2k çözünürlükte yeniden üretmeyi öner.`);
         if (postId !== undefined && !SAFE_ID.test(String(postId))) refuse(MESSAGES.postScope);
@@ -817,10 +1114,10 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             }
         }
 
-        const filename = `${row.id}${extname(row.file)}`;
+        const filename = `${row.id}${shown.final ? '-logo' : ''}${extname(shown.file)}`;
         let upload;
         try {
-            upload = await trypost.uploadMedia({ file: new Blob([bytes], { type: row.mime }), filename, mimeType: row.mime });
+            upload = await trypost.uploadMedia({ file: new Blob([bytes], { type: shown.mime }), filename, mimeType: shown.mime });
         } catch (error) {
             store.addAttachment({ generationId: row.id, project: settings.project, postId: postId ?? null, sha256, status: 'failed', reason: String(error.message).slice(0, 300) });
             if (error.status === 422) refuse(`TryPost dosyayı kabul etmedi: ${String(error.message).replace(/^.*?:\s*/, '').slice(0, 160)}`);
@@ -845,8 +1142,8 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         store.addAttachment({ generationId: row.id, project: settings.project, postId: finalId, createdPost: postId === undefined, sha256, status: 'attached' });
         log('info', 'studio image attached to TryPost', row.id, String(finalId));
         const what = postId !== undefined ? 'gönderiye eklendi' : `yeni taslak oluşturuldu (post_id: ${finalId})`;
-        const note = row.mime === 'image/png' ? ' Not: TryPost PNG dosyaları kendi tarafında JPEG’e (kalite 100, aynı boyut) çeviriyor.' : '';
-        return `Görselin asıl dosyası (${row.mime}, ${(bytes.length / MB).toFixed(1)} MB, sha256 ${sha256.slice(0, 12)}…) WhatsApp’tan geçmeden TryPost’a yüklendi ve ${what}.${note}`;
+        const note = shown.mime === 'image/png' ? ' Not: TryPost PNG dosyaları kendi tarafında JPEG’e (kalite 100, aynı boyut) çeviriyor.' : '';
+        return `Görselin ${shown.final ? 'logolu ' : ''}asıl dosyası (${shown.mime}, ${(bytes.length / MB).toFixed(1)} MB, sha256 ${sha256.slice(0, 12)}…) WhatsApp’tan geçmeden TryPost’a yüklendi ve ${what}.${note}`;
     }
 
     return {

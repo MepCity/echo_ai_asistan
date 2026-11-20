@@ -66,6 +66,29 @@ describe('approval card: studio tools', { skip }, () => {
         assert.equal(one('studio', 'attach_to_trypost', { generation_id: 'gen_1', post_id: 'p-1', ozet: '8 Mart afişi' }), "📎 Üretilen görsel TryPost'taki gönderiye eklenecek\nKonu: 8 Mart afişi");
         assert.equal(one('studio', 'attach_to_trypost', { generation_id: 'gen_1', social_account_id: 'a', content: 'Yeni etkinlik!' }), "📝 Üretilen görselle TryPost'ta yeni taslak oluşturulacak\nMetin: “Yeni etkinlik!”");
     });
+
+    it('add_logo: no credits, the corner in Turkish', () => {
+        assert.equal(one('studio', 'add_logo', { generation_id: 'gen_1' }), '🏷️ Görsele kulüp logosu eklenecek (kredi harcamaz)');
+        assert.equal(one('studio', 'add_logo', { generation_id: 'gen_1', konum: 'ust-sol', ozet: '8 Mart afişi' }), '🏷️ Görsele kulüp logosu eklenecek (kredi harcamaz)\nKöşe: sol üst\nKonu: 8 Mart afişi');
+    });
+
+    it('edit_image: credits from the hint, the change, the source when it is a sent picture', () => {
+        assert.equal(
+            one('studio', 'edit_image', { generation_id: 'gen_1', talimat: 'Başlığı “Yapay Zeka Atölyesi” yap', ozet: 'Atölye afişi düzeltmesi' }, { aspect_ratio: '4:5', credits: 1.5, resolution: '1k' }),
+            '✏️ Görsel düzenlenecek · yaklaşık 1.5 kredi\nDeğişiklik: “Başlığı “Yapay Zeka Atölyesi” yap”\nKonu: Atölye afişi düzeltmesi',
+        );
+        assert.equal(
+            one('studio', 'edit_image', { kaynak_gorsel: '/opt/data/cache/images/a.jpg', talimat: 'arka planı lacivert yap', yuksek_cozunurluk: true }, { credits: 2.75, resolution: '2k' }),
+            '✏️ Görsel düzenlenecek · yüksek çözünürlük · yaklaşık 2.75 kredi\nDeğişiklik: “arka planı lacivert yap”\nKaynak: gönderdiğin görsel',
+        );
+    });
+
+    it('generate_image shows the exact headline', () => {
+        assert.equal(
+            one('studio', 'generate_image', { prompt: 'p', platform: 'instagram', baslik: '8 Mart Dünya Kadınlar Günü', ozet: '8 Mart afişi' }, { aspect_ratio: '4:5', credits: 1.5, resolution: '1k' }),
+            '🎨 Görsel üretilecek · Instagram (4:5) · yaklaşık 1.5 kredi\nKonu: 8 Mart afişi\nBaşlık: “8 Mart Dünya Kadınlar Günü”',
+        );
+    });
 });
 
 describe('approval card: TryPost tools', { skip }, () => {

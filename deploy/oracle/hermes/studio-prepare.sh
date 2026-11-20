@@ -41,6 +41,20 @@ if [ ! -e "$BRAND_KIT" ]; then
   echo "Marka kiti olusturuldu: $BRAND_KIT (duzenleyebilirsin; guncellemeler uzerine yazmaz)."
 fi
 [ -f "$BRAND_KIT" ] || fail "$BRAND_KIT normal bir dosya degil; kaldirip tekrar calistir."
+# The VM's copy is never overwritten. When the shipped kit has a newer "brand-kit-version" line
+# (top of deploy/oracle/brand-kit.md), say so; a kit without the line counts as version 1.
+kit_version() { sed -n 's/.*brand-kit-version: *\([0-9][0-9]*\).*/\1/p' "$1" | head -n 1; }
+SHIPPED_KIT_VERSION=$(kit_version "$APP/deploy/oracle/brand-kit.md")
+VM_KIT_VERSION=$(kit_version "$BRAND_KIT")
+if [ "${SHIPPED_KIT_VERSION:-1}" -gt "${VM_KIT_VERSION:-1}" ]; then
+  cat <<NOTE
+NOT: Marka kitinin yeni surumu var (sunucudaki surum ${VM_KIT_VERSION:-1}, yeni surum $SHIPPED_KIT_VERSION).
+     $BRAND_KIT kendiliginden degistirilmez. Farklara bak:
+       diff $BRAND_KIT $APP/deploy/oracle/brand-kit.md
+     Kendi duzenlemen yoksa yenisini al (eskisi .bak olarak kalir):
+       cp $BRAND_KIT $BRAND_KIT.bak && cp $APP/deploy/oracle/brand-kit.md $BRAND_KIT
+NOTE
+fi
 # Made by install.sh before Echo first starts; checked here since studio mounts it too.
 [ -f "$ECHO_DIR/config.json" ] || fail "$ECHO_DIR/config.json dosya olarak yok (klasor ya da eksik). install.sh ile olustur, sonra tekrar calistir."
 

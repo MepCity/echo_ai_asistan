@@ -39,7 +39,7 @@ logger = logging.getLogger("echo_onay_tr")
 
 MARK = "__echo_onay_tr__"
 SERVERS = ("trypost", "studio")
-HINT_TOOLS = ("generate_image", "generate_audio")
+HINT_TOOLS = ("generate_image", "edit_image", "generate_audio")
 HINT_URL = os.environ.get("ECHO_STUDIO_HINT_URL", "http://studio:8091/approval-hint")
 HINT_TIMEOUT_S = 2.0
 DESCRIPTION = "Onaylarsan şimdi yapılır; Vazgeç'e basarsan hiçbir şey yapılmaz."

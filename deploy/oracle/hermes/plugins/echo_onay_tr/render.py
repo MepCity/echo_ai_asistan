@@ -320,7 +320,8 @@ def _generate_image(args, hint):
     resolution = clean(hint.get("resolution") or args.get("resolution") or ("2k" if args.get("yuksek_cozunurluk") is True else ""), 4)
     quality = "yüksek çözünürlük" if resolution in ("2k", "4k") else ""
     return [head("🎨", "Görsel üretilecek", where, quality, credits_text(hint.get("credits"))),
-            _konu(args, "prompt"), _reference(args.get("reference_image"))]
+            _konu(args, "prompt"), f"Başlık: {quoted(args.get('baslik'), 120)}" if args.get("baslik") else "",
+            _reference(args.get("reference_image"))]
 
 
 def _generate_audio(args, hint):
@@ -346,8 +347,27 @@ def _attach_to_trypost(args, hint):
     return lines
 
 
+CORNERS = {"alt-sag": "sağ alt", "alt-sol": "sol alt", "ust-sag": "sağ üst", "ust-sol": "sol üst"}
+
+
+def _edit_image(args, hint):
+    resolution = clean(hint.get("resolution") or ("2k" if args.get("yuksek_cozunurluk") is True else ""), 4)
+    quality = "yüksek çözünürlük" if resolution in ("2k", "4k") else ""
+    source = "Kaynak: gönderdiğin görsel" if clean(args.get("kaynak_gorsel"), 300).startswith("/") else ""
+    return [head("✏️", "Görsel düzenlenecek", quality, credits_text(hint.get("credits"))),
+            f"Değişiklik: {quoted(args.get('talimat'), 150)}", _konu(args), source]
+
+
+def _add_logo(args, hint):
+    corner = CORNERS.get(clean(args.get("konum"), 10), "")
+    return [head("🏷️", "Görsele kulüp logosu eklenecek (kredi harcamaz)"),
+            f"Köşe: {corner}" if corner else "", _konu(args)]
+
+
 STUDIO = {
     "generate_image": _generate_image,
+    "edit_image": _edit_image,
+    "add_logo": _add_logo,
     "generate_audio": _generate_audio,
     "attach_to_trypost": _attach_to_trypost,
 }

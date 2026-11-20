@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { loadConfig } from '../config.js';
 import { createTryPostProject } from '../projects/trypost.js';
+import { createLogoCompositor } from './compose.js';
 import { normalizeStudio } from './config.js';
 import { createStudioGateway } from './gateway.js';
 import { createStudioNotifier } from './notify.js';
@@ -38,7 +39,9 @@ if (settings.project) {
 // A generation that finishes after its call answered "still preparing" is pushed to the person who
 // asked (config.json people[].phone), with Echo's own WhatsApp credentials; see notify.js.
 const notify = createStudioNotifier({ whatsapp: createWhatsAppClient(config.whatsapp), people: config.people, allowedPeople: config.assistant?.allowedPeople ?? null, log });
-const gateway = createStudioGateway({ settings, store, higgsfield, auth, trypost, log, notify });
+// add_logo: the real logo PNG composited with ImageMagick (magick/convert via execFile, no shell).
+const compositor = createLogoCompositor({ logoDir: settings.logoDir });
+const gateway = createStudioGateway({ settings, store, higgsfield, auth, trypost, log, notify, compositor });
 const server = createStudioServer({ gateway, token: process.env.ECHO_STUDIO_TOKEN, log });
 // Jobs still running when their generate call answered "still preparing": finish them (or mark
 // them 'unknown' past studio.pendingStaleMin) even if nobody asks with get_generation.

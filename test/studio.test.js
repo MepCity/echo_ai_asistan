@@ -7,7 +7,8 @@ import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { normalizeConfig } from '../src/config.js';
 import { normalizeStudio } from '../src/studio/config.js';
-import { MESSAGES, createStudioGateway, dayOf } from '../src/studio/gateway.js';
+import { CLUB_NAME, MESSAGES, buildEditPrompt, buildImagePrompt, createStudioGateway, dayOf, nearestAspect, posterText } from '../src/studio/gateway.js';
+import { LOGO_CORNERS, createLogoCompositor, logoBox, variantFor } from '../src/studio/compose.js';
 import { answerExcerpt, createHiggsfieldClient, parseCompact, parseCredits, parseJob, parseJobIds, rawAnswer, redactForLog } from '../src/studio/higgsfield.js';
 import { DatabaseSync } from 'node:sqlite';
 import { rawAnswerOf, recoverGeneration } from '../src/studio/recover.js';
@@ -38,6 +39,8 @@ const PNG = (() => {
     return Buffer.concat([header, size, Buffer.from('0806000000', 'hex'), Buffer.alloc(5000, 7)]);
 })();
 const MP3 = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(3000, 3)]);
+const LOGO_MEDIA = '77777777-2222-4333-8444-555555555555';
+const CACHED_LOGO = '66666666-2222-4333-8444-555555555555';
 
 function echoConfig(dataDir) {
     return normalizeConfig({
@@ -93,6 +96,8 @@ function fakeHiggsfield({ estimate = 2.75, jobStatus = 'completed', resultUrl = 
                 };
             }
             if (name === 'media_import_url') return { text: 'media_id: 99999999-2222-4333-8444-555555555555', structured: null, isError: false };
+            if (name === 'media_upload') return { text: '', structured: { upload_url: `https://cdn.higgsfield.test/upload/${args.filename}`, media_id: LOGO_MEDIA }, isError: false };
+            if (name === 'media_confirm') return { text: `media_id: ${args.media_id}`, structured: null, isError: false };
             throw new Error(`unexpected call ${name}`);
         },
         generated: () => calls.filter((call) => call.name.startsWith('generate_')),
@@ -100,9 +105,14 @@ function fakeHiggsfield({ estimate = 2.75, jobStatus = 'completed', resultUrl = 
     return fake;
 }
 
-/** Fetch for result downloads and presigned uploads. */
-const downloadFetch = (bytes = PNG, type = 'image/png') => async (url) => {
+/** Fetch for result downloads and presigned uploads (PUTs are recorded in `puts`). */
+const puts = [];
+const downloadFetch = (bytes = PNG, type = 'image/png') => async (url, init = {}) => {
     assert.ok(String(url).startsWith('https://cdn.higgsfield.test/'));
+    if (init.method === 'PUT') {
+        puts.push({ url, bytes: Buffer.from(init.body) });
+        return new Response(null, { status: 200 });
+    }
     return new Response(bytes, { status: 200, headers: { 'content-type': type, 'content-length': String(bytes.length) } });
 };
 
@@ -128,13 +138,22 @@ function fakeTryPost({ posts = ['post-1'] } = {}) {
     };
 }
 
-function setup({ studio = {}, start = Date.parse('2026-11-20T09:00:00Z'), higgsfield = fakeHiggsfield(), fetchImpl = downloadFetch(), trypost = fakeTryPost(), notify = null } = {}) {
+/**
+ * `logoCached` (default): the logo media ids are already in studio.db, as after the first poster, so
+ * most tests see no logo upload. `compositor`: add_logo's (createLogoCompositor with a fake runner).
+ */
+function setup({ studio = {}, start = Date.parse('2026-11-20T09:00:00Z'), higgsfield = fakeHiggsfield(), fetchImpl = downloadFetch(), trypost = fakeTryPost(), notify = null, logoCached = true, compositor = null } = {}) {
     const dataDir = tempDir();
     const config = echoConfig(dataDir);
     const settings = normalizeStudio({ waitSliceSec: 1, ...studio }, config, { STUDIO_PREVIEW_DIR: join(dataDir, 'hermes-preview'), STUDIO_BRAND_KIT: join(dataDir, 'brand-kit.md') });
     const clock = { now: start };
     const store = createStudioStore(openStudioDatabase(':memory:'), () => clock.now);
-    const gateway = createStudioGateway({ settings, store, higgsfield, trypost, fetchImpl, sleep: async (ms) => (clock.now += ms), notify });
+    if (logoCached) {
+        for (const variant of ['logo', 'logo-dark']) {
+            store.setAsset(`logo:${variant}`, CACHED_LOGO, createHash('sha256').update(readFileSync(join(settings.logoDir, `${variant}.png`))).digest('hex'));
+        }
+    }
+    const gateway = createStudioGateway({ settings, store, higgsfield, trypost, fetchImpl, sleep: async (ms) => (clock.now += ms), notify, compositor });
     return { gateway, store, settings, higgsfield, trypost, clock, dataDir };
 }
 
@@ -145,7 +164,7 @@ describe('studio gateway: tools and allowlist', () => {
     it('lists only the studio tools, read-only ones marked readOnlyHint', () => {
         const { gateway } = setup();
         const names = gateway.tools.map((tool) => tool.name).sort();
-        assert.deepEqual(names, ['attach_to_trypost', 'generate_audio', 'generate_image', 'get_brand_kit', 'get_generation', 'get_original_file', 'studio_usage']);
+        assert.deepEqual(names, ['add_logo', 'attach_to_trypost', 'edit_image', 'generate_audio', 'generate_image', 'get_brand_kit', 'get_generation', 'get_original_file', 'studio_usage']);
         const readOnly = gateway.tools.filter((tool) => tool.annotations.readOnlyHint === true).map((tool) => tool.name).sort();
         assert.deepEqual(readOnly, ['get_brand_kit', 'get_generation', 'get_original_file', 'studio_usage']);
         for (const tool of gateway.tools) assert.ok(!/video/.test(tool.name));
@@ -610,11 +629,20 @@ describe('studio gateway: results, WhatsApp preview and TryPost', () => {
         assert.match(result.text, /^\[\[as_document\]\]$/m);
     });
 
-    it('uses the club logo as a reference through media_import_url', async () => {
-        const { gateway, higgsfield } = setup();
-        await image(gateway, { reference_image: 'logo' });
-        assert.deepEqual(higgsfield.calls[0], { name: 'media_import_url', args: { url: 'https://sosyal.marmaraai.com/marmara/logo.svg', type: 'image' } });
-        assert.deepEqual(higgsfield.generated()[0].args.params.medias, [{ value: '99999999-2222-4333-8444-555555555555', role: 'image_references' }]);
+    it('uploads the club logo PNG once (media_upload), caches its media id and reuses it; never a raw URL in medias', async () => {
+        const { gateway, higgsfield, clock, settings, store } = setup({ logoCached: false, studio: { limits: { cooldownSec: 0 } } });
+        puts.length = 0;
+        await image(gateway, { reference_image: 'logo', logo_zemin: 'koyu' });
+        assert.deepEqual(higgsfield.calls[0], { name: 'media_upload', args: { filename: 'logo.png', content_type: 'image/png' } });
+        assert.ok(puts[0].bytes.equals(readFileSync(join(settings.logoDir, 'logo.png'))), 'the real PNG bytes are uploaded');
+        assert.equal(higgsfield.calls.filter((item) => item.name === 'media_upload').length, 2, 'logo.png (reference) and logo-dark.png (the poster logo)');
+        assert.deepEqual(higgsfield.generated()[0].args.params.medias, [{ value: LOGO_MEDIA, role: 'image_references' }, { value: LOGO_MEDIA, role: 'image_references' }]);
+        assert.equal(store.getAsset('logo:logo-dark').media_id, LOGO_MEDIA);
+        clock.now += 1000;
+        await image(gateway);
+        assert.equal(higgsfield.calls.filter((item) => item.name === 'media_upload').length, 2, 'cached: no second upload');
+        for (const media of higgsfield.generated().flatMap((item) => item.args.params.medias ?? [])) assert.ok(!/^https?:/.test(media.value));
+        assert.ok(!higgsfield.calls.some((item) => item.name === 'media_import_url'));
     });
 
     it('refuses references outside the allowed places', async () => {
@@ -949,6 +977,255 @@ describe('studio: unmatched answers, raw copy and recovery', () => {
         assert.equal(store.get('gen_old').recovered_at, null);
         assert.equal(recoverGeneration(store, 'gen_old', JOB).ok, true);
         createStudioStore(openStudioDatabase(dir)); // opening again is a no-op
+    });
+});
+
+/**
+ * A fake ImageMagick: answers the brightness query with `brightness`, and for the composite writes the
+ * input bytes plus a marker to the png: output (same PNG header, so same size; a different sha256).
+ */
+function fakeMagick(brightness = 0.2) {
+    const calls = [];
+    const run = async (args) => {
+        assert.ok(Array.isArray(args) && args.every((arg) => typeof arg === 'string'), 'argument arrays only');
+        calls.push(args);
+        if (args.at(-1) === 'info:') return `${brightness}\n`;
+        const output = args.at(-1).replace(/^png:/, '');
+        writeFileSync(output, Buffer.concat([readFileSync(args[0]), Buffer.from('LOGO')]));
+        return '';
+    };
+    return { run, calls };
+}
+
+describe('studio: posters (headline by the model, real logo as reference)', () => {
+    it('buildImagePrompt appends the exact Turkish headline, subline, club name, typography and the logo corner', () => {
+        const prompt = buildImagePrompt({ prompt: 'Calm navy poster with soft gradient shapes.', baslik: '8 Mart Dünya Kadınlar Günü', altMetin: 'İstanbul’da çağ, ışık, öğün, şüphe', logoCorner: 'alt-sag' });
+        assert.ok(prompt.startsWith('Calm navy poster with soft gradient shapes.\n\n'));
+        assert.match(prompt, /^Headline text, exactly: "8 Mart Dünya Kadınlar Günü"$/m);
+        assert.match(prompt, /^Subline text \(smaller, below the headline\), exactly: "İstanbul’da çağ, ışık, öğün, şüphe"$/m);
+        assert.match(prompt, new RegExp(`^Small text, exactly: "${CLUB_NAME}"$`, 'm'));
+        assert.match(prompt, /ç ğ ı İ ö ş ü/);
+        assert.match(prompt, /sans-serif/);
+        assert.match(prompt, /bottom-right corner/);
+        assert.match(prompt, /last reference image is the official Marmara Yapay Zeka Kulübü logo/);
+        const plain = buildImagePrompt({ prompt: 'Abstract shapes.' });
+        assert.equal(plain, 'Abstract shapes.', 'no headline, no logo: the prompt as given');
+        assert.doesNotMatch(buildImagePrompt({ prompt: 'x', baslik: 'Başlık' }), /logo/i);
+    });
+
+    it('posterText: NFC Turkish letters, no control characters or double quotes', () => {
+        const decomposed = 'Güzel İşçi Öğün'.normalize('NFD'); // spelled with combining marks
+        assert.notEqual(decomposed, 'Güzel İşçi Öğün');
+        assert.equal(posterText(decomposed), 'Güzel İşçi Öğün');
+        assert.equal(posterText('  "Yapay‮ Zeka"\n Atölyesi '), "'Yapay Zeka' Atölyesi");
+    });
+
+    it('generate_image: headline and logo by default (logo PNG reference last), recorded for the result', async () => {
+        const { gateway, higgsfield, store } = setup();
+        const result = await image(gateway, { platform: 'instagram', baslik: '8 Mart Dünya Kadınlar Günü', alt_metin: 'Kadınların bilime katkısı', reference_image: 'gen_none' });
+        assert.match(result.text, /Referans olarak verilen üretimi bulamadım/);
+        const ok = await image(gateway, { platform: 'instagram', baslik: '8 Mart Dünya Kadınlar Günü', alt_metin: 'Kadınların bilime katkısı' });
+        assert.equal(ok.isError, false, ok.text);
+        const params = higgsfield.generated()[0].args.params;
+        assert.match(params.prompt, /^A clean modern poster for an AI workshop\n\n/);
+        assert.match(params.prompt, /Headline text, exactly: "8 Mart Dünya Kadınlar Günü"/);
+        assert.match(params.prompt, /Subline text .*"Kadınların bilime katkısı"/);
+        assert.deepEqual(params.medias, [{ value: CACHED_LOGO, role: 'image_references' }]);
+        assert.equal(params.baslik, undefined, 'only allowlisted fields reach Higgsfield');
+        const id = ok.text.match(/generation_id: (gen_\w+)/)[1];
+        assert.equal(store.get(id).logo_corner, 'alt-sag');
+        assert.deepEqual(JSON.parse(store.get(id).params).poster, { baslik: '8 Mart Dünya Kadınlar Günü', alt_metin: 'Kadınların bilime katkısı' });
+        assert.match(ok.text, /Görseldeki yazıyı kontrol et: başlık “8 Mart Dünya Kadınlar Günü”/);
+        assert.match(ok.text, /bir kez yeniden üretmeyi/);
+        assert.match(ok.text, /add_logo/);
+    });
+
+    it('logo:false sends no logo; logo_konum and logo_zemin pick the corner and the file; Recraft gets none', async () => {
+        const { gateway, higgsfield, store, clock } = setup({ studio: { limits: { cooldownSec: 0 } } });
+        store.setAsset('logo:logo', 'acik-logo-media', store.getAsset('logo:logo').sha256);
+        await image(gateway, { logo: false, baslik: 'Atölye' });
+        assert.equal(higgsfield.generated()[0].args.params.medias, undefined);
+        assert.doesNotMatch(higgsfield.generated()[0].args.params.prompt, /reference image/);
+        clock.now += 1000;
+        await image(gateway, { logo_konum: 'ust-sol', logo_zemin: 'acik' });
+        assert.deepEqual(higgsfield.generated()[1].args.params.medias, [{ value: 'acik-logo-media', role: 'image_references' }]);
+        assert.match(higgsfield.generated()[1].args.params.prompt, /top-left corner/);
+        clock.now += 1000;
+        assert.match((await image(gateway, { logo_konum: 'orta' })).text, /logo_konum/);
+        await image(gateway, { model: 'recraft_v4_1' });
+        assert.equal(higgsfield.generated()[2].args.params.medias, undefined);
+        assert.match((await image(gateway, { model: 'recraft_v4_1', logo: true })).text, /add_logo/);
+    });
+
+    it('refuses an over-long headline or a subline without a headline, without calling Higgsfield', async () => {
+        const { gateway, higgsfield } = setup();
+        assert.match((await image(gateway, { baslik: 'x'.repeat(121) })).text, /Başlık çok uzun/);
+        assert.match((await image(gateway, { alt_metin: 'Sadece alt' })).text, /baslik da ver/);
+        assert.equal(higgsfield.calls.length, 0);
+    });
+});
+
+describe('studio: logo compositing (add_logo)', () => {
+    it('logoBox: about 12% of the width, a 5% margin, in each corner', () => {
+        const box = (corner) => logoBox({ width: 1000, height: 1250, corner, logoWidth: 1024, logoHeight: 415 });
+        assert.deepEqual(box('alt-sag'), { x: 830, y: 1151, width: 120, height: 49 });
+        assert.deepEqual(box('alt-sol'), { x: 50, y: 1151, width: 120, height: 49 });
+        assert.deepEqual(box('ust-sag'), { x: 830, y: 50, width: 120, height: 49 });
+        assert.deepEqual(box('ust-sol'), { x: 50, y: 50, width: 120, height: 49 });
+        assert.deepEqual(LOGO_CORNERS, ['alt-sag', 'alt-sol', 'ust-sag', 'ust-sol']);
+        assert.throws(() => box('orta'));
+    });
+
+    it('chooses the light logo on a dark corner and the navy one on a light corner, from the measured region', async () => {
+        assert.equal(variantFor(0.1), 'logo-dark');
+        assert.equal(variantFor(0.8), 'logo');
+        const dir = tempDir();
+        const input = join(dir, 'in.png');
+        writeFileSync(input, PNG);
+        for (const [brightness, variant] of [[0.15, 'logo-dark'], [0.85, 'logo']]) {
+            const magick = fakeMagick(brightness);
+            const made = await createLogoCompositor({ run: magick.run }).apply({ input, output: join(dir, `out-${variant}.png`), width: 2048, height: 2560, corner: 'alt-sag' });
+            assert.equal(made.variant, variant);
+            const [measure, compose] = magick.calls;
+            assert.deepEqual(measure, [input, '-crop', '246x100+1700+2358', '+repage', '-colorspace', 'Gray', '-format', '%[fx:mean]', 'info:']);
+            assert.ok(compose[2].endsWith(`${variant}.png`));
+            assert.deepEqual(compose.slice(3, 9), ['-resize', '246x100!', ')', '-geometry', '+1700+2358', '-composite']);
+            assert.ok(readFileSync(input).equals(PNG), 'the original is never written');
+            assert.equal(made.sha256, createHash('sha256').update(readFileSync(made.file)).digest('hex'));
+        }
+    });
+
+    it('add_logo: no Higgsfield call, a new final PNG; preview, original file and TryPost use it; logosuz gives the original', async () => {
+        const magick = fakeMagick(0.2);
+        const { gateway, higgsfield, store, trypost, settings } = setup({ compositor: createLogoCompositor({ run: magick.run }) });
+        const id = (await image(gateway, { baslik: 'Atölye' })).text.match(/generation_id: (gen_\w+)/)[1];
+        const before = higgsfield.calls.length;
+        const result = await call(gateway, 'add_logo', { generation_id: id, konum: 'ust-sag' });
+        assert.equal(result.isError, false, result.text);
+        assert.equal(higgsfield.calls.length, before, 'no Higgsfield call, no credits');
+        assert.match(result.text, /sağ üst köşe/);
+        const row = store.get(id);
+        assert.ok(readFileSync(row.file).equals(PNG), 'original untouched');
+        assert.equal(row.sha256, createHash('sha256').update(PNG).digest('hex'));
+        const final = readFileSync(row.final_file);
+        assert.notEqual(row.final_sha256, row.sha256);
+        assert.equal(row.final_sha256, createHash('sha256').update(final).digest('hex'));
+        assert.equal(row.logo_corner, 'ust-sag');
+        assert.equal(row.final_variant, 'logo-dark');
+        assert.equal(result.text.match(/^MEDIA:(.+)$/m)[1], join(settings.hermesPreviewDir, `${id}-final-preview.png`));
+
+        const shown = await call(gateway, 'get_generation', { generation_id: id });
+        assert.ok(readFileSync(shown.text.match(/^MEDIA:(.+)$/m)[1]).equals(final), 'the preview is the final');
+        const doc = await call(gateway, 'get_original_file', { generation_id: id });
+        assert.ok(readFileSync(doc.text.match(/^MEDIA:(.+)$/m)[1]).equals(final));
+        const plain = await call(gateway, 'get_original_file', { generation_id: id, logosuz: true });
+        assert.ok(readFileSync(plain.text.match(/^MEDIA:(.+)$/m)[1]).equals(PNG));
+
+        const attached = await call(gateway, 'attach_to_trypost', { generation_id: id, post_id: 'post-1' });
+        assert.equal(attached.isError, false, attached.text);
+        assert.ok(trypost.uploads[0].bytes.equals(final), 'TryPost gets the final byte for byte');
+        assert.equal(trypost.uploads[0].mimeType, 'image/png');
+        assert.equal(store.attachments(id)[0].sha256, row.final_sha256);
+        await call(gateway, 'attach_to_trypost', { generation_id: id, post_id: 'post-1', logosuz: true });
+        assert.ok(trypost.uploads[1].bytes.equals(PNG));
+
+        writeFileSync(row.final_file, 'tampered');
+        assert.equal((await call(gateway, 'attach_to_trypost', { generation_id: id, post_id: 'post-1' })).text, MESSAGES.integrity);
+    });
+
+    it('add_logo is composited from the original every time (another corner never stacks logos)', async () => {
+        const magick = fakeMagick(0.9);
+        const { gateway, store } = setup({ compositor: createLogoCompositor({ run: magick.run }) });
+        const id = (await image(gateway)).text.match(/generation_id: (gen_\w+)/)[1];
+        await call(gateway, 'add_logo', { generation_id: id });
+        await call(gateway, 'add_logo', { generation_id: id, konum: 'alt-sol' });
+        const composites = magick.calls.filter((args) => args.at(-1) !== 'info:');
+        assert.equal(composites.length, 2);
+        for (const args of composites) assert.equal(args[0], store.get(id).file);
+        assert.equal(store.get(id).logo_corner, 'alt-sol');
+        assert.equal(store.get(id).final_variant, 'logo');
+    });
+
+    it('add_logo refuses without a compositor, for audio, and for an unknown generation', async () => {
+        const { gateway } = setup();
+        const id = (await image(gateway)).text.match(/generation_id: (gen_\w+)/)[1];
+        assert.equal((await call(gateway, 'add_logo', { generation_id: id })).text, MESSAGES.noCompositor);
+        assert.equal((await call(gateway, 'add_logo', { generation_id: 'gen_missing' })).text, MESSAGES.notFound);
+        const tools = Object.fromEntries(gateway.tools.map((tool) => [tool.name, tool]));
+        assert.equal(tools.add_logo.annotations.readOnlyHint, false, 'a write tool: it asks for approval');
+        assert.equal(tools.edit_image.annotations.readOnlyHint, false);
+    });
+
+    it('a failed composite leaves the generation as it was', async () => {
+        const { gateway, store } = setup({ compositor: createLogoCompositor({ run: async () => { throw new Error('magick: no decode delegate'); } }) });
+        const id = (await image(gateway)).text.match(/generation_id: (gen_\w+)/)[1];
+        assert.equal((await call(gateway, 'add_logo', { generation_id: id })).text, MESSAGES.logoFailed);
+        assert.equal(store.get(id).final_file, null);
+    });
+});
+
+describe('studio: edit_image (gpt_image_2_6 image-to-image)', () => {
+    it('edits an earlier generation: its job id and the logo as references, same aspect ratio, 1k, Higgsfield generate_image', async () => {
+        const { gateway, higgsfield, store, clock } = setup({ studio: { limits: { cooldownSec: 0 } } });
+        const id = (await image(gateway, { platform: 'instagram', baslik: 'Atölye' })).text.match(/generation_id: (gen_\w+)/)[1];
+        clock.now += 1000;
+        const result = await call(gateway, 'edit_image', { generation_id: id, talimat: 'Başlığı "Yapay Zeka Atölyesi" yap', ozet: 'Afiş düzeltmesi', requested_by: 'yasir' });
+        assert.equal(result.isError, false, result.text);
+        const [, edit] = higgsfield.generated();
+        assert.equal(edit.name, 'generate_image');
+        assert.equal(edit.args.params.model, 'gpt_image_2_6');
+        assert.equal(edit.args.params.aspect_ratio, '4:5');
+        assert.equal(edit.args.params.resolution, '1k');
+        assert.equal(edit.args.params.count, 1);
+        assert.deepEqual(edit.args.params.medias, [{ value: JOB, role: 'image_references' }, { value: CACHED_LOGO, role: 'image_references' }]);
+        assert.match(edit.args.params.prompt, /^Edit the first reference image\. Change only this: Başlığı "Yapay Zeka Atölyesi" yap/);
+        assert.match(edit.args.params.prompt, /ç ğ ı İ ö ş ü/);
+        const editId = result.text.match(/generation_id: (gen_\w+)/)[1];
+        assert.equal(store.get(editId).tool, 'edit_image');
+        assert.equal(store.get(editId).logo_corner, 'alt-sag');
+        assert.equal(JSON.parse(store.get(editId).params).edit.source, id);
+        assert.equal(store.usage(dayOf(store.now(), 'Europe/Istanbul'), '2026-11').counts.image, 2, 'counted like any image');
+    });
+
+    it('edits a picture the user sent (uploaded as a reference), within the reference folders only', async () => {
+        const { gateway, higgsfield, dataDir } = setup({ studio: { referenceDirs: [] } });
+        const shared = join(dataDir, 'images');
+        mkdirSync(shared);
+        const { gateway: g2, higgsfield: h2 } = setup({ studio: { referenceDirs: [shared] } });
+        writeFileSync(join(shared, 'sent.png'), PNG);
+        const result = await call(g2, 'edit_image', { kaynak_gorsel: join(shared, 'sent.png'), talimat: 'add the club logo bottom right', logo: true });
+        assert.equal(result.isError, false, result.text);
+        assert.equal(h2.calls[0].name, 'media_upload');
+        const params = h2.generated()[0].args.params;
+        assert.equal(params.aspect_ratio, '4:5', '2048x2560 → 4:5');
+        assert.deepEqual(params.medias, [{ value: LOGO_MEDIA, role: 'image_references' }, { value: CACHED_LOGO, role: 'image_references' }]);
+        assert.match((await call(gateway, 'edit_image', { kaynak_gorsel: join(shared, 'sent.png'), talimat: 'x' })).text, /referans olarak kullanılamaz/);
+        assert.equal(higgsfield.calls.length, 0);
+    });
+
+    it('needs exactly one source and an instruction; refused attempts send nothing', async () => {
+        const { gateway, higgsfield } = setup();
+        assert.equal((await call(gateway, 'edit_image', { talimat: 'x' })).text, MESSAGES.editSource);
+        assert.equal((await call(gateway, 'edit_image', { generation_id: 'gen_x', kaynak_gorsel: '/a.png', talimat: 'x' })).text, MESSAGES.editSource);
+        assert.equal((await call(gateway, 'edit_image', { generation_id: 'gen_missing', talimat: 'x' })).text, MESSAGES.editSource);
+        assert.match((await call(gateway, 'edit_image', { generation_id: 'gen_x', talimat: '  ' })).text, /talimatı boş/);
+        assert.equal(higgsfield.calls.length, 0);
+    });
+
+    it('the approval hint for edit_image uses the source aspect ratio and the GPT Image price', async () => {
+        const { gateway } = setup();
+        const id = (await image(gateway, { platform: 'story' })).text.match(/generation_id: (gen_\w+)/)[1];
+        const hint = gateway.approvalHint('edit_image', { generation_id: id, talimat: 'x' });
+        assert.equal(hint.aspect_ratio, '9:16');
+        assert.equal(hint.resolution, '1k');
+        assert.ok(Number.isFinite(hint.credits));
+    });
+
+    it('buildEditPrompt and nearestAspect', () => {
+        assert.doesNotMatch(buildEditPrompt({ talimat: 'make it blue' }), /logo/);
+        assert.match(buildEditPrompt({ talimat: 'fix the logo', logoCorner: 'alt-sol' }), /bottom-left corner/);
+        assert.equal(nearestAspect(1080, 1350, ['1:1', '4:5', '9:16']), '4:5');
+        assert.equal(nearestAspect(1920, 1080, ['1:1', '16:9', '4:5']), '16:9');
     });
 });
 

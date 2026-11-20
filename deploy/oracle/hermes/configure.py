@@ -130,7 +130,7 @@ def main(path):
     studio.update({
         "url": STUDIO_MCP_URL,
         "headers": {"Authorization": "Bearer ${ECHO_STUDIO_TOKEN}"},
-        # generate_image / generate_audio / attach_to_trypost ask on WhatsApp; the read-only
+        # generate_image / edit_image / generate_audio / add_logo / attach_to_trypost ask on WhatsApp; the read-only
         # tools (brand kit, usage, status, original file) carry readOnlyHint and do not.
         "trust": "untrusted",
         # A generation waits up to ~3 minutes for its job.
