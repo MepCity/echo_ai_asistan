@@ -124,7 +124,7 @@ export async function renderVideo({ html, assets = {}, size, audio = {}, output,
         await send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
         await send('Page.enable');
         await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
-        await send('Emulation.setDefaultBackgroundColorOverride', { color: { r: 0, g: 0, b: 0, a: 1 } });
+        await send('Emulation.setDefaultBackgroundColorOverride', { color: { r: 15, g: 28, b: 71, a: 1 } });
         const loaded = new Promise((resolve) => browser.on('Page.loadEventFired', (_params, session) => session === sessionId && resolve()));
         const nav = await send('Page.navigate', { url: `${ORIGIN}/index.html` });
         if (nav.errorText) throw new Error(`composition did not load: ${nav.errorText}`);
@@ -160,7 +160,14 @@ export async function renderVideo({ html, assets = {}, size, audio = {}, output,
         return { frames, ms: Date.now() - started, blocked: blocked.length };
     } finally {
         signal?.removeEventListener('abort', abort);
+        const exited = browser.process.exitCode !== null || browser.process.signalCode ? Promise.resolve() : new Promise((done) => browser.process.once('exit', done));
         abort();
-        rmSync(profile, { recursive: true, force: true });
+        // Chromium's helpers may still be writing the profile for a moment after the kill.
+        await Promise.race([exited, new Promise((done) => setTimeout(done, 3000))]);
+        try {
+            rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+        } catch (error) {
+            log('warn', 'render profile cleanup failed (the job folder is removed later)', error.message);
+        }
     }
 }

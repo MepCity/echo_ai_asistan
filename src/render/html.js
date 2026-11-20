@@ -54,7 +54,7 @@ export function compositionHtml(composition, { assetPath, captions = [] }) {
     const name = (prefix) => `${prefix}${counter++}`;
 
     css.push(`
-        html, body { margin: 0; padding: 0; width: ${width}px; height: ${height}px; overflow: hidden; background: #000; }
+        html, body { margin: 0; padding: 0; width: ${width}px; height: ${height}px; overflow: hidden; background: #0f1c47; }
         * { box-sizing: border-box; }
         .stage { position: absolute; inset: 0; overflow: hidden; background: ${backgroundCss(composition.background)}; font-family: ${FONT_STACK.sans}; -webkit-font-smoothing: antialiased; text-rendering: geometricPrecision; }
         .scene, .layer { position: absolute; inset: 0; }
@@ -62,7 +62,7 @@ export function compositionHtml(composition, { assetPath, captions = [] }) {
         .el img, .bg img { width: 100%; height: 100%; display: block; }
         .text { white-space: pre-wrap; overflow-wrap: break-word; line-height: 1.15; }
         .cap { position: absolute; left: 7%; right: 7%; bottom: 14%; display: flex; justify-content: center; opacity: 0; }
-        .cap span { background: rgba(15, 28, 71, 0.82); color: #fff; font-weight: 700; font-size: ${num(46 * scale)}px; line-height: 1.25; padding: ${num(12 * scale)}px ${num(24 * scale)}px; border-radius: ${num(18 * scale)}px; text-align: center; max-width: 100%; }
+        .cap span { background: rgba(15, 28, 71, 0.82); color: #ffffff; font-weight: 700; font-size: ${num(46 * scale)}px; line-height: 1.25; padding: ${num(12 * scale)}px ${num(24 * scale)}px; border-radius: ${num(18 * scale)}px; text-align: center; max-width: 100%; }
     `);
     for (const [key, frames] of Object.entries(ENTER)) if (frames) css.push(`@keyframes enter-${key} { ${frames} }`);
     css.push('@keyframes kenburns { from { transform: scale(1) translate(0, 0) } to { transform: scale(1.14) translate(-1.5%, -1%) } }');
@@ -73,8 +73,12 @@ export function compositionHtml(composition, { assetPath, captions = [] }) {
     function backgroundLayer(background, start, length) {
         if (!background?.image) return '';
         const anim = background.kenburns === false ? '' : `animation: ${background.kenburns === 'out' ? 'kenburns-out' : 'kenburns'} ${num(length)}s linear ${num(start)}s both;`;
+        // tint: the photo becomes a brand-blue duotone (greyscale, coloured with the accent), so any
+        // backdrop photo stays on brand; without it the photo keeps its own colours (slideshows).
+        const filter = background.tint ? ' filter: grayscale(1) contrast(1.05);' : '';
+        const tint = background.tint ? '<div class="layer" style="background: #1e6bf5; mix-blend-mode: color; opacity: 0.85"></div>' : '';
         const dim = background.dim ? `<div class="layer" style="background: rgba(15, 28, 71, ${num(background.dim)})"></div>` : '';
-        return `<div class="layer bg" style="overflow: hidden"><div class="layer" style="${anim}">${imageTag(background.image, 'cover')}</div></div>${dim}`;
+        return `<div class="layer bg" style="overflow: hidden"><div class="layer" style="${anim}">${imageTag(background.image, 'cover', filter)}</div></div>${tint}${dim}`;
     }
 
     function element(el, sceneStart, sceneLength) {
@@ -96,7 +100,7 @@ export function compositionHtml(composition, { assetPath, captions = [] }) {
             look.push(`color: ${el.color ?? '#ffffff'}`, `font-size: ${num((el.size ?? 56) * scale)}px`, `font-weight: ${el.weight ?? 700}`, `text-align: ${el.align ?? 'left'}`, `font-family: ${FONT_STACK[el.font ?? 'sans']}`);
             if (el.uppercase) look.push('text-transform: uppercase', `letter-spacing: ${num(0.06 * (el.size ?? 56) * scale)}px`);
             if (el.italic) look.push('font-style: italic');
-            if (el.shadow) look.push('text-shadow: 0 4px 24px rgba(0, 0, 0, 0.45)');
+            if (el.shadow) look.push('text-shadow: 0 4px 24px rgba(15, 28, 71, 0.55)');
             const pill = el.background ? ` style="display: inline-block; background: ${el.background}; padding: 0.2em 0.55em; border-radius: 0.45em; box-decoration-break: clone; -webkit-box-decoration-break: clone"` : '';
             return wrap(' text', `<span${pill}>${escapeHtml(el.text)}</span>`);
         }
@@ -109,7 +113,7 @@ export function compositionHtml(composition, { assetPath, captions = [] }) {
             }
             look.push('overflow: hidden', `border-radius: ${circle ? '50%' : `${num((el.radius ?? 0) * scale)}px`}`);
             if (el.border) look.push(`border: ${num(8 * scale)}px solid ${el.border}`);
-            if (el.shadow) look.push('box-shadow: 0 18px 60px rgba(0, 0, 0, 0.35)');
+            if (el.shadow) look.push('box-shadow: 0 18px 60px rgba(15, 28, 71, 0.45)');
             const kb = el.kenburns ? ` animation: kenburns ${num(sceneLength)}s linear ${num(sceneStart)}s both;` : '';
             return wrap('', imageTag(asset, el.fit ?? 'cover', kb));
         }

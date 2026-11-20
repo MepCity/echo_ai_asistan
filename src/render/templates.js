@@ -17,7 +17,8 @@ export const BRAND = {
 };
 
 const gradientBg = { gradient: [BRAND.blue, BRAND.cyan], angle: 160 };
-const navyBg = { gradient: [BRAND.navy, '#16306e'], angle: 170 };
+// Navy into a hint of the accent blue (translucent over the navy stage), as in every dark scene.
+const navyBg = { gradient: [BRAND.navy, '#1e6bf559'], angle: 170 };
 
 /** Template catalogue: description, parameters (for the tool schema and validation), default length. */
 export const TEMPLATES = {
@@ -98,7 +99,7 @@ function etkinlik(p, seconds) {
     const second = {
         ...b,
         transition: 'slide-up',
-        background: p.gorsel ? { image: p.gorsel, dim: 0.62, kenburns: true } : navyBg,
+        background: p.gorsel ? { image: p.gorsel, tint: true, dim: 0.62, kenburns: true } : navyBg,
         elements: [
             text(p.baslik, { x: 8, y: 16, w: 84, size: 64, weight: 800, color: '#ffffff', animation: 'fade-up', delay: 0.15, shadow: true }),
             { type: 'shape', x: 8, y: 36, w: 18, h: 0.6, gradient: BRAND.gradient, radius: 4, animation: 'wipe', delay: 0.4 },
@@ -137,7 +138,7 @@ function ozelGun(p, seconds) {
         scenes: [
             {
                 ...a,
-                background: p.gorsel ? { image: p.gorsel, dim: 0.45, kenburns: true } : navyBg,
+                background: p.gorsel ? { image: p.gorsel, tint: true, dim: 0.5, kenburns: true } : navyBg,
                 elements: [
                     { type: 'shape', x: 35, y: 30, w: 30, h: 0.5, gradient: BRAND.gradient, radius: 4, animation: 'wipe', delay: 0.3 },
                     text(p.baslik, { x: 7, y: 36, w: 86, size: 88, weight: 900, align: 'center', color: '#ffffff', animation: 'fade-up', delay: 0.5, shadow: true }),

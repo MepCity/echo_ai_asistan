@@ -534,7 +534,7 @@ export function createVideoTools({ settings, video, db, store, trypost = null, t
                 `Şablonlar (önerilen, güvenilir; * zorunlu): ${templateText}.`,
                 'Dosyalar: "logo"/"logo-dark", önceki üretimler (gen_…; görsel ya da ses) ya da kullanıcının gönderdiği görselin yolu (/opt/data/cache/images/…). İnternet adresi verilemez.',
                 'kompozisyon (sadece şablon uymuyorsa): {"background": Arka, "scenes": [{"duration": sn, "transition": "fade|slide-up|zoom|none", "background": Arka, "elements": [Öğe]}]}.',
-                'Arka: {"color": "#0f1c47"} | {"gradient": ["#3278f6", "#3cbdfa"], "angle": 160} | {"image": "gen_…", "dim": 0-0.9, "kenburns": true}.',
+                'Arka: {"color": "#0f1c47"} | {"gradient": ["#3278f6", "#3cbdfa"], "angle": 160} | {"image": "gen_…", "tint": true (marka mavisine boyar), "dim": 0-0.9, "kenburns": true}.',
                 'Öğe (x, y, w, h: kare yüzdesi; size: 1080 kısa kenarda piksel): {"type": "text", "text", "x", "y", "w", "size", "weight": 400-900, "color", "align": "left|center|right", "font": "sans|serif", "background": "#rrggbb", "shadow", "uppercase", "animation", "delay"} | {"type": "image", "asset", "x", "y", "w", "h", "fit": "cover|contain", "shape": "rect|circle", "radius", "border", "kenburns"} | {"type": "shape", "shape": "rect|circle", "x", "y", "w", "h", "color"|"gradient", "radius", "opacity"} | {"type": "logo", "variant": "logo|logo-dark", "x", "y", "w"}.',
                 'animation: none, fade, fade-up, fade-down, slide-left, slide-right, pop, zoom-in, wipe. Renkler sadece #rrggbb. Metinlerde adres/kod olamaz ("https://", "<", "url(" yok).',
             ].join('\n'),

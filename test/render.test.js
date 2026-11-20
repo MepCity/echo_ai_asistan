@@ -148,6 +148,62 @@ describe('composition page', () => {
     });
 });
 
+describe('brand palette', () => {
+    // #3278f6, #3cbdfa, #0f1c47, #1e6bf5, #f1f5f9 and white; any alpha of these is fine.
+    const PALETTE = new Set(['3278f6', '3cbdfa', '0f1c47', '1e6bf5', 'f1f5f9', 'ffffff']);
+    const hex6 = (value) => {
+        let hex = value.slice(1).toLowerCase();
+        if (hex.length <= 4) hex = [...hex.slice(0, 3)].map((ch) => ch + ch).join('');
+        return hex.slice(0, 6);
+    };
+    /** Every colour in a page: #hex and rgb()/rgba(), as 6-digit hex; named colours other than transparent fail. */
+    function colours(html) {
+        const found = new Set();
+        const css = html.replace(/<script[\s\S]*?<\/script>/g, '');
+        for (const match of css.matchAll(/#[0-9a-f]{3,8}\b/gi)) found.add(hex6(match[0]));
+        for (const match of css.matchAll(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/gi)) {
+            found.add(match.slice(1, 4).map((n) => Number(n).toString(16).padStart(2, '0')).join(''));
+        }
+        for (const match of css.matchAll(/(?:color|background)\s*:\s*([a-z]+)\b/gi)) {
+            if (!['transparent', 'linear', 'rgb', 'rgba'].includes(match[1].toLowerCase())) found.add(match[1]);
+        }
+        return found;
+    }
+
+    const PARAMS = {
+        etkinlik: [{ baslik: 'Atölye', tarih: '12 Mart', saat: '18.00', yer: 'B-201', konusmaci: 'Ayşe', aciklama: 'Gel!', gorsel: 'a0' }, { baslik: 'Atölye', tarih: '12 Mart' }],
+        ozel_gun: [{ baslik: '23 Nisan', mesaj: 'Kutlu olsun', gorsel: 'a0' }, { baslik: '23 Nisan' }],
+        alinti: [{ alinti: 'Söz', kisi: 'Ayşe', unvan: 'Araştırmacı', foto: 'a0' }, { alinti: 'Söz', kisi: 'Ayşe' }],
+        slayt: [{ baslik: 'Hackathon', gorseller: ['a0', 'a0'], yazilar: ['Bir', 'İki'], kapanis: 'Son' }],
+    };
+
+    it('every template, scene and subtitle uses only brand colours', () => {
+        // The check itself sees off-brand colours in every form.
+        assert.deepEqual([...colours('<div style="background: #16306e; color: red; border-color: rgba(90, 58, 63, .5); fill: #FFF"></div>')].sort(), ['16306e', '5a3a3f', 'ffffff', 'red']);
+        for (const [name, variants] of Object.entries(PARAMS)) {
+            for (const params of variants) {
+                const composition = { width: 1080, height: 1920, fps: 25, duration: 15, ...templateComposition(name, params, 15) };
+                const html = compositionHtml(composition, { assetPath: (id) => `/a/${id}.png`, captions: [{ start: 1, end: 2, text: 'altyazı' }] });
+                const off = [...colours(html)].filter((colour) => !PALETTE.has(colour));
+                assert.deepEqual(off, [], `${name}: off-brand colours ${off.join(', ')}`);
+                // The scene specs themselves too (backgrounds, element colours, borders, gradients).
+                const spec = JSON.stringify(composition);
+                for (const match of spec.matchAll(/#[0-9a-f]{3,8}\b/gi)) assert.ok(PALETTE.has(hex6(match[0])), `${name}: ${match[0]}`);
+            }
+        }
+    });
+
+    it('a backdrop photo behind text is tinted to the brand blue; slideshow photos keep their colours', () => {
+        const event = templateComposition('etkinlik', { baslik: 'x', gorsel: 'a0' }, 10);
+        assert.equal(event.scenes[1].background.tint, true);
+        const html = compositionHtml({ width: 1080, height: 1920, fps: 25, duration: 10, ...event }, { assetPath: (id) => `/a/${id}.png` });
+        assert.match(html, /filter: grayscale\(1\)/);
+        assert.match(html, /background: #1e6bf5; mix-blend-mode: color/);
+        const slides = templateComposition('slayt', { gorseller: ['a0'] }, 10);
+        assert.ok(slides.scenes.every((scene) => !scene.background?.tint));
+    });
+});
+
 describe('subtitles', () => {
     it('reads whisper.cpp JSON and merges short segments into caption cards', () => {
         const segments = parseWhisperJson({ transcription: [

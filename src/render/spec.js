@@ -123,7 +123,7 @@ const ELEMENT_KEYS = {
  */
 function background(value, field, asset) {
     const bg = plainObject(value, field);
-    onlyKeys(bg, field, ['color', 'gradient', 'angle', 'image', 'dim', 'kenburns']);
+    onlyKeys(bg, field, ['color', 'gradient', 'angle', 'image', 'dim', 'tint', 'kenburns']);
     const out = {};
     if (bg.color !== undefined) out.color = color(bg.color, `${field}.color`);
     if (bg.gradient !== undefined) {
@@ -133,6 +133,7 @@ function background(value, field, asset) {
     if (bg.angle !== undefined) out.angle = number(bg.angle, `${field}.angle`, 0, 360);
     if (bg.image !== undefined) out.image = asset(bg.image, 'image', `${field}.image`);
     if (bg.dim !== undefined) out.dim = number(bg.dim, `${field}.dim`, 0, 0.9);
+    if (bg.tint !== undefined) out.tint = bg.tint === true;
     if (bg.kenburns !== undefined) {
         if (bg.kenburns !== true && bg.kenburns !== false && bg.kenburns !== 'out') fail(`${field}.kenburns true, false ya da "out" olmalı.`);
         out.kenburns = bg.kenburns;
