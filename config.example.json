@@ -27,5 +27,15 @@
         { "person": "ayse", "userId": "<TryPost user id>", "roles": ["reviewer"] }
       ]
     }
-  ]
+  ],
+  "studio": {
+    "project": "marmara",
+    "limits": { "maxCreditsPerRequest": 10, "cooldownSec": 60, "dailyCredits": 40, "dailyImages": 15, "dailyMusic": 5, "dailySpeech": 20, "monthlyCredits": 400, "perPersonDailyCredits": 20 },
+    "imageModels": ["gpt_image_2_6", "nano_banana_2_1", "recraft_v4_1"],
+    "imageFormat": "png",
+    "platformAspectRatios": { "instagram": "4:5", "instagram_kare": "1:1", "story": "9:16", "linkedin": "1:1", "linkedin_dikey": "4:5", "x": "16:9" },
+    "defaultVoice": "kadin",
+    "allowUnlim": false,
+    "allowFreeGens": false
+  }
 }

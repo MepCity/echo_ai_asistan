@@ -123,6 +123,8 @@ export function normalizeConfig(config) {
         projects,
         assistant: normalizeAssistant(config.assistant, config.whatsapp, people, projects),
         mediaBridge: mediaBridgeProject(projects),
+        // Read by the studio gateway only (src/studio/config.js); Echo itself ignores it.
+        studio: config.studio ?? null,
     };
 }
 

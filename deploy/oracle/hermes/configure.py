@@ -11,6 +11,10 @@ import sys
 import yaml
 
 TRYPOST_MCP_URL = "https://sosyal.marmaraai.com/mcp/trypost"
+# Echo's studio gateway (src/studio): Higgsfield images/audio within the club's limits. Hermes never
+# gets Higgsfield itself; the bearer comes from ECHO_STUDIO_TOKEN in Hermes' .env (studio-prepare.sh),
+# expanded by Hermes at connect time, so no secret is written here.
+STUDIO_MCP_URL = os.environ.get("STUDIO_MCP_URL", "http://studio:8091/mcp")
 
 # TryPost tools Hermes never gets: API keys and webhooks (Echo's own webhook lives there).
 # Tool names are TryPost's MCP names (kebab-case class names, see app/Mcp/Tools in TryPost).
@@ -47,6 +51,8 @@ DISABLED_TOOLSETS = [
 # TryPost write tools always ask on WhatsApp: an "always allow" answer for one of them
 # (command_allowlist key "mcp:<server>/<tool>", tools/mcp_tool_handlers.py) is removed again.
 TRYPOST_GRANT_PREFIX = "mcp:trypost/"
+# The same for the studio: every generation (credits) and every TryPost attach asks.
+STUDIO_GRANT_PREFIX = "mcp:studio/"
 
 # Hermes' user overlay ($HERMES_HOME/locales/<lang>.yaml, agent/i18n_layers.py): plainer
 # Turkish for the approval card's frame and buttons than the bundled locales/tr.yaml. The
@@ -114,6 +120,20 @@ def main(path):
     trypost["tools"] = tools
     servers["trypost"] = trypost
 
+    studio = servers.get("studio") if isinstance(servers.get("studio"), dict) else {}
+    studio.update({
+        "url": STUDIO_MCP_URL,
+        "headers": {"Authorization": "Bearer ${ECHO_STUDIO_TOKEN}"},
+        # generate_image / generate_audio / attach_to_trypost ask on WhatsApp; the read-only
+        # tools (brand kit, usage, status, original file) carry readOnlyHint and do not.
+        "trust": "untrusted",
+        # A generation waits up to ~3 minutes for its job.
+        "timeout": 300,
+        "connect_timeout": 15,
+    })
+    studio.pop("auth", None)
+    servers["studio"] = studio
+
     approvals = config.get("approvals") if isinstance(config.get("approvals"), dict) else {}
     if approvals.get("mode") in (None, "off"):
         approvals["mode"] = "manual"
@@ -123,7 +143,8 @@ def main(path):
     allowlist = config.get("command_allowlist")
     if isinstance(allowlist, list):
         config["command_allowlist"] = [
-            entry for entry in allowlist if not (isinstance(entry, str) and entry.startswith(TRYPOST_GRANT_PREFIX))
+            entry for entry in allowlist
+            if not (isinstance(entry, str) and entry.startswith((TRYPOST_GRANT_PREFIX, STUDIO_GRANT_PREFIX)))
         ]
 
     agent = config.get("agent") if isinstance(config.get("agent"), dict) else {}

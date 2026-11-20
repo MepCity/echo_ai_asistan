@@ -621,6 +621,8 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
 
     return {
         uploadMedia,
+        // The studio gateway (src/studio) attaches generated images with the same token and workspace.
+        request: api,
 
         async handleEvent(event, echo) {
             if (event.type === 'inbox.item_received') return inbox.handleEvent(event, echo);

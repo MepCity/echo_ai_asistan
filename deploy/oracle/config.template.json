@@ -54,5 +54,36 @@
         }
       ]
     }
-  ]
+  ],
+  "studio": {
+    "_NOT": "Higgsfield gorsel/ses uretimi (Hermes icin). Her anahtar istege bagli; yazilmayanlar varsayilandir. limits: tek istekte en fazla kredi, uretimler arasi saniye, gunluk (Istanbul gunu) kredi ve adet sinirlari, aylik kredi, kisi basi gunluk kredi. imageModels sadece daraltabilir (gpt_image_2_6, nano_banana_2_1, recraft_v4_1). imageFormat: gpt_image_2_6 cikti bicimi (png, jpeg, webp). Gizli degerler burada degil: ECHO_STUDIO_TOKEN ve istege bagli HIGGSFIELD_API_KEY /opt/echo/.env icinde.",
+    "project": "marmara",
+    "limits": {
+      "maxCreditsPerRequest": 10,
+      "cooldownSec": 60,
+      "dailyCredits": 40,
+      "dailyImages": 15,
+      "dailyMusic": 5,
+      "dailySpeech": 20,
+      "monthlyCredits": 400,
+      "perPersonDailyCredits": 20
+    },
+    "imageModels": [
+      "gpt_image_2_6",
+      "nano_banana_2_1",
+      "recraft_v4_1"
+    ],
+    "imageFormat": "png",
+    "platformAspectRatios": {
+      "instagram": "4:5",
+      "instagram_kare": "1:1",
+      "story": "9:16",
+      "linkedin": "1:1",
+      "linkedin_dikey": "4:5",
+      "x": "16:9"
+    },
+    "defaultVoice": "kadin",
+    "allowUnlim": false,
+    "allowFreeGens": false
+  }
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Pulls the latest code and restarts Echo (and Hermes, once setup-hermes.sh has set it up).
+# Pulls the latest code and restarts Echo (and Hermes with the studio gateway, once
+# setup-hermes.sh has set them up).
 # Run on the VM as ubuntu:  bash /opt/echo/app/deploy/oracle/update.sh
 # Also picks up edits to /opt/echo/config.json and /opt/echo/.env (WhatsApp tokens are
 # copied to Hermes too).
@@ -20,9 +21,14 @@ compose() { "${DOCKER[@]}" compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "${
 
 echo "==> git pull"
 git -C "$APP" pull --ff-only
+if [ -f "$HERMES_ENV" ]; then
+  echo "==> studio (Higgsfield) hazirligi"
+  bash "$APP/deploy/oracle/hermes/studio-prepare.sh"
+fi
 echo "==> build and start"
 compose up -d --build
 compose restart echo   # re-reads config.json
+if [ -f "$HERMES_ENV" ]; then compose restart studio; fi   # re-reads config.json (studio limits)
 
 if [ -f "$HERMES_ENV" ]; then
   echo "==> Hermes: new image, settings synced from $ENV_FILE"

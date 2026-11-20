@@ -1,6 +1,7 @@
 # Echo on one VM: Echo (no published port) behind Caddy (HTTPS via Let's Encrypt), and
 # optionally Hermes Agent (profile "hermes", no published port; only Echo reaches it at
-# http://hermes:8090/whatsapp/webhook). Set up Hermes with deploy/oracle/hermes/setup-hermes.sh.
+# http://hermes:8090/whatsapp/webhook) with the studio gateway (profile "hermes", only Hermes
+# reaches it at http://studio:8091/mcp). Set up both with deploy/oracle/hermes/setup-hermes.sh.
 # Run: docker compose -f /opt/echo/app/deploy/oracle/docker-compose.yml --env-file /opt/echo/.env up -d --build
 #      (add --profile hermes once Hermes is set up; update.sh does that by itself)
 name: echo
@@ -54,6 +55,35 @@ services:
     volumes:
       # Hermes' HERMES_HOME: .env, config.yaml, SOUL.md, auth.json, mcp-tokens/, sessions, logs.
       - /opt/hermes/data:/opt/data
+    restart: unless-stopped
+    logging: *logging
+
+  studio:
+    # Studio gateway (src/studio): Hermes generates images/audio through it with the club's
+    # Higgsfield account, within config.json "studio" limits. No published port; only Hermes
+    # reaches it at http://studio:8091/mcp with ECHO_STUDIO_TOKEN. Same image as Echo.
+    profiles: ["hermes"]
+    image: echo:local
+    command: ["node", "--no-warnings", "src/studio/index.js"]
+    depends_on:
+      - echo
+    env_file: /opt/echo/.env
+    environment:
+      ECHO_CONFIG: /config/config.json
+      STUDIO_BRAND_KIT: /config/brand-kit.md
+      # Mounted at the same paths Hermes sees them (its HERMES_HOME is /opt/data), so a
+      # MEDIA:<path> the gateway hands out is a file Hermes can send.
+      STUDIO_PREVIEW_DIR: /opt/data/cache/generated/echo-studio
+      STUDIO_REFERENCE_DIRS: /opt/data/cache/images
+    # The VM user (Hermes' uid), so Hermes can read the previews; echo-data is owned by uid 1000 too.
+    user: "${HERMES_UID:-1000}:${HERMES_GID:-1000}"
+    volumes:
+      - /opt/echo/config.json:/config/config.json:ro
+      - /opt/echo/brand-kit.md:/config/brand-kit.md:ro
+      # Originals, studio.db and the Higgsfield tokens (0600) live in /data/studio.
+      - echo-data:/data
+      - /opt/hermes/data/cache/generated/echo-studio:/opt/data/cache/generated/echo-studio
+      - /opt/hermes/data/cache/images:/opt/data/cache/images:ro
     restart: unless-stopped
     logging: *logging
 

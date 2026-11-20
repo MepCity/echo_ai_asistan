@@ -303,6 +303,67 @@ webhook'u bozulmasın diye). Hermes'te kabuk, dosya, tarayıcı ve kod çalışt
 kapalıdır (`config.yaml` → `agent.disabled_toolsets`). Hermes'in kendi butonları
 (`appr:...`, `cl:...`) Echo'dan geçip Hermes'e gider.
 
+### Stüdyo: Higgsfield ile görsel ve ses (Hermes için)
+
+**Nasıl çalışır:** Hermes, Higgsfield'e doğrudan bağlanmaz. Aynı VM'de `studio` adlı küçük bir
+MCP sunucusu (Echo imajı, `src/studio/`) çalışır; Higgsfield girişini o tutar ve Hermes'e
+yalnızca şu araçları verir:
+
+| Araç | Ne yapar | Onay |
+| --- | --- | --- |
+| `get_brand_kit` | `/opt/echo/brand-kit.md` (marka kiti) | yok (salt okunur) |
+| `studio_usage` | bugünkü/aylık kullanım, kalan sınırlar, bekleme | yok |
+| `get_generation` | başlamış bir üretimin sonucu (yeni kredi harcamaz) | yok |
+| `get_original_file` | asıl dosyayı WhatsApp'a belge olarak göndermek için yol | yok |
+| `generate_image` | tek görsel: `gpt_image_2_6` (varsayılan, high/2k), `nano_banana_2_1` (≤4k), `recraft_v4_1` (≤2k, vektör/tipografi, marka renkleri) | WhatsApp'ta onay |
+| `generate_audio` | `speech` (`elevenlabs_v4`, ≤1500 karakter) ya da `music` (`elevenlabs_music_v2_5`, ≤60 sn) | onay |
+| `attach_to_trypost` | üretilen görselin **asıl dosyasını** TryPost'a yükler; `post_id` varsa ekler, yoksa `social_account_id` için yeni taslak | onay |
+
+Model listesi sunucuda sabittir (allowlist); video modelleri, preset'ler, GPU, web sitesi, reklam,
+TikTok vb. hiçbir Higgsfield aracı Hermes'e açılmaz, geçit de bunları çağıramaz. `count`/`batch_size`
+her zaman 1, `use_unlim` false (config `allowUnlim` açmadıkça), `use_free_gens` gönderilmez.
+Her üretimden önce Higgsfield'in `estimate_*_cost` aracıyla fiyat sorulur. Sınırlar
+(`config.json` → `studio.limits`, varsayılanlar): tek istekte ≤10 kredi; üretimler arası 60 sn;
+aynı anda tek üretim; İstanbul gününe göre günde ≤40 kredi, ≤15 görsel, ≤5 müzik, ≤20
+seslendirme; ayda ≤400 kredi; `requested_by` bilinen bir kişiyse kişi başı günde ≤20 kredi
+(Hermes kimliği kanıtlayamaz; asıl koruma genel sınırlardır). Başarısız ya da cevabı kaybolan
+üretim asla tekrar gönderilmez (cevabı kaybolan "unknown" sayılır ve sınırlara dahildir). Her
+deneme (reddedilenler dahil) `/data/studio/studio.db` → `generations` tablosunda.
+
+**Dosyalar:** Higgsfield'in verdiği dosya **olduğu gibi** (aynı bayt, biçim, çözünürlük; sha256
+kaydı) `echo-data` biriminde `/data/studio/media/` altında saklanır. WhatsApp'a yalnızca bir
+önizleme kopyası gider (`/opt/hermes/data/cache/generated/echo-studio/`, Hermes `MEDIA:` satırıyla
+gönderir; WhatsApp görseli sıkıştırır). TryPost'a dosya WhatsApp'tan geçmez: `attach_to_trypost`
+asıl baytları sunucudan sunucuya, medya köprüsüyle aynı yoldan (`POST /api/uploads`, aynı
+`MARMARA_TRYPOST_TOKEN`, sadece `studio.project` çalışma alanı) yükler ve `upload_token`'ı
+gönderiye bağlar. Ses dosyaları gönderiye eklenmez (saklanır, ileride video için). Not: TryPost
+PNG/WebP'yi yüklerken JPEG'e (kalite 100, aynı boyut) çevirir; bayt bayt aynı kalsın istersen
+`studio.imageFormat: "jpeg"` (yalnızca `gpt_image_2_6`).
+
+**Kurulum** (VM'de, `setup-hermes.sh` bunu yapar; `update.sh` her seferinde tekrarlar):
+`/opt/echo/brand-kit.md` yoksa oluşturulur (düzenlemelerin korunur), paylaşılan klasörler açılır,
+`/opt/echo/.env`'e rastgele `ECHO_STUDIO_TOKEN` yazılır ve Hermes'in `.env`'ine kopyalanır;
+`configure.py` Hermes'e `mcp_servers.studio` (`http://studio:8091/mcp`, `Authorization: Bearer
+${ECHO_STUDIO_TOKEN}`, `trust: untrusted`) ekler. Higgsfield girişi bir kerelik:
+
+```sh
+bash /opt/echo/app/deploy/oracle/update.sh                    # yeni kod, studio servisi
+bash /opt/echo/app/deploy/oracle/hermes/setup-hermes.sh       # 3/3 adımı: Higgsfield girişi
+# ya da sadece giriş:
+bash /opt/echo/app/deploy/oracle/hermes/studio.sh login       # adresi aç, izin ver, dönen adresi yapıştır
+bash /opt/echo/app/deploy/oracle/hermes/studio.sh status      # bağlı mı, kredi
+bash /opt/echo/app/deploy/oracle/hermes/studio.sh logs --follow
+```
+
+Giriş: Higgsfield MCP'si OAuth ister (Clerk, `https://higgsfield.ai/_clerk`; dinamik istemci
+kaydı, PKCE, `offline_access` ile yenileme anahtarı). `login.js` istemciyi kaydeder, authorize
+adresini yazar; tarayıcı `http://127.0.0.1:8976/callback?code=…` adresinde "bağlantı
+kurulamadı" der, o adresi yapıştırırsın. Anahtarlar `/data/studio/higgsfield-auth.json` (0600)
+dosyasında, süresi dolmadan kendiliğinden yenilenir, loglara yazılmaz. `HIGGSFIELD_API_KEY`
+`.env`'de tanımlıysa OAuth yerine bearer olarak o gönderilir (Higgsfield böyle bir anahtar
+belgelemiyor; yalnızca destek verirlerse işe yarar). Yenileme anahtarı geçersizleşirse araçlar
+"Higgsfield bağlantısı kurulmamış" der: `studio.sh login` ile yeniden giriş yap.
+
 ## Endpoints
 
 - `GET /whatsapp`: Meta webhook verification

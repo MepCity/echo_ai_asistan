@@ -107,12 +107,15 @@ else
   echo "SOUL.md senin duzenledigin haliyle birakildi."
 fi
 python3 -I "$HERE/configure.py" "$DATA/config.yaml"
-echo "config.yaml: saglayici openai-codex (secilen model korunur), TryPost MCP (OAuth, yazma araclari onayli), riskli araclar kapali, profil teklifi ve komut ipuclari kapali, dil tr; onay mesaji Turkce (locales/tr.yaml)."
+echo "config.yaml: saglayici openai-codex (secilen model korunur), TryPost MCP (OAuth, yazma araclari onayli), studio MCP (Higgsfield gorsel/ses; uretim ve TryPost'a ekleme onayli), riskli araclar kapali, profil teklifi ve komut ipuclari kapali, dil tr; onay mesaji Turkce (locales/tr.yaml)."
+
+# --- Studio gateway (Higgsfield images/audio): brand kit, shared folders, bearer secret ------------
+bash "$HERE/studio-prepare.sh"
 
 # --- Start Hermes -----------------------------------------------------------------------------
 say "Hermes imaji indiriliyor ve baslatiliyor (ilk sefer birkac dakika surebilir)"
 compose pull hermes
-compose up -d hermes
+compose up -d --build studio hermes
 for _ in $(seq 1 60); do
   if compose exec -T echo wget -qO- http://hermes:8090/health >/dev/null 2>&1; then break; fi
   sleep 3
@@ -172,11 +175,30 @@ EOF
 EOF
     hermes mcp login trypost || echo "UYARI: TryPost girisi tamamlanmadi; sonra tekrar: bash $HERE/hermes.sh mcp login trypost"
   fi
+
+  hf_default=E
+  compose exec -T studio node --no-warnings src/studio/login.js --status 2>/dev/null | grep -q '^Bağlı\.' && hf_default=h
+  say "3/3 Higgsfield baglantisi (gorsel ve ses uretimi; kredi harcar)"
+  if [ "$hf_default" = h ]; then echo "Daha once baglanmis gorunuyor."; fi
+  if ask_yes "Higgsfield girisi simdi yapilsin mi?" "$hf_default"; then
+    cat <<'EOF'
+
+  Higgsfield'in MCP sunucusu tarayicida bir kerelik OAuth onayi istiyor:
+    1. Ekranda cikan "authorize" adresini tarayicida ac.
+    2. Kulubun Higgsfield hesabiyla giris yap ve izin ver.
+    3. Tarayici "http://127.0.0.1:8976/callback?code=..." adresine gidip "baglanti kurulamadi"
+       diyecek: bu normal.
+    4. Adres cubugundaki TAM adresi kopyala, bu pencereye yapistir, Enter'a bas.
+  Anahtarlar sadece studio servisinde kalir; Hermes onlari hic gormez.
+
+EOF
+    compose exec studio node --no-warnings src/studio/login.js || echo "UYARI: Higgsfield girisi tamamlanmadi; sonra tekrar: bash $HERE/studio.sh login"
+  fi
 fi
 
 # --- Config again (Hermes may have migrated it on first start), restart --------------------------
 python3 -I "$HERE/configure.py" "$DATA/config.yaml"
-compose restart hermes
+compose restart studio hermes
 # Ongoing chats replay the system prompt stored when they began; this makes each one rebuild it
 # once from the new SOUL.md on its next message (history is kept).
 if compose exec -T hermes hermes sessions refresh-prompts >/dev/null 2>&1; then
@@ -212,6 +234,7 @@ cat <<EOF
    Loglar        : bash $HERE/hermes.sh logs --follow
    Codex girisi  : bash $HERE/hermes.sh auth add openai-codex
    TryPost girisi: bash $HERE/hermes.sh mcp login trypost
+   Higgsfield    : bash $HERE/studio.sh login   (durum: bash $HERE/studio.sh status)
    Model degistir: bash $HERE/hermes.sh model
    Ayarlari yenile: bash $HERE/setup-hermes.sh --skip-login
    Sohbeti sifirla: WhatsApp'ta /new yaz (gecmis silinir, yeni sohbet baslar)
