@@ -75,7 +75,10 @@ services:
       # MEDIA:<path> the gateway hands out is a file Hermes can send.
       STUDIO_PREVIEW_DIR: /opt/data/cache/generated/echo-studio
       STUDIO_REFERENCE_DIRS: /opt/data/cache/images
-    # The VM user (Hermes' uid), so Hermes can read the previews; echo-data is owned by uid 1000 too.
+    # The VM user (Hermes' uid), so Hermes can read the previews. echo-data (/data) is owned by
+    # the echo service's node user (uid 1000), which need not be this uid (e.g. ubuntu is 1001 on
+    # some VMs); studio only writes /data/studio, which studio-prepare.sh (run by update.sh and
+    # setup-hermes.sh) makes and gives to HERMES_UID:HERMES_GID.
     user: "${HERMES_UID:-1000}:${HERMES_GID:-1000}"
     volumes:
       - /opt/echo/config.json:/config/config.json:ro

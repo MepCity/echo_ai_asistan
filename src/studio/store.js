@@ -19,7 +19,20 @@ import { DatabaseSync } from 'node:sqlite';
 export function openStudioDatabase(dir) {
     let file = ':memory:';
     if (dir !== ':memory:') {
-        mkdirSync(dir, { recursive: true });
+        try {
+            mkdirSync(dir, { recursive: true });
+        } catch (err) {
+            if (err.code !== 'EACCES' && err.code !== 'EPERM') throw err;
+            const uid = typeof process.getuid === 'function' ? process.getuid() : '?';
+            const gid = typeof process.getgid === 'function' ? process.getgid() : '?';
+            throw new Error(
+                `Studio veri klasoru olusturulamadi: ${dir} (${err.code}, kullanici ${uid}:${gid}). ` +
+                `echo-data birimi echo servisinin kullanicisina (uid 1000) ait; studio ise HERMES_UID:HERMES_GID ile calisiyor. ` +
+                `VM'de su komutu calistir: bash /opt/echo/app/deploy/oracle/hermes/studio-prepare.sh ` +
+                `(ya da bash /opt/echo/app/deploy/oracle/update.sh). Klasoru ${uid}:${gid} kullanicisina verir.`,
+                { cause: err },
+            );
+        }
         file = join(dir, 'studio.db');
     }
     const db = new DatabaseSync(file);
