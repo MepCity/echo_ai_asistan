@@ -131,13 +131,11 @@ echo "config.yaml: saglayici openai-codex (secilen model korunur), TryPost MCP (
 
 # --- Studio gateway (Higgsfield images/audio): brand kit, shared folders, bearer secret ------------
 bash "$HERE/studio-prepare.sh"
-# Render service (studio videos): its bearer in /opt/echo/.env.
-bash "$HERE/../render/render-prepare.sh"
 
 # --- Start Hermes -----------------------------------------------------------------------------
 say "Hermes imaji indiriliyor ve baslatiliyor (ilk sefer birkac dakika surebilir)"
 compose pull hermes
-compose up -d --build render studio hermes
+compose up -d --build studio hermes
 for _ in $(seq 1 60); do
   if compose exec -T echo wget -qO- http://hermes:8090/health >/dev/null 2>&1; then break; fi
   sleep 3

@@ -337,11 +337,10 @@ def _generate_audio(args, hint):
 
 
 def _attach_to_trypost(args, hint):
-    video = clean(args.get("generation_id"), 64).startswith("vid_")
     if args.get("post_id"):
-        lines = [head("📎", f"Üretilen {'video' if video else 'görsel'} TryPost'taki gönderiye eklenecek")]
+        lines = [head("📎", "Üretilen görsel TryPost'taki gönderiye eklenecek")]
     else:
-        lines = [head("📝", f"Üretilen {'videoyla' if video else 'görselle'} TryPost'ta yeni taslak oluşturulacak")]
+        lines = [head("📝", "Üretilen görselle TryPost'ta yeni taslak oluşturulacak")]
         if args.get("content"):
             lines.append(f"Metin: {quoted(args.get('content'))}")
     lines.insert(1, _konu(args))
@@ -365,37 +364,12 @@ def _add_logo(args, hint):
             f"Köşe: {corner}" if corner else "", _konu(args)]
 
 
-# create_video (studio video tools, rendered by the render service; no Higgsfield credits).
-VIDEO_PLATFORMS = {
-    "reels": ("Instagram Reels", "9:16"), "story": ("Hikâye", "9:16"), "tiktok": ("TikTok", "9:16"),
-    "shorts": ("YouTube Shorts", "9:16"), "instagram": ("Instagram gönderi", "4:5"), "kare": ("Kare", "1:1"),
-    "linkedin": ("LinkedIn", "1:1"), "x": ("X", "16:9"), "youtube": ("YouTube", "16:9"),
-}
-VIDEO_TEMPLATES = {"etkinlik": "etkinlik duyurusu", "ozel_gun": "özel gün", "alinti": "alıntı", "slayt": "slayt gösterisi"}
-
-
-def _create_video(args, hint):
-    label, ratio = VIDEO_PLATFORMS.get(clean(args.get("platform"), 20) or "reels", ("", ""))
-    where = f"{label} ({ratio})" if label else ""
-    try:
-        seconds = f"{round(float(args.get('sure'))):d} sn"
-    except (TypeError, ValueError):
-        seconds = ""
-    lines = [head("🎬", "Video oluşturulacak", where, seconds, "kredi harcamaz"), _konu(args)]
-    template = VIDEO_TEMPLATES.get(clean(args.get("sablon"), 20))
-    lines.append(f"Şablon: {template}" if template else ("Serbest kompozisyon" if args.get("kompozisyon") else ""))
-    if args.get("seslendirme"):
-        lines.append("Seslendirme" + (" + altyazı" if args.get("altyazi") is not False else ""))
-    return lines
-
-
 STUDIO = {
     "generate_image": _generate_image,
     "edit_image": _edit_image,
     "add_logo": _add_logo,
     "generate_audio": _generate_audio,
     "attach_to_trypost": _attach_to_trypost,
-    "create_video": _create_video,
 }
 
 

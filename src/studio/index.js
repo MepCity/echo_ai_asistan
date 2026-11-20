@@ -10,7 +10,6 @@ import { createHiggsfieldClient } from './higgsfield.js';
 import { createHiggsfieldAuth, createTokenFile } from './oauth.js';
 import { createStudioServer } from './server.js';
 import { createStudioStore, openStudioDatabase } from './store.js';
-import { attachVideo } from './video.js';
 
 /**
  * The studio gateway: an MCP server (http://studio:8091/mcp on the compose
@@ -42,8 +41,7 @@ if (settings.project) {
 const notify = createStudioNotifier({ whatsapp: createWhatsAppClient(config.whatsapp), people: config.people, allowedPeople: config.assistant?.allowedPeople ?? null, log });
 // add_logo: the real logo PNG composited with ImageMagick (magick/convert via execFile, no shell).
 const compositor = createLogoCompositor({ logoDir: settings.logoDir });
-// Video tools (create_video, get_video, transcribe_audio) through the render service; see video.js.
-const gateway = attachVideo(createStudioGateway({ settings, store, higgsfield, auth, trypost, log, notify, compositor }), { config, settings, store, trypost, whatsapp: createWhatsAppClient(config.whatsapp), log });
+const gateway = createStudioGateway({ settings, store, higgsfield, auth, trypost, log, notify, compositor });
 const server = createStudioServer({ gateway, token: process.env.ECHO_STUDIO_TOKEN, log });
 // Jobs still running when their generate call answered "still preparing": finish them (or mark
 // them 'unknown' past studio.pendingStaleMin) even if nobody asks with get_generation.
