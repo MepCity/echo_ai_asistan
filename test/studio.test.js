@@ -383,7 +383,21 @@ describe('studio gateway: limits', () => {
         assert.equal(higgsfield.generated().length, 3);
     });
 
-    it('a job pending past the stale limit is marked unknown, still counted, and stops blocking', async () => {
+    it('a job past the stale limit gets one last look: completed meanwhile, it is stored as completed', async () => {
+        const higgsfield = fakeHiggsfield({ jobStatus: 'in_progress' });
+        const { gateway, store, clock } = setup({ higgsfield, studio: { jobTimeoutSec: 1, pendingStaleMin: 15, limits: { cooldownSec: 0 } } });
+        await image(gateway);
+        const id = store.recent().at(-1).id;
+        higgsfield.jobStatus = 'completed';
+        clock.now += 16 * 60_000;
+        await gateway.checkPending();
+        const row = store.get(id);
+        assert.equal(row.status, 'completed');
+        assert.ok(row.file && row.sha256);
+        assert.match((await call(gateway, 'get_generation', { generation_id: id })).text, /Üretim tamamlandı/);
+    });
+
+    it('a job still running past the stale limit becomes late: no block, still counted, keeps its job id', async () => {
         const higgsfield = fakeHiggsfield({ jobStatus: 'in_progress' });
         const { gateway, store, clock } = setup({ higgsfield, studio: { jobTimeoutSec: 1, pendingStaleMin: 15, limits: { cooldownSec: 0, dailyImages: 2 } } });
         await image(gateway);
@@ -393,12 +407,73 @@ describe('studio gateway: limits', () => {
         clock.now += 61_000;
         const next = await image(gateway);
         assert.equal(next.isError, false, next.text);
-        assert.equal(store.get(id).status, 'unknown');
-        assert.match(store.get(id).reason, /pending over 15 min/);
+        const row = store.get(id);
+        assert.equal(row.status, 'late');
+        assert.equal(row.job_id, JOB);
         assert.equal(higgsfield.generated().length, 2);
-        assert.equal(store.usage(dayOf(clock.now, 'Europe/Istanbul'), '2026-11').counts.image, 2, 'the stale job still counts');
+        assert.equal(store.usage(dayOf(clock.now, 'Europe/Istanbul'), '2026-11').counts.image, 2, 'the late job still counts');
         clock.now += 16 * 60_000;
-        assert.equal((await image(gateway)).text, MESSAGES.dailyImages);
+        assert.match((await call(gateway, 'studio_usage', {})).text, /Geç kalan üretim var/);
+        assert.equal((await image(gateway)).text, MESSAGES.dailyImages, 'late rows count against the daily limit');
+    });
+
+    it('a late row counts against the credit limits', async () => {
+        const higgsfield = fakeHiggsfield({ jobStatus: 'in_progress', estimate: 8 });
+        const { gateway, store, clock } = setup({ higgsfield, studio: { jobTimeoutSec: 1, limits: { cooldownSec: 0, dailyCredits: 12, perPersonDailyCredits: 100 } } });
+        await image(gateway);
+        const id = store.recent().at(-1).id;
+        clock.now += 16 * 60_000;
+        await gateway.checkPending();
+        assert.equal(store.get(id).status, 'late');
+        assert.equal(store.usage(dayOf(clock.now, 'Europe/Istanbul'), '2026-11').dayCredits, 8);
+        assert.match((await image(gateway)).text, /Bugünkü kredi sınırı bu istek için yetmiyor \(kalan yaklaşık 4 kredi\)/);
+    });
+
+    it('a late job completes later through the background check, and get_generation returns it', async () => {
+        const higgsfield = fakeHiggsfield({ jobStatus: 'in_progress' });
+        const { gateway, store, clock, trypost } = setup({ higgsfield, studio: { jobTimeoutSec: 1, limits: { cooldownSec: 0 } } });
+        await image(gateway);
+        const id = store.recent().at(-1).id;
+        clock.now += 16 * 60_000;
+        await gateway.checkPending();
+        assert.equal(store.get(id).status, 'late');
+        assert.equal((await call(gateway, 'get_generation', { generation_id: id })).text, MESSAGES.late(id));
+        clock.now += 3 * 3_600_000;
+        await gateway.checkPending();
+        assert.equal(store.get(id).status, 'late');
+        higgsfield.jobStatus = 'completed';
+        await gateway.checkPending();
+        assert.equal(store.get(id).status, 'completed');
+        assert.match((await call(gateway, 'get_generation', { generation_id: id })).text, /Üretim tamamlandı/);
+        assert.match((await call(gateway, 'get_original_file', { generation_id: id })).text, /MEDIA:/);
+        assert.equal((await call(gateway, 'attach_to_trypost', { generation_id: id, post_id: 'post-1' })).isError, false);
+        assert.deepEqual(trypost.uploads[0].bytes, PNG);
+    });
+
+    it('get_generation itself polls a late job and stores it when done', async () => {
+        const higgsfield = fakeHiggsfield({ jobStatus: 'in_progress' });
+        const { gateway, store, clock } = setup({ higgsfield, studio: { jobTimeoutSec: 1 } });
+        await image(gateway);
+        const id = store.recent().at(-1).id;
+        clock.now += 16 * 60_000;
+        assert.equal((await call(gateway, 'get_generation', { generation_id: id })).text, MESSAGES.late(id), 'stale + still running: late');
+        higgsfield.jobStatus = 'completed';
+        assert.match((await call(gateway, 'get_generation', { generation_id: id })).text, /Üretim tamamlandı/);
+        assert.equal(store.get(id).status, 'completed');
+    });
+
+    it('a late job is given up as unknown after lateMaxHours', async () => {
+        const higgsfield = fakeHiggsfield({ jobStatus: 'in_progress' });
+        const { gateway, store, clock } = setup({ higgsfield, studio: { jobTimeoutSec: 1 } });
+        await image(gateway);
+        const id = store.recent().at(-1).id;
+        clock.now += 16 * 60_000;
+        await gateway.checkPending();
+        assert.equal(store.get(id).status, 'late');
+        clock.now += 24 * 3_600_000;
+        await gateway.checkPending();
+        assert.equal(store.get(id).status, 'unknown');
+        assert.match(store.get(id).reason, /late over 24 h/);
     });
 
     it('a submitting row left by a crash blocks until the stale limit', async () => {
@@ -407,7 +482,9 @@ describe('studio gateway: limits', () => {
         assert.equal((await image(gateway)).text, MESSAGES.pending('gen_crashed'));
         clock.now += 15 * 60_000;
         assert.equal((await image(gateway)).isError, false);
-        assert.equal(store.get('gen_crashed').status, 'unknown');
+        assert.equal(store.get('gen_crashed').status, 'unknown', 'no job id: straight to unknown');
+        assert.match(store.get('gen_crashed').reason, /without a job id/);
+        assert.equal(store.usage(dayOf(clock.now, 'Europe/Istanbul'), '2026-11').counts.image, 2, 'and still counted');
     });
 
     it('starts a new day at midnight in Istanbul, not UTC', async () => {

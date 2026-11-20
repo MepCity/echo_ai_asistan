@@ -327,7 +327,9 @@ Her üretimden önce Higgsfield'in `estimate_*_cost` aracıyla fiyat sorulur. S�
 aynı anda tek üretim (Higgsfield'e gönderilmiş ama bitmemiş bir iş, `submitting`/`submitted`,
 veritabanında durdukça yeni üretim reddedilir; `get_generation`, bir sonraki üretim denemesi ve
 dakikada bir arka plan kontrolü biten işi `completed`/`failed` yapar; `studio.pendingStaleMin`
-(15 dk) geçen iş "unknown" olur, sınırlara sayılır ve artık engellemez); İstanbul gününe göre
+(15 dk) geçince işe son bir kez bakılır: bitmişse saklanır, hâlâ çalışıyorsa "late" olur (yeni
+üretimi engellemez, sınırlara sayılır, `get_generation` ve arka plan kontrolü `studio.lateMaxHours`
+(24 sa) boyunca bakmaya devam eder, sonra "unknown"); job id'si olmayan iş doğrudan "unknown" olur); İstanbul gününe göre
 günde ≤40 kredi, ≤15 görsel, ≤5 müzik, ≤20 seslendirme; ayda ≤400 kredi; kişi başı günde ≤20
 kredi. **Kişi başı sınır en iyi çabadır:** `requested_by`'ı model yazar; Hermes MCP sunucusuna
 çağrıyı kimin (hangi WhatsApp numarasının) yaptığını iletmez (MCP istemcisi yalnızca araç

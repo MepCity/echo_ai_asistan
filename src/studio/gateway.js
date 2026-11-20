@@ -10,7 +10,8 @@ import { parseCredits, parseJob, parseJobIds, parseMediaId, parseUpload } from '
  * credentials. Every generation goes through one path that checks, in order:
  * the request itself (allowlisted model, sizes), one generation at a time (no
  * other call in its submit window, and no earlier job still pending in the
- * database), the cooldown, the daily counts, then Higgsfield's own cost
+ * database; one still running after pendingStaleMin becomes 'late' and stops
+ * blocking), the cooldown, the daily counts, then Higgsfield's own cost
  * estimate against the per-request, daily, monthly and per-person credit caps. Only then is one
  * job sent (count/batch_size 1, never unlimited or free generations unless the
  * config allows), and it is never sent again: a lost answer is recorded as
@@ -68,6 +69,7 @@ export const MESSAGES = {
     lostAnswer: "Higgsfield'den cevap alamadım; üretim yine de yapılmış olabilir. Krediyi boşa harcamamak için tekrar denemiyorum; birkaç dakika sonra studio_usage ile durumu kontrol edebilirsin.",
     notFound: 'Bu üretimi bulamadım.',
     notReady: 'Bu üretim henüz tamamlanmadı.',
+    late: (id) => `Bu üretim (generation_id: ${id}) beklenenden uzun sürüyor; Higgsfield'de hâlâ çalışıyor. Hazır olunca get_generation ile alınabilir; tekrar göndermiyorum. Bu sırada yeni üretim başlatılabilir.`,
     audioAttach:
         "Ses dosyaları Instagram, LinkedIn ya da X gönderisine tek başına eklenemiyor. Dosya saklandı; ileride video servisi gelince videoda kullanılabilecek. Şimdilik WhatsApp'tan dinleyebilirsin.",
     noProject: 'TryPost bağlantısı ayarlı değil; görseli gönderiye eklemek için yöneticiye haber ver.',
@@ -138,6 +140,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
     // Rows a jobs_wait check is running for, so two checks never store the same job twice.
     const settling = new Set();
     const staleMs = settings.pendingStaleMin * 60_000;
+    const lateMs = settings.lateMaxHours * 3_600_000;
     const now = () => store.now();
     const today = () => dayOf(now(), settings.timeZone);
     const newId = () => `gen_${now().toString(36)}${randomBytes(3).toString('hex')}`;
@@ -330,24 +333,56 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         return store.get(id);
     }
 
-    /**
-     * Brings sent-but-unfinished jobs up to date: one jobs_wait look for each 'submitted' job (a
-     * finished one becomes completed/failed), and a job pending longer than pendingStaleMin is marked
-     * 'unknown' (it still counts against the limits). Returns the rows still pending.
-     */
-    async function settlePending({ check = true } = {}) {
-        for (const row of store.pending()) {
-            if (now() - row.created_at >= staleMs) {
-                store.update(row.id, { status: 'unknown', reason: `pending over ${settings.pendingStaleMin} min (last status ${row.status})` });
-                log('warn', 'studio generation stale, marked unknown', row.id, row.status);
-            } else if (check && row.status === 'submitted' && row.job_id && !settling.has(row.id)) {
-                try {
-                    await finish(row.id, row.job_id, now());
-                } catch (error) {
-                    log('warn', 'studio pending check failed', row.id, error.message);
-                }
-            }
+    /** One jobs_wait look at a row's job (a finished one becomes completed/failed); errors are logged, not thrown. */
+    async function lookOnce(row) {
+        if (settling.has(row.id)) return;
+        try {
+            await finish(row.id, row.job_id, now());
+        } catch (error) {
+            log('warn', 'studio pending check failed', row.id, error.message);
         }
+    }
+
+    /**
+     * Brings one sent-but-unfinished row up to date.
+     * - pending ('submitting'/'submitted') under the stale limit: one look when `check`.
+     * - pending past pendingStaleMin: without a job id it becomes 'unknown'; with one, a last look,
+     *   and if the job is still running it becomes 'late' (no longer blocks, still counted, keeps its job id).
+     * - 'late': polled (when `check`) until it finishes; past lateMaxHours it becomes 'unknown'.
+     */
+    async function settleRow(row, { check = true } = {}) {
+        const age = now() - row.created_at;
+        if (row.status === 'late') {
+            if (age >= lateMs) {
+                store.update(row.id, { status: 'unknown', reason: `late over ${settings.lateMaxHours} h` });
+                log('warn', 'studio late generation given up, marked unknown', row.id);
+            } else if (check && row.job_id) {
+                await lookOnce(row);
+            }
+            return;
+        }
+        if (age >= staleMs) {
+            if (!row.job_id) {
+                store.update(row.id, { status: 'unknown', reason: `pending over ${settings.pendingStaleMin} min without a job id (last status ${row.status})` });
+                log('warn', 'studio generation stale without job id, marked unknown', row.id, row.status);
+                return;
+            }
+            if (settling.has(row.id)) return;
+            await lookOnce(row);
+            const after = store.get(row.id);
+            if (after.status === 'submitted' || after.status === 'submitting') {
+                store.update(row.id, { status: 'late', reason: `still running after ${settings.pendingStaleMin} min` });
+                log('warn', 'studio generation late', row.id);
+            }
+            return;
+        }
+        if (check && row.status === 'submitted' && row.job_id) await lookOnce(row);
+    }
+
+    /** Settles pending rows (and, with `late`, polls late ones); returns the rows still pending (blocking). */
+    async function settlePending({ check = true, late = false } = {}) {
+        for (const row of store.pending()) await settleRow(row, { check });
+        if (late) for (const row of store.late()) await settleRow(row, { check });
         return store.pending();
     }
 
@@ -553,6 +588,8 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             `Tek istekte en fazla ${limits.maxCreditsPerRequest} kredi; üretimler arası ${limits.cooldownSec} sn.`,
             inFlight || store.pending().length ? 'Şu an bir üretim sürüyor.' : usage.cooldownLeft > 0 ? `Yeni üretim için ${usage.cooldownLeft} sn beklemek gerekiyor.` : 'Yeni üretim başlatılabilir.',
         ];
+        const late = store.late();
+        if (late.length) lines.push(`Geç kalan üretim var (${late.map((row) => row.id).join(', ')}): Higgsfield'de hâlâ çalışıyor, yeni üretimi engellemiyor ama sınırlara sayılıyor; hazır olunca get_generation ile alınabilir.`);
         const status = auth?.status?.();
         if (status && !status.connected) lines.push('Higgsfield bağlantısı kurulmamış; yöneticinin sunucuda giriş yapması gerekiyor.');
         return lines.join('\n');
@@ -566,14 +603,14 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
 
     async function getGeneration({ generation_id: id }) {
         let row = requireGeneration(id);
-        if (row.status === 'submitted' || row.status === 'submitting') {
-            await settlePending({ check: false });
+        if (['submitting', 'submitted', 'late'].includes(row.status)) {
+            await settleRow(row);
             row = store.get(row.id);
         }
-        if (row.status === 'submitted' && row.job_id) row = await finish(row.id, row.job_id, now());
         if (row.status === 'completed') return describeResult(row, usageNumbers(), ['(Bu sonuç daha önce başlatılmış üretime ait; yeni kredi harcanmadı.)']);
         if (row.status === 'failed') return failedMessage(row);
         if (row.status === 'unknown') return 'Bu üretimin sonucu bilinmiyor (Higgsfield cevap vermedi). Tekrar denemiyorum.';
+        if (row.status === 'late') return MESSAGES.late(row.id);
         return MESSAGES.notReady;
     }
 
@@ -728,10 +765,10 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             }
         },
         usage: usageNumbers,
-        /** Background check of sent jobs (completes or fails finished ones, marks stale ones 'unknown'); skipped while a generation is being sent. */
+        /** Background check of sent and late jobs (completes or fails finished ones, moves stale ones to 'late'/'unknown'); skipped while a generation is being sent. */
         async checkPending() {
             if (inFlight) return;
-            await settlePending();
+            await settlePending({ late: true });
         },
     };
 }

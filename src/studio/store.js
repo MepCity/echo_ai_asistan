@@ -8,8 +8,10 @@ import { DatabaseSync } from 'node:sqlite';
  *   the Europe/Istanbul calendar day and month it was made in (limits count by
  *   them). `status`: 'refused' (never sent), 'submitting' (sent, no answer yet),
  *   'submitted' (Higgsfield took it, job id known), 'completed', 'failed',
- *   'unknown' (the answer was lost, or the job stayed pending past the stale
- *   limit: it may have run and cost credits, so it counts against the limits
+ *   'late' (job id known, still running past the stale limit: no longer blocks
+ *   new generations, still counted, polled until it finishes or lateMaxHours),
+ *   'unknown' (the answer was lost, a job without a job id stayed pending past
+ *   the stale limit, or a late job passed lateMaxHours: it may have run and cost credits, so it counts against the limits
  *   and is never sent again). `requested_by` is the person key the model gave,
  *   or 'bilinmiyor' (shared bucket) when it gave none or an unknown one.
  * - attachments: generated images uploaded to TryPost (post id, upload sha256).
@@ -65,7 +67,7 @@ export function openStudioDatabase(dir) {
 }
 
 // Rows that may have cost credits: everything sent, except jobs Higgsfield reports failed (refunded).
-const SPENT = "status IN ('submitting', 'submitted', 'completed', 'unknown')";
+const SPENT = "status IN ('submitting', 'submitted', 'late', 'completed', 'unknown')";
 
 export function createStudioStore(db, now = () => Date.now()) {
     const credits = 'COALESCE(SUM(COALESCE(actual_credits, estimated_credits, 0)), 0)';
@@ -131,9 +133,13 @@ export function createStudioStore(db, now = () => Date.now()) {
         pending() {
             return db.prepare("SELECT * FROM generations WHERE status IN ('submitting', 'submitted') ORDER BY created_at, rowid").all();
         },
+        /** Jobs still running past the stale limit ('late', job id known), oldest first. They do not block new generations. */
+        late() {
+            return db.prepare("SELECT * FROM generations WHERE status = 'late' AND job_id IS NOT NULL ORDER BY created_at, rowid").all();
+        },
         /** Time of the last generation sent to Higgsfield (for the cooldown), or null. */
         lastSentAt() {
-            const row = db.prepare("SELECT MAX(created_at) AS at FROM generations WHERE status IN ('submitting', 'submitted', 'completed', 'unknown', 'failed')").get();
+            const row = db.prepare("SELECT MAX(created_at) AS at FROM generations WHERE status IN ('submitting', 'submitted', 'late', 'completed', 'unknown', 'failed')").get();
             return row?.at ?? null;
         },
         addAttachment(row) {

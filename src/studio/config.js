@@ -18,7 +18,8 @@ import { join } from 'node:path';
  *     "voices": { "kadin": { "id": "<voice id>", "label": "Kadın" }, ... }, "defaultVoice": "kadin",
  *     "allowUnlim": false, "allowFreeGens": false,
  *     "jobTimeoutSec": 180,            // how long one generate call waits for its job before answering "still preparing"
- *     "pendingStaleMin": 15,           // a job pending longer than this is marked 'unknown' and no longer blocks
+ *     "pendingStaleMin": 15,           // a job pending longer than this stops blocking: one last check, then 'late' (or 'unknown' without a job id)
+ *     "lateMaxHours": 24,              // a 'late' job is polled this long, then marked 'unknown'
  *     "previewDir": "...", "hermesPreviewDir": "...", "referenceDirs": ["..."], "brandKitFile": "..."
  *   }
  * }
@@ -161,6 +162,8 @@ export function normalizeStudio(raw, config, env = process.env) {
         jobTimeoutSec: number(value.jobTimeoutSec, 180, 'jobTimeoutSec', 1),
         // A sent job still pending after this long is marked 'unknown' (still counted) and stops blocking new ones.
         pendingStaleMin: number(value.pendingStaleMin, 15, 'pendingStaleMin', 1),
+        // A job still running at the stale limit becomes 'late' (not blocking, still counted) and is polled this long, then 'unknown'.
+        lateMaxHours: number(value.lateMaxHours, 24, 'lateMaxHours', 1),
         waitSliceSec: Math.min(number(value.waitSliceSec, 10, 'waitSliceSec', 0), 15),
         maxDownloadMb: number(value.maxDownloadMb, 50, 'maxDownloadMb', 1),
         whatsappPreviewMaxMb: number(value.whatsappPreviewMaxMb, 5, 'whatsappPreviewMaxMb', 0),
