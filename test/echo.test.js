@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { after, beforeEach, describe, it } from 'node:test';
 import { normalizeConfig } from '../src/config.js';
+import { addressName, createAssistant } from '../src/assistant.js';
 import { createEcho } from '../src/core.js';
 import { createStore, openDatabase } from '../src/db.js';
 import { createTryPostProject, fingerprint, sameVersion, versionTag } from '../src/projects/trypost.js';
@@ -1502,11 +1503,54 @@ describe('assistant (Hermes) behind Echo', () => {
             assert.equal(answer.status, 200);
             for (let i = 0; i < 200 && !hermes.accepted.length; i++) await new Promise((resolve) => setTimeout(resolve, 5));
             assert.equal(hermes.accepted.length, 1);
-            assert.deepEqual(hermes.accepted[0], JSON.parse(body));
+            // Everything as Meta sent it, except the name: Hermes calls Ayşe by her name in config.
+            const expected = JSON.parse(body);
+            expected.entry[0].changes[0].value.contacts[0].profile.name = 'Ayşe';
+            assert.deepEqual(hermes.accepted[0], expected);
         } finally {
             server.closeAllConnections();
             server.close();
         }
+    });
+
+    it('calls a known person by the first name in config, not by their WhatsApp profile name', async () => {
+        await hermes.close();
+        hermes = await fakeHermes();
+        t = setup({
+            assistant: { url: hermes.url, enabled: true, allowedPeople: ['yasir', 'ayse'] },
+            people: [
+                { id: 'yasir', name: 'Yasir Arslan', phone: PHONES.yasir },
+                { id: 'ayse', name: 'Ayşe Kaya', phone: PHONES.ayse, hitap: 'Ayşe Hoca' },
+                { id: 'mehmet', name: 'Mehmet', phone: PHONES.mehmet },
+            ],
+        });
+        const body = (from, name, id) => ({
+            object: 'whatsapp_business_account',
+            entry: [{ id: 'waba-1', changes: [{ field: 'messages', value: {
+                messaging_product: 'whatsapp',
+                metadata: { display_phone_number: '908500000000', phone_number_id: '1' },
+                contacts: [{ profile: { name }, wa_id: from }],
+                messages: [{ from, id, timestamp: '1762862400', type: 'text', text: { body: 'selam' } }],
+            } }] }],
+        });
+        await t.echo.handleWebhook(parseWebhook(body(PHONES.yasir, 'YA 🚀', 'm1')));
+        await t.echo.handleWebhook(parseWebhook(body(PHONES.ayse, 'ayşe k.', 'm2')));
+        const [yasir, ayse] = hermes.accepted.map((b) => b.entry[0].changes[0].value);
+        assert.deepEqual(yasir.contacts, [{ profile: { name: 'Yasir' }, wa_id: PHONES.yasir }]);
+        assert.equal(yasir.messages[0].from, PHONES.yasir);
+        assert.deepEqual(ayse.contacts, [{ profile: { name: 'Ayşe Hoca' }, wa_id: PHONES.ayse }]); // hitap wins
+        assert.equal(ayse.messages[0].from, PHONES.ayse);
+    });
+
+    it('keeps Meta\'s profile name for a sender Echo does not know', () => {
+        const assistant = createAssistant({ url: 'http://x', appSecret: 's', timeoutMs: 1000 }, { phoneNumberId: '1' });
+        const contact = { profile: { name: 'Biri' }, wa_id: '905559999999' };
+        const message = { id: 'm1', from: '905559999999', type: 'text', text: 'selam', contact };
+        const value = assistant.messageBody(message, null).entry[0].changes[0].value;
+        assert.deepEqual(value.contacts, [contact]);
+        assert.equal(addressName({ name: '  Hasan Vural ' }), 'Hasan');
+        assert.equal(addressName({ name: 'Bilal Karabali', hitap: ' ' }), 'Bilal');
+        assert.equal(addressName(null), '');
     });
 
     it('keeps Echo\'s own flows: buttons, note sessions, quote-replies and "iptal"', async () => {
@@ -1692,7 +1736,7 @@ describe('senders without a phone number (WhatsApp usernames, BSUIDs)', () => {
             const value = hermes.accepted[0].entry[0].changes[0].value;
             assert.equal(value.messages[0].from, PHONES.ayse);
             assert.equal(value.messages[0].from_user_id, BSUID);
-            assert.deepEqual(value.contacts[0], { profile: { name: 'Ayşe K.', username: 'ayse.k' }, user_id: BSUID, wa_id: PHONES.ayse });
+            assert.deepEqual(value.contacts[0], { profile: { name: 'Ayşe', username: 'ayse.k' }, user_id: BSUID, wa_id: PHONES.ayse });
             // A status of Hermes' message addressed by BSUID only is still forwarded.
             await t.echo.handleWebhook({ messages: [], statuses: [{ id: 'wamid.h1', status: 'read', recipient: null, recipientUserId: BSUID }] });
             assert.equal(hermes.statuses().length, 1);

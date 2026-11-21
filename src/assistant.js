@@ -37,11 +37,16 @@ export function createAssistant(config, { phoneNumberId, fetchImpl = globalThis.
      * One stored inbound message (see parseWebhook), as the webhook Meta sent it.
      * Hermes knows people only by phone number (`from`, `contacts[].wa_id`): when
      * Meta left it out (a user with a username, see whatsapp.js isUserId), Echo
-     * puts in the number of the person it resolved the sender to.
+     * puts in the number of the person it resolved the sender to. Hermes calls
+     * the user by `contacts[].profile.name`, so for a known person Echo puts in
+     * their address name from config (addressName) instead of their WhatsApp
+     * profile name; an unknown sender keeps Meta's.
      */
     function messageBody(message, person) {
         let raw = rawMessage(message);
         let contact = message.contact ?? { profile: { name: person?.name ?? '' }, wa_id: message.from };
+        const name = addressName(person);
+        if (name) contact = { ...contact, profile: { ...contact.profile, name } };
         const phone = person?.phone && !isUserId(person.phone) ? person.phone : null;
         if (phone && !raw.from) raw = { ...raw, from: phone };
         if (phone && !contact.wa_id) contact = { ...contact, wa_id: phone };
@@ -67,6 +72,16 @@ export function createAssistant(config, { phoneNumberId, fetchImpl = globalThis.
         messageBody,
         statusBody,
     };
+}
+
+/**
+ * What the assistant calls a person: `people[].hitap` when set, otherwise the
+ * first word of `people[].name` ("Yasir Arslan" -> "Yasir"). Empty for no person.
+ */
+export function addressName(person) {
+    const hitap = String(person?.hitap ?? '').trim();
+    if (hitap) return hitap;
+    return String(person?.name ?? '').trim().split(/\s+/)[0] ?? '';
 }
 
 /** The message as Meta sent it; rebuilt from the parsed fields for rows stored before Echo kept it. */

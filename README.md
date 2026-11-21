@@ -274,7 +274,9 @@ token'ları yeniden kopyalanır).
 
 **İzinli numara eklemek:** iki yerde olmalı. (1) Echo: `/opt/echo/config.json` içindeki
 `people` listesine `{ "id": "ad", "name": "Ad", "phone": "905xxxxxxxxx" }` ekle (Echo
-bilinmeyen numaraları Hermes'e hiç iletmez). İsteğe bağlı: `"whatsappUsername": "kullaniciadi"`
+bilinmeyen numaraları Hermes'e hiç iletmez). Hermes kişiye WhatsApp profil adıyla değil,
+Echo'nun ilettiği adla hitap eder: isteğe bağlı `"hitap": "Ad"`, yoksa `name`'in ilk kelimesi
+(`"Yasir Arslan"` → Yasir). İsteğe bağlı: `"whatsappUsername": "kullaniciadi"`
 (WhatsApp kullanıcı adı, büyük/küçük harf ve `@` fark etmez) ve `"whatsappUserId": "TR.…"`
 (Meta'nın BSUID'si). Kullanıcı adı olan biri Meta'nın webhook'unda numarasız (yalnızca
 `from_user_id` / `contacts[].user_id` ile) gelebilir; Echo onu bu alanlarla ya da daha önce

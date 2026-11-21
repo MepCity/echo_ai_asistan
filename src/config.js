@@ -10,8 +10,8 @@ import { readFileSync } from 'node:fs';
  *   "publicUrl": "https://echo.example.com",
  *   "whatsapp": { "phoneNumberId": "...", "accessToken": "${WA_ACCESS_TOKEN}",
  *                 "appSecret": "${WA_APP_SECRET}", "verifyToken": "${WA_VERIFY_TOKEN}" },
- *   "people": [ { "id": "yasir", "name": "Yasir", "phone": "905xxxxxxxxx",
- *                 "whatsappUsername": "yasir", "whatsappUserId": "TR.1234..." } ],
+ *   "people": [ { "id": "yasir", "name": "Yasir Arslan", "phone": "905xxxxxxxxx",
+ *                 "hitap": "Yasir", "whatsappUsername": "yasir", "whatsappUserId": "TR.1234..." } ],
  *   "projects": [ { "id": "marmara", "type": "trypost", "name": "Marmara AI Sosyal",
  *                   "apiUrl": "https://sosyal.marmaraai.com/api", "publicUrl": "https://sosyal.marmaraai.com",
  *                   "apiToken": "${TRYPOST_API_TOKEN}", "webhookSecret": "${TRYPOST_WEBHOOK_SECRET}",
@@ -25,7 +25,8 @@ import { readFileSync } from 'node:fs';
  * number; Echo then finds them by `whatsappUserId` (optional), by
  * `whatsappUsername` (optional, any case, with or without "@"), or by the
  * BSUID it saw earlier together with their phone number. A person without a
- * phone is written to at their BSUID.
+ * phone is written to at their BSUID. `hitap` (optional) is what the assistant
+ * calls the person; without it, the first word of `name`.
  *
  * A TryPost project may set "mediaBridge": true (or false). With an assistant,
  * images, videos and PDFs people send are uploaded to that project's TryPost
