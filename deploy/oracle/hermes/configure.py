@@ -82,6 +82,19 @@ LOCALE_TR = {
 # plugins.disabled stays off (Hermes then shows its own English approval text).
 ECHO_PLUGINS = ["echo_onay_tr"]
 
+# Voice messages (Hermes gateway/run_inbound_transcription.py, tools/transcription_tools.py): local
+# faster-whisper, free and on the VM. "small" because "base" gets Turkish badly wrong; on the VM's two
+# ARM cores small/int8 takes roughly 10-15 s for a 15 s clip and ~0.5-0.7 GB RAM while loaded, freed
+# after 10 idle minutes. faster-whisper is not in the image: setup-hermes.sh installs the stt-whisper
+# extra into /opt/hermes/data/installs (hermes pm install), which survives image updates.
+STT_DEFAULTS = {"provider": "local", "enabled": True, "echo_transcripts": True}
+STT_LOCAL_DEFAULTS = {
+    "model": "small",
+    "device": "cpu",
+    "compute_type": "int8",
+    "unload_after_idle_seconds": 600,
+}
+
 # onboarding.seen flags (Hermes agent/onboarding.py) marked as already shown.
 ONBOARDING_SEEN_FLAGS = [
     "profile_build_offered",
@@ -183,6 +196,21 @@ def main(path):
     if display.get("language") in (None, "", "en"):
         display["language"] = "tr"
     config["display"] = display
+
+    # Voice messages: only what is missing is filled in, so a provider, model or setting the user
+    # picked stays. Hermes' default language is "en" (forced, so Turkish comes out as English
+    # nonsense); like display.language above, that one is replaced. The transcript is echoed back
+    # (🎙️ "…") before the answer so the user sees what was understood.
+    stt = config.get("stt") if isinstance(config.get("stt"), dict) else {}
+    for key, value in STT_DEFAULTS.items():
+        stt.setdefault(key, value)
+    if stt.get("language") in (None, "", "en"):
+        stt["language"] = "tr"
+    local = stt.get("local") if isinstance(stt.get("local"), dict) else {}
+    for key, value in STT_LOCAL_DEFAULTS.items():
+        local.setdefault(key, value)
+    stt["local"] = local
+    config["stt"] = stt
 
     # No "gateway shutting down / restarted" notices to WhatsApp users on updates
     # (gateway/config.py gateway_restart_notification; a root-level platform block).

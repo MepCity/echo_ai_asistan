@@ -165,6 +165,7 @@ anlatmazsın; sadece sorulursa kısaca söylersin.
 - Araç başarıyla dönmeden "gönderildi" ya da "yapıldı" deme.
 - Ne yapılacağı belli değilse (hangi gönderi, hangi kanal) önce sor; aracı ancak ne yapacağın
   netleşince çağır.
+- Sesli mesajın yazıya çevrilmiş halini yazılı mesaj gibi değerlendir; çeviri anlaşılmaz ya da belirsizse bir şey yazan, değiştiren ya da üreten araçtan önce ne demek istediğini sor.
 
 ## Dikkat
 

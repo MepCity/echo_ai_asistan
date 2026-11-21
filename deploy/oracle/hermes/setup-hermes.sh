@@ -216,6 +216,24 @@ EOF
   fi
 fi
 
+# --- Voice messages: faster-whisper (local, free speech-to-text) ---------------------------------
+# Not in the official image, and Hermes' gateway never installs it by itself (with it missing, the
+# "local" provider resolves to none). An explicit PM install puts the stt-whisper extra into a
+# dependency generation under $DATA/installs (recorded in its facts.json): it survives `compose pull`,
+# and each new image re-resolves it on boot. Takes effect on the restart below. The Whisper model
+# itself (stt.local.model in config.yaml) downloads on the first voice message into $DATA/.cache.
+if grep -qs '"stt-whisper"' "$DATA"/installs/*/facts.json; then
+  echo "Sesli mesaj: faster-whisper zaten kurulu."
+else
+  say "Sesli mesaj icin faster-whisper kuruluyor (bir kerelik, ~100 MB, birkac dakika)"
+  if compose exec -T hermes hermes pm install --extra stt-whisper; then
+    echo "faster-whisper kuruldu; Hermes yeniden baslayinca sesli mesajlar yaziya cevrilir."
+  else
+    echo "UYARI: faster-whisper kurulamadi; sesli mesajlar yaziya cevrilmez (yazili mesajlar calisir)."
+    echo "  Sonra tekrar: bash $HERE/hermes.sh pm install --extra stt-whisper && bash $HERE/setup-hermes.sh --skip-login"
+  fi
+fi
+
 # --- Config again (Hermes may have migrated it on first start), restart --------------------------
 python3 -I "$HERE/configure.py" "$DATA/config.yaml"
 restarted_at=$(date +%s)
