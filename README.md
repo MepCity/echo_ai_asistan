@@ -259,6 +259,24 @@ Tekrar çalıştırmak güvenlidir; `--skip-login` ile girişleri atlar, sadece 
 yeniler. `update.sh` Hermes kuruluysa onu da günceller (yeni imaj, WhatsApp
 token'ları yeniden kopyalanır).
 
+**Sesli mesajlar:** Hermes WhatsApp sesli mesajlarını VM'de, ücretsiz olarak yazıya çevirir
+(faster-whisper; `config.yaml` → `stt`: `provider: local`, model `small`, `int8`, dil `tr`).
+Resmi Hermes imajında faster-whisper yok; bu yüzden `hermes` servisi resmi imajın üstüne onu
+ekleyen küçük bir imajdır (`deploy/oracle/hermes/Dockerfile`, sürümler Hermes'in kendi
+`uv.lock`'undan). `setup-hermes.sh` (ve onu çağıran `update.sh`) her seferinde resmi imajın
+yenisini çekip (`docker compose build --pull hermes`) bu eki yeniden kurar; imaj
+değişmediyse saniyeler sürer, ilk seferde birkaç dakika. Whisper modeli (yaklaşık 500 MB) bir kez
+`/opt/hermes/data/cache/huggingface` klasörüne iner (`HF_HOME`); konteyner ya da imaj
+yenilense de tekrar inmez. Script sonunda durumu yazar: `Sesli mesaj: ACIK.` ya da
+`Sesli mesaj: KAPALI.` (nedeniyle). Yeni imaj oluşturulamazsa (Docker Hub/PyPI'ya
+ulaşılamadı) önceki imajla devam eder. Elle kontrol:
+`docker compose -f /opt/echo/app/deploy/oracle/docker-compose.yml --env-file /opt/echo/.env --profile hermes exec hermes /opt/hermes/.venv/bin/python -c "import faster_whisper; print(faster_whisper.__version__)"`.
+Denemek için izinli numaradan kısa bir Türkçe sesli mesaj gönder: Hermes önce çevrilmiş metni
+yazar (`stt.echo_transcripts`), sonra ona göre cevap verir. İlk mesajda model belleğe yüklenir
+(birkaç saniye fazladan), 15 saniyelik bir mesaj yaklaşık 10-15 saniyede çevrilir.
+`bash /opt/echo/app/deploy/oracle/hermes/hermes.sh logs --follow` içinde
+`Transcribing user voice` satırı görünür; hata olursa `transcription failed` satırı nedenini söyler.
+
 **Komutlar** (`H=/opt/echo/app/deploy/oracle/hermes`):
 
 | Ne | Komut |

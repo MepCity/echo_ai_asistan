@@ -36,12 +36,16 @@ if [ -f "$HERMES_ENV" ]; then
   bash "$APP/deploy/oracle/hermes/studio-prepare.sh"
 fi
 echo "==> build and start"
-compose up -d --build
+# Hermes is left to setup-hermes.sh below: it pulls the new official image, builds Echo's
+# addition on top (faster-whisper, hermes/Dockerfile) and keeps the running Hermes if that fails.
+SERVICES=(echo caddy)
+[ -f "$HERMES_ENV" ] && SERVICES+=(studio)
+compose up -d --build "${SERVICES[@]}"
 compose restart echo   # re-reads config.json
 if [ -f "$HERMES_ENV" ]; then compose restart studio; fi   # re-reads config.json (studio limits)
 
 if [ -f "$HERMES_ENV" ]; then
-  echo "==> Hermes: new image, settings synced from $ENV_FILE"
+  echo "==> Hermes: new image (+ faster-whisper), settings synced from $ENV_FILE"
   bash "$APP/deploy/oracle/hermes/setup-hermes.sh" --skip-login
 fi
 

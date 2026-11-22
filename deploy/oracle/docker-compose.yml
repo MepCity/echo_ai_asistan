@@ -45,13 +45,24 @@ services:
 
   hermes:
     profiles: ["hermes"]
-    # Official multi-arch image (amd64 + arm64); "stable" is the release-gated channel.
-    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:stable}
+    # The official multi-arch image (amd64 + arm64; "stable" is the release-gated channel) plus
+    # faster-whisper for voice messages (hermes/Dockerfile). setup-hermes.sh (run by update.sh)
+    # rebuilds it with --pull, so a new official image is picked up on every update.
+    build:
+      context: ./hermes
+      dockerfile: Dockerfile
+      args:
+        HERMES_IMAGE: ${HERMES_IMAGE:-nousresearch/hermes-agent:stable}
+    image: echo-hermes:local
     command: ["gateway", "run"]
     environment:
       # Files in /opt/hermes/data stay owned by the VM user (ubuntu).
       HERMES_UID: ${HERMES_UID:-1000}
       HERMES_GID: ${HERMES_GID:-1000}
+      # Hugging Face cache (the Whisper model, stt.local.model in config.yaml) on the data volume:
+      # downloaded once, kept across container recreation and image updates.
+      HF_HOME: /opt/data/cache/huggingface
+      HF_HUB_DISABLE_TELEMETRY: "1"
     volumes:
       # Hermes' HERMES_HOME: .env, config.yaml, SOUL.md, auth.json, mcp-tokens/, sessions, logs.
       - /opt/hermes/data:/opt/data

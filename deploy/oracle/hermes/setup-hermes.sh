@@ -133,9 +133,19 @@ echo "config.yaml: saglayici openai-codex (secilen model korunur), TryPost MCP (
 bash "$HERE/studio-prepare.sh"
 
 # --- Start Hermes -----------------------------------------------------------------------------
-say "Hermes imaji indiriliyor ve baslatiliyor (ilk sefer birkac dakika surebilir)"
-compose pull hermes
-compose up -d --build studio hermes
+# The hermes service is the official image plus faster-whisper (hermes/Dockerfile, see the voice
+# message check below). --pull fetches the newest official image; an unchanged one reuses the
+# cached layer, so this is quick after the first build.
+say "Hermes imaji indiriliyor ve sesli mesaj eki (faster-whisper) ekleniyor (ilk sefer birkac dakika surebilir)"
+if compose build --pull hermes; then
+  echo "Hermes imaji hazir (resmi imaj + faster-whisper)."
+elif "${DOCKER[@]}" image inspect echo-hermes:local >/dev/null 2>&1; then
+  echo "UYARI: Hermes imaji yeniden olusturulamadi (Docker Hub ya da PyPI'ya ulasilamadi olabilir); onceki imajla devam ediliyor."
+  echo "  Sonra tekrar: bash $APP/deploy/oracle/update.sh"
+else
+  fail "Hermes imaji olusturulamadi (yukaridaki hataya bak). Internet baglantisini kontrol edip tekrar calistir."
+fi
+compose up -d studio hermes
 for _ in $(seq 1 60); do
   if compose exec -T echo wget -qO- http://hermes:8090/health >/dev/null 2>&1; then break; fi
   sleep 3
@@ -216,24 +226,6 @@ EOF
   fi
 fi
 
-# --- Voice messages: faster-whisper (local, free speech-to-text) ---------------------------------
-# Not in the official image, and Hermes' gateway never installs it by itself (with it missing, the
-# "local" provider resolves to none). An explicit PM install puts the stt-whisper extra into a
-# dependency generation under $DATA/installs (recorded in its facts.json): it survives `compose pull`,
-# and each new image re-resolves it on boot. Takes effect on the restart below. The Whisper model
-# itself (stt.local.model in config.yaml) downloads on the first voice message into $DATA/.cache.
-if grep -qs '"stt-whisper"' "$DATA"/installs/*/facts.json; then
-  echo "Sesli mesaj: faster-whisper zaten kurulu."
-else
-  say "Sesli mesaj icin faster-whisper kuruluyor (bir kerelik, ~100 MB, birkac dakika)"
-  if compose exec -T hermes hermes pm install --extra stt-whisper; then
-    echo "faster-whisper kuruldu; Hermes yeniden baslayinca sesli mesajlar yaziya cevrilir."
-  else
-    echo "UYARI: faster-whisper kurulamadi; sesli mesajlar yaziya cevrilmez (yazili mesajlar calisir)."
-    echo "  Sonra tekrar: bash $HERE/hermes.sh pm install --extra stt-whisper && bash $HERE/setup-hermes.sh --skip-login"
-  fi
-fi
-
 # --- Config again (Hermes may have migrated it on first start), restart --------------------------
 python3 -I "$HERE/configure.py" "$DATA/config.yaml"
 restarted_at=$(date +%s)
@@ -267,6 +259,75 @@ else
   echo "  ve ilk mesajdan sonra: cat $PLUGIN_DST/status.json"
 fi
 
+# --- Voice messages: faster-whisper (local, free speech-to-text) ---------------------------------
+# faster-whisper is baked into the hermes image (hermes/Dockerfile), into the venv the gateway runs
+# from (/opt/hermes/.venv), so it survives container recreation and comes back with every image
+# update. Hermes boots from a PM dependency generation under $DATA/installs instead when one is
+# committed there (an opt-in extra or plugin dependency Hermes installed by itself); that one would
+# lack faster-whisper, so the check looks at the environment Hermes actually selects. The Whisper
+# model (stt.local.model in config.yaml) is fetched here once into HF_HOME
+# (/opt/data/cache/huggingface, on the data volume), so the first voice message does not wait for it.
+say "Sesli mesaj (yaziya cevirme) kontrolu"
+stt_provider=- stt_model=small stt_compute=- stt_language=-
+IFS=$'\t' read -r stt_provider stt_model stt_compute stt_language < <(python3 -I -c '
+import sys, yaml
+with open(sys.argv[1], encoding="utf-8") as handle:
+    config = yaml.safe_load(handle) or {}
+stt = config.get("stt") if isinstance(config.get("stt"), dict) else {}
+local = stt.get("local") if isinstance(stt.get("local"), dict) else {}
+print("\t".join(str(value) for value in (stt.get("provider") or "-", local.get("model") or "small",
+                                          local.get("compute_type") or "-", stt.get("language") or "-")))
+' "$DATA/config.yaml") || true
+stt_check=$(compose exec -T -u hermes hermes /opt/hermes/.venv/bin/python -c '
+import sys
+from importlib.machinery import PathFinder
+from pathlib import Path
+sys.path.insert(0, "/opt/hermes")
+try:
+    import ctranslate2
+    import faster_whisper
+except Exception as exc:
+    print(f"yok: {exc}")
+    sys.exit(1)
+try:
+    from pm.environments import selected_venv, site_packages
+    environment = selected_venv(Path("/opt/hermes"))
+    site = site_packages(environment)
+    if site.is_dir() and PathFinder.find_spec("faster_whisper", [str(site)]) is None:
+        print(f"ortam: {environment}")
+        sys.exit(2)
+except Exception:
+    pass  # another PM layout: the import above is the check
+print(faster_whisper.__version__)
+' 2>&1) && stt_rc=0 || stt_rc=$?
+stt_status="KAPALI"
+if [ "$stt_rc" = 0 ]; then
+  if compose exec -T -u hermes hermes /opt/hermes/.venv/bin/python -c '
+import sys
+from faster_whisper.utils import download_model
+download_model(sys.argv[1])
+' "$stt_model" >/dev/null 2>&1; then
+    stt_model_note="model $stt_model indirildi ($DATA/cache/huggingface)"
+  else
+    stt_model_note="UYARI: model $stt_model simdi indirilemedi (Hugging Face'e erisim?), ilk sesli mesajda tekrar denenir"
+  fi
+  if [ "$stt_provider" = local ]; then
+    stt_status="ACIK"
+    echo "Sesli mesaj: ACIK. WhatsApp sesli mesajlari VM'de yaziya cevrilir (faster-whisper ${stt_check##*$'\n'}, model $stt_model, $stt_compute, dil $stt_language)."
+  else
+    stt_status="saglayici $stt_provider"
+    echo "Sesli mesaj: faster-whisper hazir ama config.yaml stt.provider '$stt_provider' (yerel degil); sesli mesajlar o saglayiciyla cevrilir."
+  fi
+  echo "  $stt_model_note"
+elif [ "$stt_rc" = 2 ]; then
+  echo "Sesli mesaj: KAPALI. Hermes kendi bagimlilik ortamiyla aciliyor (${stt_check#ortam: }) ve orada faster-whisper yok;"
+  echo "  sesli mesajlar yaziya cevrilmez (yazili mesajlar calisir). Kontrol: bash $HERE/hermes.sh doctor"
+else
+  echo "Sesli mesaj: KAPALI. Hermes'te faster-whisper yuklenemiyor; sesli mesajlar yaziya cevrilmez (yazili mesajlar calisir)."
+  echo "  Ayrinti: ${stt_check:-Hermes calismiyor olabilir}"
+  echo "  Imaji yeniden olusturmak icin: bash $APP/deploy/oracle/update.sh"
+fi
+
 # --- Echo forwards to Hermes ------------------------------------------------------------------------
 say "Echo -> Hermes yonlendirmesi"
 if jq -e '.assistant.url' "$ECHO_CONFIG" >/dev/null 2>&1; then
@@ -289,6 +350,7 @@ cat <<EOF
 
  Echo'nun onay/gorus mesajlari ve onlara verilen cevaplar Echo'da kalir;
  geri kalan her sey Hermes'e gider.
+ Sesli mesajin yaziya cevrilmesi: $stt_status
 
  Komutlar:
    Loglar        : bash $HERE/hermes.sh logs --follow

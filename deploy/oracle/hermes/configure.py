@@ -85,8 +85,9 @@ ECHO_PLUGINS = ["echo_onay_tr"]
 # Voice messages (Hermes gateway/run_inbound_transcription.py, tools/transcription_tools.py): local
 # faster-whisper, free and on the VM. "small" because "base" gets Turkish badly wrong; on the VM's two
 # ARM cores small/int8 takes roughly 10-15 s for a 15 s clip and ~0.5-0.7 GB RAM while loaded, freed
-# after 10 idle minutes. faster-whisper is not in the image: setup-hermes.sh installs the stt-whisper
-# extra into /opt/hermes/data/installs (hermes pm install), which survives image updates.
+# after 10 idle minutes. faster-whisper is not in the official image: hermes/Dockerfile adds the
+# stt-whisper extra (uv.lock pins) to the image's venv, rebuilt on every update; the model downloads
+# once into HF_HOME=/opt/data/cache/huggingface (docker-compose.yml), checked by setup-hermes.sh.
 STT_DEFAULTS = {"provider": "local", "enabled": True, "echo_transcripts": True}
 STT_LOCAL_DEFAULTS = {
     "model": "small",
