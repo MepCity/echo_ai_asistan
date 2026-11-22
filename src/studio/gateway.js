@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { basename, extname, join, resolve, sep } from 'node:path';
 import { DEFAULT_IMAGE_MODEL, DEFAULT_IMAGE_RESOLUTION, IMAGE_MODELS, MUSIC_MODEL, SPEECH_MODEL, UNKNOWN_PERSON, personBucket } from './config.js';
 import { answerExcerpt, parseCredits, parseJob, parseJobIds, parseMediaId, parseUpload, rawAnswer } from './higgsfield.js';
@@ -101,6 +101,11 @@ export const MESSAGES = {
     logoFailed: 'Logoyu görsele ekleyemedim; görsel değişmedi. Yöneticiye haber ver.',
     logoFile: 'Kulüp logosu dosyası sunucuda bulunamadı; yöneticiye haber ver.',
     notImage: 'Bu işlem sadece görseller için.',
+    // A picture the user sent (kaynak_gorsel / reference_image) that cannot be read: the cause, named.
+    referenceMissing: (name) => `Gönderilen görseli açamadım: dosya bulunamadı (${name}). Yol yanlış olabilir ya da dosya sunucudan silinmiş; Hermes'in verdiği yolu aynen kullan, yine bulunamazsa kullanıcıdan görseli WhatsApp'tan tekrar göndermesini iste.`,
+    referenceDenied: (name) => `Gönderilen görseli açamadım: izin yok (stüdyo ${name} dosyasını okuyamıyor). Bu bir sunucu ayarı sorunu; görseli tekrar göndermek işe yaramaz. Kullanıcıya bunu söyle ve yöneticiye haber vermesini iste.`,
+    referenceType: (what) => `Gönderilen dosyayı açamadım: desteklenmeyen tür (${what}). Sadece PNG, JPEG ya da WebP görseller kullanılabilir.`,
+    referenceOutside: 'Bu dosya referans olarak kullanılamaz; sadece kullanıcının WhatsApp’tan gönderdiği görseller ya da kulüp logosu kullanılabilir.',
     editSource: 'Düzenlenecek görseli bulamadım. Önceki bir üretimin generation_id’sini (gen_…) ya da kullanıcının gönderdiği görselin yolunu ver.',
     stillPreparing: (id) => `Üretim hâlâ hazırlanıyor (generation_id: ${id}). Kullanıcıya biraz sürdüğünü ve hazır olunca önizlemenin WhatsApp'tan kendiliğinden geleceğini söyle; sorarsa get_generation ile sonucu al. Yeni bir üretim başlatma.`,
     variantsCount: (left) => `Bugün yalnızca ${left} görsel hakkı kaldı; iki seçenek için yetmiyor. Tek görsel üretebilirim.`,
@@ -213,6 +218,14 @@ export function dayOf(ms, timeZone) {
 }
 
 const round = (value) => Math.round(Number(value) * 100) / 100;
+
+/** The image type of a file's first bytes: image/png, image/jpeg, image/webp, or null. */
+export function imageMime(bytes) {
+    if (bytes.length >= 8 && bytes.readUInt32BE(0) === 0x89504e47 && bytes.readUInt32BE(4) === 0x0d0a1a0a) return 'image/png';
+    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+    if (bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+    return null;
+}
 
 /** Width and height of a PNG, JPEG or WebP, or null (no decoding; just the header). */
 export function imageSize(bytes) {
@@ -347,20 +360,54 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         return mediaId;
     }
 
-    /** The real path of a picture the user sent (inside referenceDirs), or a refusal. */
+    /**
+     * The real path of a picture the user sent, or a refusal naming the cause. Strict: the path as
+     * given must be inside one of settings.referenceDirs (nothing outside is even looked at), its
+     * realpath must still be inside one (no symlink out), it must be a regular file with a PNG/JPEG/
+     * WebP extension whose first bytes are that same image type, and the studio must be able to open it.
+     */
     function userImagePath(value) {
-        for (const dir of settings.referenceDirs) {
-            const root = resolve(dir);
-            let real;
-            try {
-                real = realpathSync(resolve(value));
-            } catch {
-                refuse('Referans görsel dosyasını bulamadım; kullanıcıdan görseli tekrar göndermesini iste.');
-            }
-            const rootReal = existsSync(root) ? realpathSync(root) : root;
-            if (real.startsWith(rootReal + sep)) return real;
+        const inside = (path, root) => path.startsWith(root.endsWith(sep) ? root : root + sep);
+        const given = resolve(String(value));
+        const roots = settings.referenceDirs.map((dir) => resolve(dir));
+        if (!roots.some((root) => inside(given, root))) refuse(MESSAGES.referenceOutside);
+        const name = basename(given);
+        const cause = (error) => {
+            if (error?.code === 'EACCES' || error?.code === 'EPERM') return MESSAGES.referenceDenied(name);
+            if (error?.code === 'ELOOP') return MESSAGES.referenceOutside;
+            return MESSAGES.referenceMissing(name);
+        };
+        let real;
+        try {
+            real = realpathSync(given);
+        } catch (error) {
+            refuse(cause(error));
         }
-        refuse('Bu dosya referans olarak kullanılamaz; sadece kullanıcının WhatsApp’tan gönderdiği görseller ya da kulüp logosu kullanılabilir.');
+        const realRoots = roots.flatMap((root) => {
+            try {
+                return [realpathSync(root)];
+            } catch {
+                return [];
+            }
+        });
+        if (!realRoots.some((root) => inside(real, root))) refuse(MESSAGES.referenceOutside);
+        const ext = extname(real).slice(1).toLowerCase();
+        if (!REFERENCE_EXT.has(ext)) refuse(MESSAGES.referenceType(ext ? `.${ext}` : 'uzantısız dosya'));
+        const header = Buffer.alloc(16);
+        let fd;
+        try {
+            fd = openSync(real, 'r');
+            if (!fstatSync(fd).isFile()) refuse(MESSAGES.referenceType('dosya değil'));
+            readSync(fd, header, 0, header.length, 0);
+        } catch (error) {
+            if (error instanceof Refusal) throw error;
+            refuse(cause(error));
+        } finally {
+            if (fd !== undefined) closeSync(fd);
+        }
+        const sniffed = imageMime(header);
+        if (sniffed !== MIME_BY_EXT[ext]) refuse(MESSAGES.referenceType(sniffed ? `.${ext} uzantılı ${sniffed}` : `.${ext} uzantılı ama görsel değil`));
+        return real;
     }
 
     /** A Higgsfield media id (or job id) for a reference the caller named. */
@@ -840,7 +887,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
                     resolution: { type: 'string', enum: ['1k', '2k', '4k'], description: 'Varsayılan 1k (sosyal medya için yeterli, en ucuzu). 2k sadece kullanıcı baskı, büyük ekran ya da "yüksek çözünürlük" derse; 4k sadece nano_banana_2_1 ile ve kullanıcı açıkça 4k isterse.' },
                     yuksek_cozunurluk: { type: 'boolean', description: 'true: 2k üret (resolution "2k" ile aynı). Sadece kullanıcı baskı, büyük ekran ya da "yüksek çözünürlük" isterse.' },
                     style: { type: 'string', enum: IMAGE_MODELS.recraft_v4_1.styles, description: 'Sadece recraft_v4_1: standard, vector (logo/ikon/tipografi), utility, utility_vector.' },
-                    reference_image: { type: 'string', description: 'İsteğe bağlı ek referans (stil ya da içerik için): önceki bir üretim (gen_…) ya da kullanıcının gönderdiği görselin yolu (/opt/data/cache/images/…). Logo için bunu değil logo alanını kullan.' },
+                    reference_image: { type: 'string', description: 'İsteğe bağlı ek referans (stil ya da içerik için): önceki bir üretim (gen_…) ya da kullanıcının gönderdiği görselin yolu: Hermes’in mesajda verdiği yol, aynen (WhatsApp’tan gelen görsel: /opt/data/platforms/whatsapp_cloud/media/…; "[Image attached at: …]" ya da "image_url: …" içindeki yol). Logo için bunu değil logo alanını kullan.' },
                     ozet: ozetProp,
                     requested_by: requestedByProp,
                 },
@@ -858,7 +905,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
                 type: 'object',
                 properties: {
                     generation_id: { type: 'string', description: 'Düzenlenecek önceki üretim (gen_…).' },
-                    kaynak_gorsel: { type: 'string', description: 'generation_id yerine: kullanıcının gönderdiği görselin yolu (/opt/data/cache/images/…).' },
+                    kaynak_gorsel: { type: 'string', description: 'generation_id yerine: kullanıcının gönderdiği görselin yolu: Hermes’in mesajda verdiği yol, aynen (WhatsApp’tan gelen görsel: /opt/data/platforms/whatsapp_cloud/media/…; "[Image attached at: …]" ya da "image_url: …" içindeki yol).' },
                     talimat: { type: 'string', maxLength: 2000, description: 'Ne değişecek (ör. "başlığı \'Yapay Zeka Atölyesi\' yap", "arka planı lacivert yap", "sağ alttaki logoyu düzelt"). Yeni yazı varsa aynen ve Türkçe karakterleriyle yaz.' },
                     logo: { type: 'boolean', description: 'Gerçek kulüp logosu referans olarak verilsin mi. Varsayılan: kaynak üretimde logo varsa true. Logo düzeltilecekse true.' },
                     logo_konum: { type: 'string', enum: LOGO_CORNERS, description: 'İsteğe bağlı köşe (varsayılan kaynak üretimdeki; o da yoksa logo yerinde kalır ya da model seçer).' },
@@ -1092,7 +1139,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             sourceCorner = row.logo_corner;
             sourceLogo = Boolean(row.logo_corner) || (row.params ? JSON.parse(row.params).logo === true : false);
         } else {
-            const value = String(args.kaynak_gorsel);
+            const value = String(args.kaynak_gorsel).trim();
             if (!value.startsWith('/')) refuseAttempt(attempt, MESSAGES.editSource);
             source = userImagePath(value);
             let size = null;

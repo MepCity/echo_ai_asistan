@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import fs, { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { after, describe, it } from 'node:test';
 import { normalizeConfig } from '../src/config.js';
 import { normalizeStudio } from '../src/studio/config.js';
@@ -1286,6 +1288,100 @@ describe('studio: edit_image (gpt_image_2_6 image-to-image)', () => {
         assert.deepEqual(params.medias, [{ value: LOGO_MEDIA, role: 'image_references' }, { value: CACHED_LOGO, role: 'image_references' }]);
         assert.match((await call(gateway, 'edit_image', { kaynak_gorsel: join(shared, 'sent.png'), talimat: 'x' })).text, /referans olarak kullanılamaz/);
         assert.equal(higgsfield.calls.length, 0);
+    });
+
+    describe('a picture the user sent on WhatsApp (whatsapp_cloud media folder)', () => {
+        // hermes-agent v0.23.3 plugins/platforms/whatsapp_cloud/adapter.py saves an inbound photo as
+        // $HERMES_HOME/platforms/whatsapp_cloud/media/<media id>.jpg and the model is given that path.
+        const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x08, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x05, 0x00, 0x04, 0x00, 0x03, 0x01, 0x22, 0x00, 0xff, 0xd9]);
+        function mediaSetup() {
+            const root = tempDir();
+            const media = join(root, 'platforms', 'whatsapp_cloud', 'media');
+            const images = join(root, 'cache', 'images');
+            mkdirSync(media, { recursive: true });
+            mkdirSync(images, { recursive: true });
+            const outside = join(root, 'secret');
+            mkdirSync(outside);
+            writeFileSync(join(outside, 'auth.png'), PNG);
+            return { ...setup({ studio: { referenceDirs: [media, images] } }), media, outside };
+        }
+
+        it('accepts the exact path Hermes passes (a JPEG under the media folder) and uploads it', async () => {
+            const { gateway, higgsfield, media, clock } = mediaSetup();
+            writeFileSync(join(media, '1234567890123456.jpg'), JPEG);
+            const result = await call(gateway, 'edit_image', { kaynak_gorsel: ` ${join(media, '1234567890123456.jpg')}`, talimat: 'metni "Yapay Zeka Atölyesi" yap' });
+            assert.equal(result.isError, false, result.text);
+            assert.equal(higgsfield.calls[0].name, 'media_upload');
+            assert.deepEqual(higgsfield.calls[0].args, { filename: '1234567890123456.jpg', content_type: 'image/jpeg' });
+            assert.equal(higgsfield.generated()[0].args.params.aspect_ratio, '4:5', '1024x1280 → 4:5');
+            clock.now += 10 * 60_000;
+            const again = await call(gateway, 'generate_image', { prompt: 'A poster like this one', reference_image: join(media, '1234567890123456.jpg') });
+            assert.equal(again.isError, false, again.text);
+        });
+
+        it('refuses a path outside the allowed folders without looking at it', async () => {
+            const { gateway, higgsfield, media, outside } = mediaSetup();
+            for (const path of [join(outside, 'auth.png'), join(media, '..', '..', '..', 'secret', 'auth.png'), '/etc/passwd']) {
+                assert.equal((await call(gateway, 'edit_image', { kaynak_gorsel: path, talimat: 'x' })).text, MESSAGES.referenceOutside, path);
+            }
+            assert.equal(higgsfield.calls.length, 0);
+        });
+
+        it('refuses a symlink in the media folder that points outside it', async () => {
+            const { gateway, higgsfield, media, outside } = mediaSetup();
+            symlinkSync(join(outside, 'auth.png'), join(media, 'link.png'));
+            symlinkSync(outside, join(media, 'dir'));
+            assert.equal((await call(gateway, 'edit_image', { kaynak_gorsel: join(media, 'link.png'), talimat: 'x' })).text, MESSAGES.referenceOutside);
+            assert.equal((await call(gateway, 'edit_image', { kaynak_gorsel: join(media, 'dir', 'auth.png'), talimat: 'x' })).text, MESSAGES.referenceOutside);
+            assert.equal(higgsfield.calls.length, 0);
+        });
+
+        it('names the cause in Turkish: dosya bulunamadı, desteklenmeyen tür, izin yok', async () => {
+            const { gateway, higgsfield, media } = mediaSetup();
+            const missing = (await call(gateway, 'edit_image', { kaynak_gorsel: join(media, 'gone.jpg'), talimat: 'x' })).text;
+            assert.equal(missing, MESSAGES.referenceMissing('gone.jpg'));
+            assert.match(missing, /dosya bulunamadı/);
+            writeFileSync(join(media, 'voice.ogg'), 'OggS');
+            assert.match((await call(gateway, 'edit_image', { kaynak_gorsel: join(media, 'voice.ogg'), talimat: 'x' })).text, /desteklenmeyen tür \(\.ogg\)/);
+            writeFileSync(join(media, 'fake.jpg'), '<html>not an image</html>');
+            assert.match((await call(gateway, 'edit_image', { kaynak_gorsel: join(media, 'fake.jpg'), talimat: 'x' })).text, /desteklenmeyen tür \(\.jpg uzantılı ama görsel değil\)/);
+            writeFileSync(join(media, 'png.jpg'), PNG);
+            assert.match((await call(gateway, 'edit_image', { kaynak_gorsel: join(media, 'png.jpg'), talimat: 'x' })).text, /desteklenmeyen tür \(\.jpg uzantılı image\/png\)/);
+            mkdirSync(join(media, 'folder.png'));
+            assert.match((await call(gateway, 'edit_image', { kaynak_gorsel: join(media, 'folder.png'), talimat: 'x' })).text, /desteklenmeyen tür/);
+
+            const locked = join(media, 'locked.jpg');
+            writeFileSync(locked, JPEG);
+            chmodSync(locked, 0o000);
+            // root reads a 0000 file anyway: then the EACCES the studio user would get is simulated.
+            const realOpen = fs.openSync;
+            if (process.getuid?.() === 0) {
+                fs.openSync = (path, ...rest) => {
+                    if (String(path) === locked) throw Object.assign(new Error(`EACCES: permission denied, open '${path}'`), { code: 'EACCES' });
+                    return realOpen(path, ...rest);
+                };
+                syncBuiltinESMExports();
+            }
+            try {
+                const denied = (await call(gateway, 'edit_image', { kaynak_gorsel: locked, talimat: 'x' })).text;
+                assert.equal(denied, MESSAGES.referenceDenied('locked.jpg'));
+                assert.match(denied, /izin yok/);
+                assert.doesNotMatch(denied, /belge|doküman|document/i, 'resending as a document would not help');
+            } finally {
+                fs.openSync = realOpen;
+                syncBuiltinESMExports();
+                chmodSync(locked, 0o644);
+            }
+            assert.equal(higgsfield.calls.length, 0);
+        });
+
+        it('the compose file mounts the media folder read-only at the same path and allows it', () => {
+            const compose = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'deploy/oracle/docker-compose.yml'), 'utf8');
+            assert.match(compose, /^\s+- \/opt\/hermes\/data\/platforms\/whatsapp_cloud\/media:\/opt\/data\/platforms\/whatsapp_cloud\/media:ro$/m);
+            const dirs = compose.match(/STUDIO_REFERENCE_DIRS: (.*)$/m)[1].split(',');
+            assert.deepEqual(dirs, ['/opt/data/platforms/whatsapp_cloud/media', '/opt/data/cache/images']);
+            assert.doesNotMatch(compose, /\/opt\/hermes\/data:\/opt\/data:ro|\/opt\/hermes\/data\/platforms:/, 'only the media folder, never all of Hermes\' data');
+        });
     });
 
     it('needs exactly one source and an instruction; refused attempts send nothing', async () => {

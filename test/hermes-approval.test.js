@@ -68,18 +68,18 @@ describe('approval card: studio tools', { skip }, () => {
     });
 
     it('add_logo: no credits, the corner in Turkish', () => {
-        assert.equal(one('studio', 'add_logo', { generation_id: 'gen_1' }), '🏷️ Görsele kulüp logosu eklenecek (kredi harcamaz)');
-        assert.equal(one('studio', 'add_logo', { generation_id: 'gen_1', konum: 'ust-sol', ozet: '8 Mart afişi' }), '🏷️ Görsele kulüp logosu eklenecek (kredi harcamaz)\nKöşe: sol üst\nKonu: 8 Mart afişi');
+        assert.equal(one('studio', 'add_logo', { generation_id: 'gen_1' }), '🔖 Görsele kulüp logosu eklenecek (kredi harcamaz)');
+        assert.equal(one('studio', 'add_logo', { generation_id: 'gen_1', konum: 'ust-sol', ozet: '8 Mart afişi' }), '🔖 Görsele kulüp logosu eklenecek (kredi harcamaz)\nKöşe: sol üst\nKonu: 8 Mart afişi');
     });
 
     it('edit_image: credits from the hint, the change, the source when it is a sent picture', () => {
         assert.equal(
             one('studio', 'edit_image', { generation_id: 'gen_1', talimat: 'Başlığı “Yapay Zeka Atölyesi” yap', ozet: 'Atölye afişi düzeltmesi' }, { aspect_ratio: '4:5', credits: 1.5, resolution: '1k' }),
-            '✏️ Görsel düzenlenecek · yaklaşık 1.5 kredi\nDeğişiklik: “Başlığı “Yapay Zeka Atölyesi” yap”\nKonu: Atölye afişi düzeltmesi',
+            '🪄 Görsel düzenlenecek · yaklaşık 1.5 kredi\nDeğişiklik: “Başlığı “Yapay Zeka Atölyesi” yap”\nKonu: Atölye afişi düzeltmesi',
         );
         assert.equal(
             one('studio', 'edit_image', { kaynak_gorsel: '/opt/data/cache/images/a.jpg', talimat: 'arka planı lacivert yap', yuksek_cozunurluk: true }, { credits: 2.75, resolution: '2k' }),
-            '✏️ Görsel düzenlenecek · yüksek çözünürlük · yaklaşık 2.75 kredi\nDeğişiklik: “arka planı lacivert yap”\nKaynak: gönderdiğin görsel',
+            '🪄 Görsel düzenlenecek · yüksek çözünürlük · yaklaşık 2.75 kredi\nDeğişiklik: “arka planı lacivert yap”\nKaynak: gönderdiğin görsel',
         );
     });
 
@@ -114,7 +114,7 @@ describe('approval card: TryPost tools', { skip }, () => {
         assert.ok(text.endsWith('…”'));
         assert.equal(media, 'Medya: 1 dosya');
         assert.ok(!draft.includes('secret-token'));
-        assert.equal(scheduled, '🗓️ Gönderi planlanacak · LinkedIn · 3 Aralık 15:30\nMetin: “Kısa”');
+        assert.equal(scheduled, '📅 Gönderi planlanacak · LinkedIn · 3 Aralık 15:30\nMetin: “Kısa”');
         assert.equal(now, '🚀 Gönderi HEMEN yayınlanacak · X\nMetin: “Şimdi”');
     });
 
@@ -133,12 +133,12 @@ describe('approval card: TryPost tools', { skip }, () => {
             { server: 'trypost', tool: 'reject-post-tool', args: { post_id: 'p' } },
         ]);
         assert.deepEqual(bodies, [
-            "✏️ TryPost'taki gönderi düzenlenecek\nYeni metin: “Düzeltilmiş metin”\nDurum: planlanacak · 8 Mart 10:00",
-            '🗑️ Gönderi silinecek (geri alınamaz)',
+            "📝 TryPost'taki gönderi düzenlenecek\nYeni metin: “Düzeltilmiş metin”\nDurum: planlanacak · 8 Mart 10:00",
+            '❌ Gönderi silinecek (geri alınamaz)',
             '🚀 Gönderi HEMEN yayınlanacak',
-            '🗓️ Taslak gönderi kuyruğa eklenecek · ilk boş zamana',
+            '📅 Taslak gönderi kuyruğa eklenecek · ilk boş zamana',
             '🚀 Onay bekleyen gönderi onaylanıp HEMEN yayınlanacak',
-            '↩️ Onay bekleyen gönderi reddedilecek',
+            '🚫 Onay bekleyen gönderi reddedilecek',
         ]);
     });
 
@@ -150,7 +150,7 @@ describe('approval card: TryPost tools', { skip }, () => {
     it('every TryPost write tool has its own Turkish phrase', () => {
         const bodies = render(TRYPOST_WRITE_TOOLS.map((tool) => ({ server: 'trypost', tool, args: {} })));
         bodies.forEach((body, index) => {
-            assert.ok(!body.startsWith('⚙️'), `${TRYPOST_WRITE_TOOLS[index]} falls back to the generic card`);
+            assert.ok(!body.startsWith('🔧'), `${TRYPOST_WRITE_TOOLS[index]} falls back to the generic card`);
             assert.doesNotMatch(body, FORBIDDEN);
         });
     });
@@ -159,7 +159,7 @@ describe('approval card: TryPost tools', { skip }, () => {
 describe('approval card: unknown tools, safety and length', { skip }, () => {
     it('an unknown tool gets the generic form: a key: value list, secrets masked, no JSON', () => {
         const body = one('trypost', 'create-webhook-tool', { endpoint: 'https://example.test/hook', events: ['post.published', 'post.failed'], secret_token: 'abc', meta: { a: 1 }, enabled: true });
-        assert.equal(body, '⚙️ create-webhook işlemi yapılacak\nendpoint: https://example.test/hook\nevents: 2 öğe\nsecret_token: ***\nmeta: 1 alan\nenabled: evet');
+        assert.equal(body, '🔧 create-webhook işlemi yapılacak\nendpoint: https://example.test/hook\nevents: 2 öğe\nsecret_token: ***\nmeta: 1 alan\nenabled: evet');
         const many = one('studio', 'new_tool', Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`k${i}`, `v${i}`])));
         assert.equal(many.split('\n').at(-1), '(+3 alan daha)');
         assert.doesNotMatch(many, FORBIDDEN);

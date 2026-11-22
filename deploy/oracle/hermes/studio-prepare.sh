@@ -3,7 +3,8 @@
 # Run by setup-hermes.sh and update.sh as ubuntu; safe to run again:
 #   - /opt/echo/brand-kit.md from deploy/oracle/brand-kit.md, only if it does not exist yet
 #     (your edits are kept);
-#   - the folders the studio shares with Hermes (previews it sends, images people sent);
+#   - the folders the studio shares with Hermes (previews it sends, images people sent:
+#     platforms/whatsapp_cloud/media and cache/images);
 #   - /data/studio in the echo-data volume, owned by HERMES_UID:HERMES_GID (studio's user);
 #   - ECHO_STUDIO_TOKEN: a random secret in /opt/echo/.env (made once), copied to Hermes' .env
 #     so its mcp_servers.studio entry can send it. Never printed.
@@ -59,9 +60,15 @@ fi
 [ -f "$ECHO_DIR/config.json" ] || fail "$ECHO_DIR/config.json dosya olarak yok (klasor ya da eksik). install.sh ile olustur, sonra tekrar calistir."
 
 # Folders the studio shares with Hermes. Made by the VM user before compose mounts them; if
-# Docker already made any of them (as root), they are given back to the owner of $HDATA.
+# Docker already made any of them (as root), they are given back to the owner of $HDATA (a
+# root-owned media folder would stop Hermes saving the pictures people send). Only these folders
+# are touched, never their files or any mode: Hermes keeps them owner-only (cache/images 0700) and
+# the studio reads them as the same user (HERMES_UID), so nothing becomes readable by others.
+# platforms/whatsapp_cloud/media: where the whatsapp_cloud adapter saves inbound photos and voice
+# notes (<media id>.jpg / .ogg), the path Hermes gives the model and the studio opens.
 # Parents first, so mkdir works inside a folder Docker made.
-for dir in "$HDATA/cache" "$HDATA/cache/generated" "$HDATA/cache/generated/echo-studio" "$HDATA/cache/images"; do
+for dir in "$HDATA/cache" "$HDATA/cache/generated" "$HDATA/cache/generated/echo-studio" "$HDATA/cache/images" \
+           "$HDATA/platforms" "$HDATA/platforms/whatsapp_cloud" "$HDATA/platforms/whatsapp_cloud/media"; do
   if [ -d "$dir" ]; then
     if [ "$(stat -c %u:%g "$dir")" != "$(stat -c %u:%g "$HDATA")" ]; then
       as_root chown --reference="$HDATA" "$dir"
@@ -73,6 +80,18 @@ for dir in "$HDATA/cache" "$HDATA/cache/generated" "$HDATA/cache/generated/echo-
 done
 
 env_get() { sed -n "s/^$1=//p" "$2" | tail -n 1 | sed "s/^'\(.*\)'\$/\1/"; }
+
+# The studio runs as HERMES_UID and reads Hermes' owner-only media folders: they must be that uid's.
+H_UID=$(env_get HERMES_UID "$ECHO_ENV" 2>/dev/null || true); H_UID=${H_UID:-$(id -u)}
+for dir in "$HDATA/platforms/whatsapp_cloud/media" "$HDATA/cache/images"; do
+  if [ "$(stat -c %u "$dir")" != "$H_UID" ]; then
+    echo "UYARI: $dir sahibi uid $(stat -c %u "$dir"), studio uid $H_UID (HERMES_UID, $ECHO_ENV) olarak calisiyor; gonderilen gorselleri okuyamaz (izin yok). HERMES_UID'yi $HDATA sahibinin uid'si yap." >&2
+  fi
+done
+# Hermes uses a legacy whatsapp_cloud/media folder instead when it already has files; it is not mounted.
+if [ -n "$(ls -A "$HDATA/whatsapp_cloud/media" 2>/dev/null)" ]; then
+  echo "UYARI: $HDATA/whatsapp_cloud/media dolu: Hermes gonderilen gorselleri oraya yaziyor olabilir, studio ise $HDATA/platforms/whatsapp_cloud/media klasorunu okuyor." >&2
+fi
 
 # /data/studio in the echo-data volume (studio.db, originals, Higgsfield tokens). The volume is
 # shared with the echo service, which runs as the image's node user (uid 1000) and owns /data,

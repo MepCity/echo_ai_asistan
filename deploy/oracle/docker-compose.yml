@@ -72,9 +72,12 @@ services:
       ECHO_CONFIG: /config/config.json
       STUDIO_BRAND_KIT: /config/brand-kit.md
       # Mounted at the same paths Hermes sees them (its HERMES_HOME is /opt/data), so a
-      # MEDIA:<path> the gateway hands out is a file Hermes can send.
+      # MEDIA:<path> the gateway hands out is a file Hermes can send, and the path Hermes gives
+      # the model for a picture the user sent is the path the studio opens.
       STUDIO_PREVIEW_DIR: /opt/data/cache/generated/echo-studio
-      STUDIO_REFERENCE_DIRS: /opt/data/cache/images
+      # Pictures people sent: the whatsapp_cloud adapter saves them in platforms/whatsapp_cloud/media
+      # (<media id>.jpg); cache/images is where Hermes' other adapters cache them.
+      STUDIO_REFERENCE_DIRS: /opt/data/platforms/whatsapp_cloud/media,/opt/data/cache/images
     # The VM user (Hermes' uid), so Hermes can read the previews. echo-data (/data) is owned by
     # the echo service's node user (uid 1000), which need not be this uid (e.g. ubuntu is 1001 on
     # some VMs); studio only writes /data/studio, which studio-prepare.sh (run by update.sh and
@@ -86,6 +89,8 @@ services:
       # Originals, studio.db and the Higgsfield tokens (0600) live in /data/studio.
       - echo-data:/data
       - /opt/hermes/data/cache/generated/echo-studio:/opt/data/cache/generated/echo-studio
+      # Read-only, and only these two media folders (never the rest of Hermes' data: .env, auth.json).
+      - /opt/hermes/data/platforms/whatsapp_cloud/media:/opt/data/platforms/whatsapp_cloud/media:ro
       - /opt/hermes/data/cache/images:/opt/data/cache/images:ro
     restart: unless-stopped
     logging: *logging

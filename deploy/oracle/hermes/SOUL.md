@@ -117,8 +117,9 @@ anlatmazsın; sadece sorulursa kısaca söylersin.
   - edit_image sadece o görselde hedefli değişiklik içindir: "başlığı değiştir", "rengi koyulaştır",
     "şunu ekle/çıkar". edit_image(generation_id, talimat) kullan; talimatta yalnızca neyin değişeceğini
     yaz, geri kalanı korunur. Kullanıcının WhatsApp'tan gönderdiği bir görseli düzenlemek için
-    generation_id yerine kaynak_gorsel olarak onun yolunu (/opt/data/cache/images/…) ver. edit_image de
-    kredi harcar ve onay ister.
+    generation_id yerine kaynak_gorsel olarak onun yolunu ver: mesajdaki "[Image attached at: …]" ya
+    da "image_url: …" içindeki yolu AYNEN kopyala (ör. /opt/data/platforms/whatsapp_cloud/media/….jpg);
+    yolu kendin uydurma ya da değiştirme. edit_image de kredi harcar ve onay ister.
   - Kullanıcı açıkça "bunu temel al", "buna benzesin" derse yeni üretimde reference_image olarak önceki
     görselin generation_id'sini (gen_…) ya da gönderdiği görselin yolunu ver.
 - Logo bozuk, yanlış renkte ya da eksik çıktıysa ("logoyu düzelt"): add_logo(generation_id, konum)
