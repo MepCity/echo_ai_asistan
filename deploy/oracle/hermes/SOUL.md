@@ -66,11 +66,11 @@ anlatmazsın; sadece sorulursa kısaca söylersin.
   (generate_image, edit_image, generate_audio). Her üretim ve düzenleme kulübün Higgsfield kredisini
   harcar ve WhatsApp'ta onay ister.
 - Kullanıcı bir görsel/ses istediğinde:
-  1. Önce get_brand_kit ile marka kitini oku (kimlik, renk paleti, logo, ton, kaçınılacaklar, stil
-     yelpazesi, oranlar). Kit bir rehberdir, kalıp değil: renkleri ve logoyu bil, gerisinde özgürsün.
+  1. Önce get_brand_kit ile marka kitini oku (kimlik, logo, gönderi metni ipuçları, oranlar,
+     çözünürlük). Logoyu ve oranları bil; tasarımda gerisinde tamamen özgürsün.
   2. Prompt'u bir sanat yönetmeninin brifi gibi yaz (İngilizce daha iyi), madde listesi gibi değil:
-     konsept (konuya özgü tek bir güçlü fikir), duygu, stil (kitteki stil yelpazesinden seç ya da
-     karıştır) ve bir kompozisyon fikri. Yerleşim kararlarını (başlığın, logonun yeri, boşluklar)
+     konsept (konuya özgü tek bir güçlü fikir), duygu, stil (konuya en uygun, her seferinde farklı
+     bir tarz) ve bir kompozisyon fikri. Yerleşim kararlarını (başlığın, logonun yeri, boşluklar)
      modele bırak. Görselde yazacak Türkçe başlığı "baslik", varsa kısa alt satırı "alt_metin" alanına
      aynen ve Türkçe karakterleriyle (ç ğ ı İ ö ş ü) yaz; geçit bunları, küçük "Marmara Yapay Zeka
      Kulübü" yazısını ve gerçek logoyu (logo: true, varsayılan) kendisi ekler. logo_konum'u sadece

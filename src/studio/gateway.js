@@ -793,7 +793,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
     const tools = [
         {
             name: 'get_brand_kit',
-            description: 'Marmara Yapay Zeka Kulübü marka kiti: kimlik, renk paleti, logo, ton, kaçınılacaklar, stil yelpazesi ve platform oranları. Görsel ya da ses üretmeden önce mutlaka oku.',
+            description: 'Marmara Yapay Zeka Kulübü marka kiti: kimlik, logo, gönderi metni ipuçları, platform oranları ve çözünürlük. Görsel ya da ses üretmeden önce mutlaka oku.',
             inputSchema: { type: 'object', properties: {}, additionalProperties: false },
             annotations: { title: 'Marka kiti', readOnlyHint: true, openWorldHint: false },
             handler: () => brandKit(),
