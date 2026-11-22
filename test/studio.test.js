@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { normalizeConfig } from '../src/config.js';
 import { normalizeStudio } from '../src/studio/config.js';
-import { CLUB_NAME, MESSAGES, buildEditPrompt, buildImagePrompt, createStudioGateway, dayOf, nearestAspect, posterText } from '../src/studio/gateway.js';
+import { CLUB_NAME, MESSAGES, STYLE_DIRECTIONS, buildEditPrompt, buildImagePrompt, createStudioGateway, dayOf, nearestAspect, posterText } from '../src/studio/gateway.js';
 import { LOGO_CORNERS, createLogoCompositor, logoBox, variantFor } from '../src/studio/compose.js';
 import { answerExcerpt, createHiggsfieldClient, parseCompact, parseCredits, parseJob, parseJobIds, rawAnswer, redactForLog } from '../src/studio/higgsfield.js';
 import { DatabaseSync } from 'node:sqlite';
@@ -998,17 +998,24 @@ function fakeMagick(brightness = 0.2) {
 }
 
 describe('studio: posters (headline by the model, real logo as reference)', () => {
-    it('buildImagePrompt appends the exact Turkish headline, subline, club name, typography and the logo corner', () => {
-        const prompt = buildImagePrompt({ prompt: 'Calm navy poster with soft gradient shapes.', baslik: '8 Mart Dünya Kadınlar Günü', altMetin: 'İstanbul’da çağ, ışık, öğün, şüphe', logoCorner: 'alt-sag' });
+    it('buildImagePrompt appends only the essentials: exact Turkish text, small club name, the logo as given, a soft palette', () => {
+        const colors = ['#3278f6', '#0f1c47'];
+        const prompt = buildImagePrompt({ prompt: 'Calm navy poster with soft gradient shapes.', baslik: '8 Mart Dünya Kadınlar Günü', altMetin: 'İstanbul’da çağ, ışık, öğün, şüphe', logo: true, colors });
         assert.ok(prompt.startsWith('Calm navy poster with soft gradient shapes.\n\n'));
-        assert.match(prompt, /^Headline text, exactly: "8 Mart Dünya Kadınlar Günü"$/m);
-        assert.match(prompt, /^Subline text \(smaller, below the headline\), exactly: "İstanbul’da çağ, ışık, öğün, şüphe"$/m);
-        assert.match(prompt, new RegExp(`^Small text, exactly: "${CLUB_NAME}"$`, 'm'));
+        assert.match(prompt, /^Headline: "8 Mart Dünya Kadınlar Günü"$/m);
+        assert.match(prompt, /^Subline: "İstanbul’da çağ, ışık, öğün, şüphe"$/m);
+        assert.match(prompt, new RegExp(`^Club name, small: "${CLUB_NAME}"$`, 'm'));
         assert.match(prompt, /ç ğ ı İ ö ş ü/);
-        assert.match(prompt, /sans-serif/);
-        assert.match(prompt, /bottom-right corner/);
         assert.match(prompt, /last reference image is the official Marmara Yapay Zeka Kulübü logo/);
-        const plain = buildImagePrompt({ prompt: 'Abstract shapes.' });
+        assert.match(prompt, /exactly as given/);
+        assert.match(prompt, /do not redraw/);
+        assert.match(prompt, /wherever it suits the composition, clearly visible on an uncluttered area/);
+        assert.match(prompt, /palette inspired by the club's brand colours \(#3278f6, #0f1c47\)/);
+        // No forced style, typography, corner or size.
+        assert.doesNotMatch(prompt, /sans-serif|Typography:|corner|12%|bold headline/);
+        assert.match(buildImagePrompt({ prompt: 'x', baslik: 'A', logo: true, logoCorner: 'ust-sol' }), /in the top-left corner, clearly visible/);
+        assert.match(buildImagePrompt({ prompt: 'x', style: 'retro Y2K aesthetic' }), /^x\n\nStyle direction for this version: retro Y2K aesthetic\.$/);
+        const plain = buildImagePrompt({ prompt: 'Abstract shapes.', colors });
         assert.equal(plain, 'Abstract shapes.', 'no headline, no logo: the prompt as given');
         assert.doesNotMatch(buildImagePrompt({ prompt: 'x', baslik: 'Başlık' }), /logo/i);
     });
@@ -1028,15 +1035,19 @@ describe('studio: posters (headline by the model, real logo as reference)', () =
         assert.equal(ok.isError, false, ok.text);
         const params = higgsfield.generated()[0].args.params;
         assert.match(params.prompt, /^A clean modern poster for an AI workshop\n\n/);
-        assert.match(params.prompt, /Headline text, exactly: "8 Mart Dünya Kadınlar Günü"/);
-        assert.match(params.prompt, /Subline text .*"Kadınların bilime katkısı"/);
+        assert.match(params.prompt, /Headline: "8 Mart Dünya Kadınlar Günü"/);
+        assert.match(params.prompt, /Subline: "Kadınların bilime katkısı"/);
+        assert.match(params.prompt, /palette inspired by the club's brand colours \(#3278f6, #3cbdfa, #0f1c47, #1e6bf5, #f1f5f9\)/);
+        assert.match(params.prompt, /wherever it suits the composition/, 'no corner given: the model places the logo');
         assert.deepEqual(params.medias, [{ value: CACHED_LOGO, role: 'image_references' }]);
         assert.equal(params.baslik, undefined, 'only allowlisted fields reach Higgsfield');
         const id = ok.text.match(/generation_id: (gen_\w+)/)[1];
-        assert.equal(store.get(id).logo_corner, 'alt-sag');
+        assert.equal(store.get(id).logo_corner, null, 'no corner chosen');
+        assert.equal(JSON.parse(store.get(id).params).logo, true);
         assert.deepEqual(JSON.parse(store.get(id).params).poster, { baslik: '8 Mart Dünya Kadınlar Günü', alt_metin: 'Kadınların bilime katkısı' });
         assert.match(ok.text, /Görseldeki yazıyı kontrol et: başlık “8 Mart Dünya Kadınlar Günü”/);
-        assert.match(ok.text, /bir kez yeniden üretmeyi/);
+        assert.match(ok.text, /edit_image ile düzeltmeyi/);
+        assert.doesNotMatch(ok.text, /bir kez/);
         assert.match(ok.text, /add_logo/);
     });
 
@@ -1062,6 +1073,78 @@ describe('studio: posters (headline by the model, real logo as reference)', () =
         assert.match((await image(gateway, { baslik: 'x'.repeat(121) })).text, /Başlık çok uzun/);
         assert.match((await image(gateway, { alt_metin: 'Sadece alt' })).text, /baslik da ver/);
         assert.equal(higgsfield.calls.length, 0);
+    });
+});
+
+describe('studio: secenek (two options in different styles)', () => {
+    const today = (store) => store.usage(dayOf(store.now(), 'Europe/Istanbul'), '2026-11');
+
+    it('secenek: 2 sends two independent jobs with the given styles, one estimate, both counted', async () => {
+        const { gateway, higgsfield, store } = setup();
+        const result = await image(gateway, { platform: 'instagram', baslik: 'LLM Atölyesi', secenek: 2, stiller: ['bold typography-led poster', 'isometric 3D illustration'], requested_by: 'yasir' });
+        assert.equal(result.isError, false, result.text);
+        const [first, second] = higgsfield.generated();
+        assert.equal(higgsfield.generated().length, 2);
+        assert.equal(higgsfield.calls.filter((item) => item.name === 'estimate_image_cost').length, 1);
+        assert.match(first.args.params.prompt, /Style direction for this version: bold typography-led poster\./);
+        assert.match(second.args.params.prompt, /Style direction for this version: isometric 3D illustration\./);
+        for (const job of [first, second]) {
+            assert.equal(job.args.params.count, 1);
+            assert.match(job.args.params.prompt, /Headline: "LLM Atölyesi"/);
+            assert.deepEqual(job.args.params.medias, [{ value: CACHED_LOGO, role: 'image_references' }]);
+        }
+        assert.match(result.text, /Seçenek 1 \(bold typography-led poster\):/);
+        assert.match(result.text, /Seçenek 2 \(isometric 3D illustration\):/);
+        const ids = [...result.text.matchAll(/generation_id: (gen_\w+)/g)].map((match) => match[1]);
+        assert.equal(new Set(ids).size, 2);
+        assert.equal(result.text.match(/^MEDIA:/gm).length, 2);
+        assert.equal(result.text.match(/Bugün kalan/g).length, 1, 'one remaining line for both');
+        assert.equal(today(store).counts.image, 2);
+        assert.equal(today(store).dayCredits, 5.5);
+        assert.equal(JSON.parse(store.get(ids[1]).params).stil, 'isometric 3D illustration');
+    });
+
+    it('secenek: 2 without stiller picks two different style directions', async () => {
+        const { gateway, higgsfield } = setup();
+        assert.equal((await image(gateway, { secenek: 2 })).isError, false);
+        const styles = higgsfield.generated().map((job) => job.args.params.prompt.match(/Style direction for this version: (.*)\.$/m)[1]);
+        assert.equal(styles.length, 2);
+        assert.notEqual(styles[0], styles[1]);
+        for (const style of styles) assert.ok(STYLE_DIRECTIONS.includes(style), style);
+    });
+
+    it('checks the limits for both before sending either; at most 2', async () => {
+        const credits = setup({ studio: { limits: { dailyCredits: 5 } } });
+        assert.match((await image(credits.gateway, { secenek: 2 })).text, /kredi sınırı bu istek için yetmiyor/);
+        assert.equal(credits.higgsfield.generated().length, 0);
+        assert.equal((await image(credits.gateway, {})).isError, false, 'one image still fits');
+
+        const count = setup({ studio: { limits: { dailyImages: 1 } } });
+        assert.match((await image(count.gateway, { secenek: 2 })).text, /yalnızca 1 görsel hakkı kaldı/);
+        assert.equal(count.higgsfield.generated().length, 0);
+
+        const many = setup();
+        assert.match((await image(many.gateway, { secenek: 3 })).text, /en fazla 2/);
+        assert.equal(many.higgsfield.calls.length, 0);
+    });
+
+    it('a second job that cannot be sent is reported; the first is kept and nothing is retried', async () => {
+        const { gateway, higgsfield, store } = setup();
+        const original = higgsfield.call;
+        let sends = 0;
+        higgsfield.call = async (name, args) => {
+            if (name === 'generate_image' && ++sends === 2) {
+                higgsfield.calls.push({ name, args });
+                throw new Error('socket hang up');
+            }
+            return original(name, args);
+        };
+        const result = await image(gateway, { secenek: 2, stiller: ['a', 'b'] });
+        assert.equal(result.isError, false, result.text);
+        assert.match(result.text, /Seçenek 1 \(a\):/);
+        assert.match(result.text, /Seçenek 2 gönderilemedi/);
+        assert.equal(higgsfield.generated().length, 2, 'never sent again');
+        assert.equal(today(store).counts.image, 2, 'the lost one is counted too');
     });
 });
 
@@ -1182,7 +1265,9 @@ describe('studio: edit_image (gpt_image_2_6 image-to-image)', () => {
         assert.match(edit.args.params.prompt, /ç ğ ı İ ö ş ü/);
         const editId = result.text.match(/generation_id: (gen_\w+)/)[1];
         assert.equal(store.get(editId).tool, 'edit_image');
-        assert.equal(store.get(editId).logo_corner, 'alt-sag');
+        assert.equal(store.get(editId).logo_corner, null, 'the source had no corner: the logo stays where the model put it');
+        assert.match(edit.args.params.prompt, /where it already is/);
+        assert.equal(JSON.parse(store.get(editId).params).logo, true);
         assert.equal(JSON.parse(store.get(editId).params).edit.source, id);
         assert.equal(store.usage(dayOf(store.now(), 'Europe/Istanbul'), '2026-11').counts.image, 2, 'counted like any image');
     });
@@ -1282,6 +1367,8 @@ describe('studio: approval card hint', () => {
         assert.deepEqual(gateway.approvalHint('generate_audio', { kind: 'speech' }), { credits: 1 });
         assert.deepEqual(gateway.approvalHint('generate_audio', { kind: 'music', duration: 30 }), { duration: 30, credits: 4.5 });
         assert.deepEqual(gateway.approvalHint('attach_to_trypost', {}), {});
+        assert.deepEqual(gateway.approvalHint('generate_image', { platform: 'instagram', secenek: 2 }), { aspect_ratio: '4:5', resolution: '1k', count: 2, credits: 3 }, 'secenek: 2 → two images, twice the credits');
+        assert.equal(gateway.approvalHint('edit_image', { secenek: 2 }).count, undefined, 'edit_image has no options');
     });
 
     it('config.json studio.approxCredits overrides the table; a real earlier estimate of the same model and resolution wins', async () => {

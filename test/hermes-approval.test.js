@@ -83,6 +83,14 @@ describe('approval card: studio tools', { skip }, () => {
         );
     });
 
+    it('generate_image with secenek: 2 says two images and their total credits', () => {
+        assert.equal(
+            one('studio', 'generate_image', { prompt: 'p', platform: 'instagram', secenek: 2, ozet: 'Atölye afişi, iki seçenek' }, { aspect_ratio: '4:5', credits: 3, resolution: '1k', count: 2 }),
+            '🎨 Görsel üretilecek · Instagram (4:5) · 2 görsel · yaklaşık 3 kredi\nKonu: Atölye afişi, iki seçenek',
+        );
+        assert.equal(one('studio', 'generate_image', { prompt: 'p', secenek: 2, ozet: 'x' }), '🎨 Görsel üretilecek · 2 görsel\nKonu: x', 'no hint: still two images');
+    });
+
     it('generate_image shows the exact headline', () => {
         assert.equal(
             one('studio', 'generate_image', { prompt: 'p', platform: 'instagram', baslik: '8 Mart Dünya Kadınlar Günü', ozet: '8 Mart afişi' }, { aspect_ratio: '4:5', credits: 1.5, resolution: '1k' }),

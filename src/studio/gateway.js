@@ -31,10 +31,14 @@ import { CORNER_NAMES, CORNER_PROMPT, DEFAULT_LOGO_CORNER, LOGO_CORNERS } from '
  * recompresses images); TryPost gets the original bytes, server to server,
  * only through attach_to_trypost.
  *
- * Posters are finished by the model: the gateway appends the headline/subline
- * (baslik, alt_metin) and the club name to the prompt in a fixed phrasing, and
- * gives the real club logo PNG (uploaded once, media id cached in studio.db)
- * as an image reference with where to place it. If the model's logo comes out
+ * Posters are finished by the model: Hermes writes a creative brief, and the
+ * gateway appends only the essentials in a fixed phrasing: the exact headline
+ * and subline (baslik, alt_metin) with correct Turkish letters, the club name
+ * small, the real club logo PNG (uploaded once, media id cached in studio.db)
+ * as an image reference to be placed as given (a corner only when one is
+ * asked for), and the brand palette as a soft hint. Layout and style are left
+ * to the model. secenek: 2 sends two independent jobs of the same brief with
+ * different style directions, both counted against every limit. If the model's logo comes out
  * wrong, add_logo composites the real PNG with ImageMagick (no credits): that
  * makes a "final" PNG next to the untouched original, and the preview,
  * get_original_file and attach_to_trypost use the final when there is one.
@@ -98,6 +102,9 @@ export const MESSAGES = {
     logoFile: 'Kulüp logosu dosyası sunucuda bulunamadı; yöneticiye haber ver.',
     notImage: 'Bu işlem sadece görseller için.',
     editSource: 'Düzenlenecek görseli bulamadım. Önceki bir üretimin generation_id’sini (gen_…) ya da kullanıcının gönderdiği görselin yolunu ver.',
+    stillPreparing: (id) => `Üretim hâlâ hazırlanıyor (generation_id: ${id}). Kullanıcıya biraz sürdüğünü ve hazır olunca önizlemenin WhatsApp'tan kendiliğinden geleceğini söyle; sorarsa get_generation ile sonucu al. Yeni bir üretim başlatma.`,
+    variantsCount: (left) => `Bugün yalnızca ${left} görsel hakkı kaldı; iki seçenek için yetmiyor. Tek görsel üretebilirim.`,
+    variants: 'secenek 1 ya da 2 olabilir (en fazla 2 seçenek).',
 };
 
 /** The club's name as it is written on posters. */
@@ -114,37 +121,65 @@ export function posterText(value) {
         .trim();
 }
 
+/**
+ * The logo line: the reference is the real logo, to be placed as given. The corner only when the user or
+ * Hermes chose one (`corner`); otherwise the model picks the spot that suits its composition.
+ */
 const logoInstruction = (corner, which) =>
-    `Club logo: ${which} is the official ${CLUB_NAME} logo. Place that exact logo once, in the ${CORNER_PROMPT[corner]} corner, small (about 12% of the image width), about 5% in from the edges, on a calm, uncluttered area with good contrast. Reproduce it faithfully: same shapes, same colours, same proportions; do not redraw, restyle, distort or crop it, and do not add any other logo or emblem. Keep all text away from that corner.`;
+    `Logo: ${which} is the official ${CLUB_NAME} logo. Place it once, exactly as given (same shapes, colours and proportions; do not redraw, restyle, distort or crop it, and add no other logo or emblem), ${corner ? `in the ${CORNER_PROMPT[corner]} corner` : 'wherever it suits the composition'}, clearly visible on an uncluttered area.`;
+
+/** A soft colour hint: the brand palette as inspiration, not a rule. */
+const paletteHint = (colors) => `Colour palette inspired by the club's brand colours (${colors.join(', ')}); use them freely, as inspiration rather than a rule.`;
+
+/** The poster style directions secenek: 2 draws from when Hermes gives none: two different ones per request. */
+export const STYLE_DIRECTIONS = [
+    'bold typography-led poster, the words as the main visual',
+    'glossy 3D render with soft studio lighting',
+    'collage / mixed media with paper textures and cut-outs',
+    'retro Y2K aesthetic with chrome and playful shapes',
+    'minimalist Swiss design, strict grid, strong type',
+    'isometric illustration with a small detailed world',
+    'photoreal editorial photography look',
+    'hand-drawn flat illustration, warm and friendly',
+    'futuristic interface / HUD aesthetic',
+    'layered paper-cut art with depth and shadows',
+    'flowing gradient mesh with abstract organic forms',
+];
 
 /**
- * The prompt sent for generate_image: the caller's description, then (in a fixed phrasing) the exact
- * headline, subline and club name to render, the typography, and where the logo reference goes.
- * `logoCorner` null: no logo instruction.
+ * The prompt sent for generate_image: the caller's creative brief, then (only when there is a headline or a
+ * logo) a short fixed block: the exact text to render with correct Turkish letters, the club name small, the
+ * real logo as given, and the brand palette as a soft hint. Layout, typography and style stay the model's call.
+ * `logo` false: no logo line; `logoCorner` null: the model places the logo. `style`: an extra style direction.
  */
-export function buildImagePrompt({ prompt, baslik = null, altMetin = null, logoCorner = null }) {
+export function buildImagePrompt({ prompt, baslik = null, altMetin = null, logo = false, logoCorner = null, style = null, colors = null }) {
     const parts = [String(prompt).trim()];
+    if (style) parts.push(`Style direction for this version: ${style}.`);
     if (baslik) {
         const lines = [
-            `Text in the image: render exactly the following text and no other words. It is Turkish; spell every word exactly as given, with the correct Turkish characters ${TURKISH_LETTERS}, no missing or replaced letters, no extra punctuation.`,
-            `Headline text, exactly: "${baslik}"`,
+            `Text to render, exactly as written and no other words. It is Turkish: keep every letter, with the correct Turkish characters ${TURKISH_LETTERS}, nothing missing or replaced, no extra punctuation.`,
+            `Headline: "${baslik}"`,
         ];
-        if (altMetin) lines.push(`Subline text (smaller, below the headline), exactly: "${altMetin}"`);
-        lines.push(`Small text, exactly: "${CLUB_NAME}"`);
-        lines.push('Typography: clean modern sans-serif, bold headline, brand colours (deep navy #0f1c47, white #ffffff or light #f1f5f9, accent #1e6bf5, brand gradient #3278f6 to #3cbdfa), strong contrast with the background, crisp and legible at phone size, generous spacing, nothing cut off at the edges.');
+        if (altMetin) lines.push(`Subline: "${altMetin}"`);
+        lines.push(`Club name, small: "${CLUB_NAME}"`);
+        lines.push('Layout and typography are up to you; keep all text legible and uncut.');
         parts.push(lines.join('\n'));
     }
-    if (logoCorner) parts.push(logoInstruction(logoCorner, 'the last reference image'));
+    if (logo || logoCorner) parts.push(logoInstruction(logoCorner, 'the last reference image'));
+    if ((baslik || logo || logoCorner) && colors?.length) parts.push(paletteHint(colors));
     return parts.join('\n\n');
 }
 
 /** The prompt sent for edit_image: change only what the instruction says, keep the rest. */
-export function buildEditPrompt({ talimat, logoCorner = null }) {
+export function buildEditPrompt({ talimat, logo = false, logoCorner = null }) {
     const parts = [
         `Edit the first reference image. Change only this: ${String(talimat).trim()}`,
         `Keep everything else as it is: composition, colours, style, layout and any existing text. Any text you add or change must be spelled exactly as given, with the correct Turkish characters ${TURKISH_LETTERS}.`,
     ];
-    if (logoCorner) parts.push(logoInstruction(logoCorner, 'the last reference image').replace('Place that exact logo once', 'The image must show that exact logo once').replace('Reproduce it faithfully', 'If the logo in the image differs from it, replace it with a faithful copy'));
+    if (logo || logoCorner) {
+        const where = logoCorner ? `in the ${CORNER_PROMPT[logoCorner]} corner` : 'where it already is (or, if there is none, wherever it suits the composition)';
+        parts.push(`Logo: the last reference image is the official ${CLUB_NAME} logo. The image must show it once, exactly as given, ${where}, clearly visible on an uncluttered area. If the logo in the image differs from it, replace it with a faithful copy; do not redraw, restyle or distort it, and add no other logo or emblem.`);
+    }
     return parts.join('\n\n');
 }
 
@@ -415,16 +450,17 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             if (shown.final) lines.push(`Gerçek kulüp logosu eklenmiş hali (${CORNER_NAMES[row.logo_corner] ?? ''} köşe) kullanılıyor; logosuz asıl hali de saklı (logosuz: true).`);
             const text = params.poster;
             if (text?.baslik) {
-                lines.push(`Görseldeki yazıyı kontrol et: başlık “${text.baslik}”${text.alt_metin ? `, alt metin “${text.alt_metin}”` : ''}. Kullanıcı yazının yanlış olduğunu söylerse bir kez yeniden üretmeyi (ya da edit_image ile düzeltmeyi) teklif et; kendiliğinden tekrar üretme.`);
+                lines.push(`Görseldeki yazıyı kontrol et: başlık “${text.baslik}”${text.alt_metin ? `, alt metin “${text.alt_metin}”` : ''}. Kullanıcı yazının yanlış olduğunu söylerse edit_image ile düzeltmeyi (ya da yeniden üretmeyi) teklif et; kendiliğinden tekrar üretme.`);
             }
-            if (row.logo_corner && !shown.final) lines.push('Logo modele referans olarak verildi. Logo bozuk ya da yanlış çıktıysa add_logo ile gerçek logo kredi harcamadan eklenebilir.');
+            if ((row.logo_corner || params.logo) && !shown.final) lines.push('Logo modele referans olarak verildi. Logo bozuk ya da yanlış çıktıysa add_logo ile gerçek logo kredi harcamadan eklenebilir.');
         } else {
             if (row.bytes <= WHATSAPP_AUDIO_MAX) {
                 lines.push('Kullanıcıya dinletmek için cevabına ayrı bir satırda aynen şunu yaz:', `MEDIA:${exposeToHermes(row)}`);
             }
             lines.push(`Ses dosyası saklandı (${meta}); sosyal medya gönderisine tek başına eklenemez, ileride videoda kullanılabilir.`);
         }
-        lines.push(...extra, remainingLine(usage, row.kind));
+        lines.push(...extra);
+        if (usage) lines.push(remainingLine(usage, row.kind));
         return lines.join('\n');
     }
 
@@ -523,31 +559,40 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         return `Üretim başarısız oldu${why ? ` (${why.slice(0, 120)})` : ''}. Kendiliğimden tekrar denemiyorum; istersen isteği değiştirip yeniden başlatabilirsin.`;
     }
 
-    /** The one path every generation takes. */
+    /**
+     * The one path every generation takes. `attempt.variants` (secenek: 2): several independent jobs of the
+     * same request, each with its own params (prompt); every check below counts all of them, and the call
+     * waits for all. Without it, one job.
+     */
     async function generate(attempt) {
         const { kind, requestedBy } = attempt;
         if (inFlight) refuseAttempt(attempt, MESSAGES.busy);
         inFlight = true;
         try {
+            const variants = attempt.variants ?? [{ params: attempt.params }];
+            const n = variants.length;
             // A job sent earlier may still be running (the call that sent it answered "still preparing").
             const [pending] = await settlePending();
             if (pending) refuseAttempt(attempt, MESSAGES.pending(pending.id));
             const before = usageNumbers();
             if (before.cooldownLeft > 0) refuseAttempt(attempt, MESSAGES.cooldown(before.cooldownLeft));
             const dailyCount = { image: [limits.dailyImages, MESSAGES.dailyImages], music: [limits.dailyMusic, MESSAGES.dailyMusic], speech: [limits.dailySpeech, MESSAGES.dailySpeech] }[kind];
-            if (before.counts[kind] >= dailyCount[0]) refuseAttempt(attempt, dailyCount[1]);
+            if (before.counts[kind] + n > dailyCount[0]) refuseAttempt(attempt, n > 1 && before.counts[kind] < dailyCount[0] ? MESSAGES.variantsCount(dailyCount[0] - before.counts[kind]) : dailyCount[1]);
             if (before.monthCredits >= limits.monthlyCredits) refuseAttempt(attempt, MESSAGES.monthlyCredits);
 
-            const params = { ...attempt.params };
-            // References in order (the prompt names "the first" / "the last" reference image).
+            // References in order (the prompt names "the first" / "the last" reference image); the same for every variant.
             const references = attempt.references ?? (attempt.reference ? [attempt.reference] : []);
+            let medias = null;
             if (references.length) {
-                params.medias = [];
-                for (const reference of references) params.medias.push({ value: await resolveReference(reference), role: 'image_references' });
+                medias = [];
+                for (const reference of references) medias.push({ value: await resolveReference(reference), role: 'image_references' });
             }
+            const all = variants.map((variant) => ({ ...variant, params: { ...variant.params, ...(medias ? { medias } : {}) } }));
+            const params = all[0].params;
             const estimateTool = kind === 'image' ? 'estimate_image_cost' : 'estimate_audio_cost';
             let estimate = null;
             try {
+                // The variants differ only in their prompt: one estimate is the cost of each.
                 const answer = await higgsfield.call(estimateTool, { params });
                 estimate = answer.isError ? null : parseCredits(answer);
             } catch (error) {
@@ -556,56 +601,91 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             }
             if (estimate === null || !Number.isFinite(estimate)) refuseAttempt({ ...attempt, params }, MESSAGES.noEstimate);
             const cost = round(estimate);
-            if (cost > limits.maxCreditsPerRequest) refuseAttempt({ ...attempt, params }, MESSAGES.tooExpensive(cost, limits.maxCreditsPerRequest), cost);
+            const total = round(cost * n);
+            if (cost > limits.maxCreditsPerRequest) refuseAttempt({ ...attempt, params }, MESSAGES.tooExpensive(cost, limits.maxCreditsPerRequest), total);
             const usage = usageNumbers();
-            if (usage.dayCredits + cost > limits.dailyCredits) refuseAttempt({ ...attempt, params }, MESSAGES.dailyCredits(usage.remaining.credits), cost);
-            if (usage.monthCredits + cost > limits.monthlyCredits) refuseAttempt({ ...attempt, params }, MESSAGES.monthlyCredits, cost);
+            if (usage.dayCredits + total > limits.dailyCredits) refuseAttempt({ ...attempt, params }, MESSAGES.dailyCredits(usage.remaining.credits), total);
+            if (usage.monthCredits + total > limits.monthlyCredits) refuseAttempt({ ...attempt, params }, MESSAGES.monthlyCredits, total);
             // Best-effort (requested_by is the model's word); a missing or unknown one shares the 'bilinmiyor' cap.
             const spent = store.personCredits(usage.day, requestedBy);
-            if (spent + cost > limits.perPersonDailyCredits) {
+            if (spent + total > limits.perPersonDailyCredits) {
                 const left = round(Math.max(0, limits.perPersonDailyCredits - spent));
-                refuseAttempt({ ...attempt, params }, requestedBy === UNKNOWN_PERSON ? MESSAGES.unknownPerson(left) : MESSAGES.perPerson(left), cost);
+                refuseAttempt({ ...attempt, params }, requestedBy === UNKNOWN_PERSON ? MESSAGES.unknownPerson(left) : MESSAGES.perPerson(left), total);
             }
 
-            const id = newId();
-            // `record`: what the gateway keeps about the request beyond what is sent (headline, edit source).
-            store.insert({ id, day: usage.day, month: usage.day.slice(0, 7), tool: attempt.tool, kind, model: params.model, params: { ...publicParams(params), ...(attempt.record ?? {}) }, estimated: cost, status: 'submitting', requestedBy, summary: attempt.summary, logoCorner: attempt.logoCorner ?? null });
             const deadline = now() + settings.jobTimeoutSec * 1000;
-            let answer;
-            try {
-                // edit_image is gpt_image_2_6 image-to-image: Higgsfield's generate_image with the image as a reference.
-                answer = await higgsfield.call(attempt.higgsfieldTool ?? attempt.tool, { params, context: 'Kulüp sosyal medya içeriği için tek üretim.' });
-            } catch (error) {
-                // Sent, but no answer: it may have run. Counted, never sent again.
-                store.update(id, { status: 'unknown', reason: String(error.message).slice(0, 300) });
-                log('warn', 'studio generation answer lost', id, error.message);
-                refuse(MESSAGES.lostAnswer);
+            const sent = [];
+            let stopped = null;
+            for (const variant of all) {
+                try {
+                    sent.push({ ...variant, ...(await sendOne(attempt, variant, usage.day, cost)) });
+                } catch (error) {
+                    // A variant that failed to send: nothing after it is sent (no retries, no surprises).
+                    if (!sent.length || !error.userMessage) throw error;
+                    stopped = error.userMessage;
+                    break;
+                }
             }
-            if (answer.isError) {
-                store.update(id, { status: 'failed', reason: answer.text.slice(0, 300) });
-                refuse(`Higgsfield bu isteği kabul etmedi: ${answer.text.replace(/\s+/g, ' ').slice(0, 160)}`);
-            }
-            const [jobId] = parseJobIds(answer);
-            const actual = /charged|spent|harcan/i.test(answer.text) ? parseCredits(answer) : null;
-            if (!jobId) {
-                // Higgsfield took it (and likely charged it) but no job id could be read: keep the raw
-                // answer so an admin can find the job and attach it (studio.sh raw / recover).
-                store.update(id, { status: 'unknown', reason: 'no job id in answer', rawAnswer: rawAnswer(answer), ...(actual !== null ? { actual } : {}) });
-                log('warn', 'studio generation answer has no job id, raw answer stored', id, attempt.tool, `excerpt: ${answerExcerpt(answer)}`);
-                refuse(MESSAGES.lostAnswer);
-            }
-            store.update(id, { status: 'submitted', jobId, ...(actual !== null ? { actual } : {}) });
-            log('info', 'studio generation submitted', id, attempt.tool, params.model, `est=${cost}`);
 
-            const row = (await finish(id, jobId, deadline));
-            if (row.status === 'completed') return describeResult(row, usageNumbers());
-            if (row.status === 'failed') refuse(failedMessage(row));
-            // The requester is told on WhatsApp when the background check finishes it (notifyFinished).
-            store.markNotify(row.id, null, 'waiting');
-            return `Üretim hâlâ hazırlanıyor (generation_id: ${row.id}). Kullanıcıya biraz sürdüğünü ve hazır olunca önizlemenin WhatsApp'tan kendiliğinden geleceğini söyle; sorarsa get_generation ile sonucu al. Yeni bir üretim başlatma.`;
+            const results = [];
+            for (const item of sent) results.push({ ...item, row: await finish(item.id, item.jobId, deadline) });
+            if (n === 1) {
+                const [{ row }] = results;
+                if (row.status === 'completed') return describeResult(row, usageNumbers());
+                if (row.status === 'failed') refuse(failedMessage(row));
+                // The requester is told on WhatsApp when the background check finishes it (notifyFinished).
+                store.markNotify(row.id, null, 'waiting');
+                return MESSAGES.stillPreparing(row.id);
+            }
+            const lines = [`${n} seçenek istendi; her biri ayrı bir üretim ve sınırlara ayrı sayılıyor. Kullanıcıya iki önizlemeyi de göster ve hangisini beğendiğini sor.`];
+            results.forEach(({ row, label }, index) => {
+                lines.push('', `Seçenek ${index + 1}${label ? ` (${label})` : ''}:`);
+                if (row.status === 'completed') lines.push(describeResult(row, null));
+                else if (row.status === 'failed') lines.push(failedMessage(row));
+                else {
+                    store.markNotify(row.id, null, 'waiting');
+                    lines.push(MESSAGES.stillPreparing(row.id));
+                }
+            });
+            if (stopped) lines.push('', `Seçenek ${sent.length + 1} gönderilemedi: ${stopped}`);
+            lines.push('', remainingLine(usageNumbers(), kind));
+            return lines.join('\n');
         } finally {
             inFlight = false;
         }
+    }
+
+    /** Records and sends one job; { id, jobId }. Never sent twice: a lost answer is 'unknown' and counted. */
+    async function sendOne(attempt, { params, record = {}, logoCorner = null }, day, cost) {
+        const id = newId();
+        // `record`: what the gateway keeps about the request beyond what is sent (headline, edit source).
+        store.insert({ id, day, month: day.slice(0, 7), tool: attempt.tool, kind: attempt.kind, model: params.model, params: { ...publicParams(params), ...(attempt.record ?? {}), ...record }, estimated: cost, status: 'submitting', requestedBy: attempt.requestedBy, summary: attempt.summary, logoCorner: logoCorner ?? attempt.logoCorner ?? null });
+        let answer;
+        try {
+            // edit_image is gpt_image_2_6 image-to-image: Higgsfield's generate_image with the image as a reference.
+            answer = await higgsfield.call(attempt.higgsfieldTool ?? attempt.tool, { params, context: 'Kulüp sosyal medya içeriği için tek üretim.' });
+        } catch (error) {
+            // Sent, but no answer: it may have run. Counted, never sent again.
+            store.update(id, { status: 'unknown', reason: String(error.message).slice(0, 300) });
+            log('warn', 'studio generation answer lost', id, error.message);
+            refuse(MESSAGES.lostAnswer);
+        }
+        if (answer.isError) {
+            store.update(id, { status: 'failed', reason: answer.text.slice(0, 300) });
+            refuse(`Higgsfield bu isteği kabul etmedi: ${answer.text.replace(/\s+/g, ' ').slice(0, 160)}`);
+        }
+        const [jobId] = parseJobIds(answer);
+        const actual = /charged|spent|harcan/i.test(answer.text) ? parseCredits(answer) : null;
+        if (!jobId) {
+            // Higgsfield took it (and likely charged it) but no job id could be read: keep the raw
+            // answer so an admin can find the job and attach it (studio.sh raw / recover).
+            store.update(id, { status: 'unknown', reason: 'no job id in answer', rawAnswer: rawAnswer(answer), ...(actual !== null ? { actual } : {}) });
+            log('warn', 'studio generation answer has no job id, raw answer stored', id, attempt.tool, `excerpt: ${answerExcerpt(answer)}`);
+            refuse(MESSAGES.lostAnswer);
+        }
+        store.update(id, { status: 'submitted', jobId, ...(actual !== null ? { actual } : {}) });
+        log('info', 'studio generation submitted', id, attempt.tool, params.model, `est=${cost}`);
+        return { id, jobId };
     }
 
     // ---- approval card hint and "ready" notification ------------------------------------------
@@ -634,7 +714,10 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
                 return (params.resolution ?? '2k') === resolution;
             });
             const credits = seen?.estimated_credits ?? settings.approxCredits.image[model]?.[resolution];
-            if (Number.isFinite(credits)) hint.credits = round(credits);
+            // secenek: 2 (generate_image only): two generations, twice the credits.
+            const count = tool === 'generate_image' && args.secenek === 2 ? 2 : 1;
+            if (count > 1) hint.count = count;
+            if (Number.isFinite(credits)) hint.credits = round(credits * count);
         } else if (tool === 'generate_audio') {
             if (args.kind === 'speech') hint.credits = round(settings.approxCredits.speech);
             if (args.kind === 'music') {
@@ -710,7 +793,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
     const tools = [
         {
             name: 'get_brand_kit',
-            description: 'Marmara Yapay Zeka Kulübü marka kiti: renkler, logo, ton, görsel kurallar, şablonlar ve platform oranları. Görsel ya da ses üretmeden önce mutlaka oku.',
+            description: 'Marmara Yapay Zeka Kulübü marka kiti: kimlik, renk paleti, logo, ton, kaçınılacaklar, stil yelpazesi ve platform oranları. Görsel ya da ses üretmeden önce mutlaka oku.',
             inputSchema: { type: 'object', properties: {}, additionalProperties: false },
             annotations: { title: 'Marka kiti', readOnlyHint: true, openWorldHint: false },
             handler: () => brandKit(),
@@ -739,19 +822,21 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         {
             name: 'generate_image',
             description:
-                'Kulübün Higgsfield hesabıyla TEK bir görsel üretir; kredi harcar (varsayılan 1k: yaklaşık 1,5 kredi; 2k: 2-3; Recraft 8). Önce get_brand_kit oku, kullanıcıya ne üretileceğini ve yaklaşık krediyi söyle. Hedef platformu "platform" ile ver: oran ona göre seçilir, sonradan kırpma gerekmez. "ozet" alanına Türkçe tek satırlık özet yaz. Başarısız olursa kendiliğinden tekrar deneme.',
+                'Kulübün Higgsfield hesabıyla yeni bir görsel üretir (secenek: 2 ile farklı stilde iki ayrı görsel); kredi harcar (varsayılan 1k: görsel başı yaklaşık 1,5 kredi; 2k: 2-3; Recraft 8). Önce get_brand_kit oku, kullanıcıya ne üretileceğini ve yaklaşık krediyi söyle. "Yeni / farklı / daha modern / baştan / alternatif" istekleri için bunu kullan, edit_image değil. Hedef platformu "platform" ile ver: oran ona göre seçilir, sonradan kırpma gerekmez. "ozet" alanına Türkçe tek satırlık özet yaz. Başarısız olursa kendiliğinden tekrar deneme.',
             inputSchema: {
                 type: 'object',
                 properties: {
-                    prompt: { type: 'string', description: 'Marka kitine uygun, ayrıntılı görsel tarifi (İngilizce daha iyi): sahne, kompozisyon, renkler, yazının nerede duracağı. Başlık ve alt metni burada değil baslik/alt_metin alanlarında ver; geçit onları sabit bir kalıpla ekler.', maxLength: 4000 },
+                    prompt: { type: 'string', description: 'Sanat yönetmeni brifi (İngilizce daha iyi): konsept, duygu, stil ve bir kompozisyon fikri; yerleşim kararlarını modele bırak. Başlık ve alt metni burada değil baslik/alt_metin alanlarında ver; geçit onları aynen yazdırır.', maxLength: 4000 },
                     baslik: { type: 'string', maxLength: BASLIK_MAX, description: 'Afişin Türkçe başlığı, görselde aynen yazılacak metin (ör. "8 Mart Dünya Kadınlar Günü"). Türkçe karakterleri doğru yaz. Verilirse görsele küçük harflerle "Marmara Yapay Zeka Kulübü" de yazılır.' },
                     alt_metin: { type: 'string', maxLength: ALT_METIN_MAX, description: 'İsteğe bağlı kısa alt satır (tarih, yer, slogan), görselde aynen yazılır. baslik ile birlikte verilir.' },
-                    logo: { type: 'boolean', description: 'Varsayılan true (afişler için): gerçek kulüp logosu modele referans olarak verilir ve logo_konum köşesine yerleştirilmesi istenir. Sadece logosuz görsel istenirse false.' },
-                    logo_konum: { type: 'string', enum: LOGO_CORNERS, description: `Logonun köşesi (varsayılan ${DEFAULT_LOGO_CORNER}: sağ alt). Yazı bu köşeden uzak tutulur.` },
+                    logo: { type: 'boolean', description: 'Varsayılan true (afişler için): gerçek kulüp logosu modele referans olarak verilir, olduğu gibi ve net görünür yerleştirilmesi istenir. Sadece logosuz görsel istenirse false.' },
+                    logo_konum: { type: 'string', enum: LOGO_CORNERS, description: 'İsteğe bağlı köşe; sadece kullanıcı ya da tasarım belirli bir köşe isterse ver. Verilmezse logonun yerini model kompozisyona göre seçer.' },
                     logo_zemin: { type: 'string', enum: ['koyu', 'acik'], description: 'Logo köşesinin zemini: koyu (lacivert/koyu; beyaz yazılı logo, varsayılan) ya da acik (açık zemin; lacivert yazılı logo).' },
                     platform: { type: 'string', enum: platformKeys, description: `Hedef platform; oranı belirler (${platformKeys.map((key) => `${key} ${settings.platformAspectRatios[key]}`).join(', ')}).` },
                     aspect_ratio: { type: 'string', enum: aspectRatios, description: 'Platform verilmediyse en-boy oranı.' },
-                    model: { type: 'string', enum: settings.imageModels, description: `Varsayılan ${DEFAULT_IMAGE_MODEL}. ${settings.imageModels.map((model) => `${model}: ${IMAGE_MODELS[model].label}`).join('; ')}.` },
+                    model: { type: 'string', enum: settings.imageModels, description: `Varsayılan ${DEFAULT_IMAGE_MODEL}. ${settings.imageModels.map((model) => `${model}: ${IMAGE_MODELS[model].label}`).join('; ')}. Stile göre seç (ör. fotogerçekçi ya da editoryal için nano_banana_2_1).` },
+                    secenek: { type: 'integer', enum: [1, 2], description: 'Varsayılan 1. 2: kullanıcı "birkaç seçenek / alternatifler" isterse aynı brifi iki farklı stilde iki ayrı görsel olarak üretir; her biri ayrı kredi ve sınırlara ayrı sayılır (en fazla 2).' },
+                    stiller: { type: 'array', items: { type: 'string', maxLength: 200 }, maxItems: 2, description: 'secenek: 2 ile isteğe bağlı: iki seçeneğin stil yönleri (İngilizce, birbirinden farklı; ör. ["bold typography-led poster", "isometric 3D illustration"]). Verilmezse geçit iki farklı stil seçer.' },
                     resolution: { type: 'string', enum: ['1k', '2k', '4k'], description: 'Varsayılan 1k (sosyal medya için yeterli, en ucuzu). 2k sadece kullanıcı baskı, büyük ekran ya da "yüksek çözünürlük" derse; 4k sadece nano_banana_2_1 ile ve kullanıcı açıkça 4k isterse.' },
                     yuksek_cozunurluk: { type: 'boolean', description: 'true: 2k üret (resolution "2k" ile aynı). Sadece kullanıcı baskı, büyük ekran ya da "yüksek çözünürlük" isterse.' },
                     style: { type: 'string', enum: IMAGE_MODELS.recraft_v4_1.styles, description: 'Sadece recraft_v4_1: standard, vector (logo/ikon/tipografi), utility, utility_vector.' },
@@ -768,7 +853,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         {
             name: 'edit_image',
             description:
-                'Var olan bir görseli gpt_image_2_6 ile DÜZENLER (görselden görsele): önceki bir üretim (generation_id) ya da kullanıcının WhatsApp’tan gönderdiği görsel (kaynak_gorsel). Talimatta neyin değişeceğini yaz (Türkçe ya da İngilizce); geri kalan korunur. Yeni bir üretimdir: kredi harcar (1k yaklaşık 1,5), aynı sınırlar ve onay geçerli. "ozet" alanını doldur. Başarısız olursa kendiliğinden tekrar deneme.',
+                'Var olan bir görselde HEDEFLİ değişiklik yapar (gpt_image_2_6, görselden görsele): önceki bir üretim (generation_id) ya da kullanıcının WhatsApp’tan gönderdiği görsel (kaynak_gorsel). Sadece "başlığı değiştir", "rengi koyulaştır", "şunu ekle/çıkar" gibi istekler için; "yeni / farklı / daha modern / baştan / alternatif" için değil (onlar yeni generate_image). Talimatta neyin değişeceğini yaz (Türkçe ya da İngilizce); geri kalan korunur. Yeni bir üretimdir: kredi harcar (1k yaklaşık 1,5), aynı sınırlar ve onay geçerli. "ozet" alanını doldur. Başarısız olursa kendiliğinden tekrar deneme.',
             inputSchema: {
                 type: 'object',
                 properties: {
@@ -776,7 +861,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
                     kaynak_gorsel: { type: 'string', description: 'generation_id yerine: kullanıcının gönderdiği görselin yolu (/opt/data/cache/images/…).' },
                     talimat: { type: 'string', maxLength: 2000, description: 'Ne değişecek (ör. "başlığı \'Yapay Zeka Atölyesi\' yap", "arka planı lacivert yap", "sağ alttaki logoyu düzelt"). Yeni yazı varsa aynen ve Türkçe karakterleriyle yaz.' },
                     logo: { type: 'boolean', description: 'Gerçek kulüp logosu referans olarak verilsin mi. Varsayılan: kaynak üretimde logo varsa true. Logo düzeltilecekse true.' },
-                    logo_konum: { type: 'string', enum: LOGO_CORNERS, description: 'Logonun köşesi (varsayılan kaynak üretimdeki ya da sağ alt).' },
+                    logo_konum: { type: 'string', enum: LOGO_CORNERS, description: 'İsteğe bağlı köşe (varsayılan kaynak üretimdeki; o da yoksa logo yerinde kalır ya da model seçer).' },
                     logo_zemin: { type: 'string', enum: ['koyu', 'acik'], description: 'Logo köşesinin zemini (varsayılan koyu).' },
                     platform: { type: 'string', enum: platformKeys, description: 'İsteğe bağlı: başka orana çevirmek için. Verilmezse kaynağın oranı korunur.' },
                     yuksek_cozunurluk: { type: 'boolean', description: 'true: 2k. Sadece kullanıcı açıkça isterse.' },
@@ -859,7 +944,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         const ratios = Object.entries(settings.platformAspectRatios)
             .map(([key, ratio]) => `${key}: ${ratio}`)
             .join(', ');
-        return `${text.trim()}\n\n---\nGeçitteki ayarlar: platform oranları ${ratios}. generate_image: baslik/alt_metin görsele aynen yazılır; logo (varsayılan true) gerçek logo dosyasını referans verir, logo_konum köşesine (${LOGO_CORNERS.join(', ')}). Logo bozuk çıkarsa add_logo (kredi harcamaz). Düzeltme için edit_image.`;
+        return `${text.trim()}\n\n---\nGeçitteki ayarlar: platform oranları ${ratios}. generate_image: baslik/alt_metin görsele aynen yazılır; logo (varsayılan true) gerçek logo dosyasını referans verir; yerini model kompozisyona göre seçer, logo_konum (${LOGO_CORNERS.join(', ')}) sadece köşe istenirse. secenek: 2 farklı stilde iki ayrı görsel üretir (iki kat kredi). Logo bozuk çıkarsa add_logo (kredi harcamaz). Hedefli değişiklik için edit_image; yeni fikir için yeni generate_image.`;
     }
 
     function usageText() {
@@ -936,16 +1021,26 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         if (baslik.length > BASLIK_MAX) refuseAttempt(attempt, `Başlık çok uzun (en fazla ${BASLIK_MAX} karakter); afişte kısa başlık daha iyi okunur.`);
         if (altMetin.length > ALT_METIN_MAX) refuseAttempt(attempt, `Alt metin çok uzun (en fazla ${ALT_METIN_MAX} karakter).`);
         if (altMetin && !baslik) refuseAttempt(attempt, 'alt_metin için baslik da ver.');
-        const corner = args.logo_konum ?? DEFAULT_LOGO_CORNER;
-        if (!LOGO_CORNERS.includes(corner)) refuseAttempt(attempt, `logo_konum ${LOGO_CORNERS.join(', ')} olabilir.`);
+        // The corner only when the user or Hermes chose one; otherwise the model places the logo.
+        const corner = args.logo_konum ?? null;
+        if (corner !== null && !LOGO_CORNERS.includes(corner)) refuseAttempt(attempt, `logo_konum ${LOGO_CORNERS.join(', ')} olabilir.`);
         // The real logo goes to the model as a reference: only models that take references (not Recraft).
         const logo = args.logo !== false && spec.references;
         if (args.logo === true && !spec.references) refuseAttempt(attempt, `${model} referans görsel almadığı için logoyu veremiyorum; gpt_image_2_6 kullan ya da sonra add_logo ile ekle.`);
         const logoCorner = logo ? corner : null;
+        // secenek: 2 → two independent generations of the brief, each with its own style direction.
+        const secenek = args.secenek ?? 1;
+        if (secenek !== 1 && secenek !== 2) refuseAttempt(attempt, MESSAGES.variants);
+        let styles = [null];
+        if (secenek === 2) {
+            const given = Array.isArray(args.stiller) ? args.stiller.map((item) => posterText(item).slice(0, 200)).filter(Boolean) : [];
+            styles = given.length >= 2 && given[0] !== given[1] ? given.slice(0, 2) : pickStyles(given[0]);
+        }
 
         // Built here from the allowlist: nothing else Hermes sends reaches Higgsfield.
-        const fullPrompt = buildImagePrompt({ prompt, baslik: baslik || null, altMetin: altMetin || null, logoCorner });
-        const params = { model, prompt: fullPrompt, aspect_ratio: aspect, batch_size: 1, count: 1, use_unlim: settings.allowUnlim };
+        const colors = baslik || logo ? settings.brandColors : null;
+        const fullPrompt = (style) => buildImagePrompt({ prompt, baslik: baslik || null, altMetin: altMetin || null, logo, logoCorner, style, colors });
+        const params = { model, prompt: fullPrompt(styles[0]), aspect_ratio: aspect, batch_size: 1, count: 1, use_unlim: settings.allowUnlim };
         if (settings.allowFreeGens) params.use_free_gens = true;
         if (model === 'gpt_image_2_6') Object.assign(params, { quality: 'high', resolution, output_format: settings.imageFormat });
         if (model === 'nano_banana_2_1') params.resolution = resolution;
@@ -957,8 +1052,18 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         const references = [];
         if (args.reference_image) references.push(args.reference_image);
         if (logo) references.push(logoVariant(args.logo_zemin));
-        const record = baslik ? { poster: { baslik, ...(altMetin ? { alt_metin: altMetin } : {}) } } : {};
-        return generate({ ...attempt, params, references, logoCorner, record });
+        const record = { ...(baslik ? { poster: { baslik, ...(altMetin ? { alt_metin: altMetin } : {}) } } : {}), ...(logo ? { logo: true } : {}) };
+        if (secenek === 1) return generate({ ...attempt, params, references, logoCorner, record });
+        const variants = styles.map((style) => ({ params: { ...params, prompt: fullPrompt(style) }, label: style, record: { stil: style } }));
+        return generate({ ...attempt, variants, references, logoCorner, record });
+    }
+
+    /** Two different style directions (the first one given, if any, kept). */
+    function pickStyles(first = null) {
+        const pool = STYLE_DIRECTIONS.filter((style) => style !== first);
+        const a = first ?? pool.splice(randomBytes(1)[0] % pool.length, 1)[0];
+        const b = pool[randomBytes(1)[0] % pool.length];
+        return [a, b];
     }
 
     /** The logo file for the background of its corner: logo-dark.png (light lettering) on dark, logo.png on light. */
@@ -977,6 +1082,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         let source;
         let aspect = null;
         let sourceCorner = null;
+        let sourceLogo = false;
         if (args.generation_id) {
             const row = store.get(String(args.generation_id));
             if (!row || row.kind !== 'image' || row.status !== 'completed' || !row.job_id) refuseAttempt(attempt, MESSAGES.editSource);
@@ -984,6 +1090,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             aspect = row.params ? JSON.parse(row.params).aspect_ratio ?? null : null;
             if (!aspect && row.width) aspect = nearestAspect(row.width, row.height, spec.aspectRatios);
             sourceCorner = row.logo_corner;
+            sourceLogo = Boolean(row.logo_corner) || (row.params ? JSON.parse(row.params).logo === true : false);
         } else {
             const value = String(args.kaynak_gorsel);
             if (!value.startsWith('/')) refuseAttempt(attempt, MESSAGES.editSource);
@@ -1002,17 +1109,17 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         }
         aspect ??= '1:1';
         if (!spec.aspectRatios.includes(aspect)) aspect = nearestAspect(...aspect.split(':').map(Number), spec.aspectRatios);
-        const corner = args.logo_konum ?? sourceCorner ?? DEFAULT_LOGO_CORNER;
-        if (!LOGO_CORNERS.includes(corner)) refuseAttempt(attempt, `logo_konum ${LOGO_CORNERS.join(', ')} olabilir.`);
-        const logo = args.logo ?? Boolean(sourceCorner);
+        const corner = args.logo_konum ?? sourceCorner ?? null;
+        if (corner !== null && !LOGO_CORNERS.includes(corner)) refuseAttempt(attempt, `logo_konum ${LOGO_CORNERS.join(', ')} olabilir.`);
+        const logo = args.logo ?? sourceLogo;
         const logoCorner = logo ? corner : null;
         const resolution = args.yuksek_cozunurluk === true ? '2k' : DEFAULT_IMAGE_RESOLUTION;
 
-        const params = { model, prompt: buildEditPrompt({ talimat, logoCorner }), aspect_ratio: aspect, batch_size: 1, count: 1, use_unlim: settings.allowUnlim, quality: 'high', resolution, output_format: settings.imageFormat };
+        const params = { model, prompt: buildEditPrompt({ talimat, logo, logoCorner }), aspect_ratio: aspect, batch_size: 1, count: 1, use_unlim: settings.allowUnlim, quality: 'high', resolution, output_format: settings.imageFormat };
         if (settings.allowFreeGens) params.use_free_gens = true;
         const references = [source];
         if (logo) references.push(logoVariant(args.logo_zemin));
-        const record = { edit: { source: args.generation_id ? source : 'kullanici-gorseli', talimat: talimat.slice(0, 300) } };
+        const record = { edit: { source: args.generation_id ? source : 'kullanici-gorseli', talimat: talimat.slice(0, 300) }, ...(logo ? { logo: true } : {}) };
         return generate({ ...attempt, params, references, logoCorner, record });
     }
 

@@ -319,7 +319,9 @@ def _generate_image(args, hint):
     where = f"{platform} ({ratio})" if platform and ratio else (platform or ratio)
     resolution = clean(hint.get("resolution") or args.get("resolution") or ("2k" if args.get("yuksek_cozunurluk") is True else ""), 4)
     quality = "yüksek çözünürlük" if resolution in ("2k", "4k") else ""
-    return [head("🎨", "Görsel üretilecek", where, quality, credits_text(hint.get("credits"))),
+    # secenek: 2 → two separate generations; the hint's credits already cover both.
+    several = "2 görsel" if hint.get("count") == 2 or args.get("secenek") == 2 else ""
+    return [head("🎨", "Görsel üretilecek", where, quality, several, credits_text(hint.get("credits"))),
             _konu(args, "prompt"), f"Başlık: {quoted(args.get('baslik'), 120)}" if args.get("baslik") else "",
             _reference(args.get("reference_image"))]
 

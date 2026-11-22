@@ -327,12 +327,16 @@ yalnızca şu araçları verir:
 `ozet` alır: Hermes'in yazdığı tek satırlık Türkçe özet; yalnızca onay mesajında ve "hazır"
 bildiriminde görünür.
 
-**Yayına hazır afiş:** `generate_image` `baslik` (ve isteğe bağlı `alt_metin`) alır; geçit bunları,
-küçük "Marmara Yapay Zeka Kulübü" yazısını, tipografiyi ve Türkçe karakter uyarısını sabit bir
-kalıpla prompt'a ekler. `logo: true` (varsayılan, referans alan modellerde) gerçek logo PNG'sini
+**Yayına hazır afiş:** Hermes prompt'u bir sanat yönetmeni brifi gibi yazar (konsept, duygu, stil);
+yerleşim modele kalır. `generate_image` `baslik` (ve isteğe bağlı `alt_metin`) alır; geçit prompt'a
+yalnızca şunları ekler: aynen yazılacak metin ve Türkçe karakter uyarısı, küçük "Marmara Yapay Zeka
+Kulübü" yazısı, logonun olduğu gibi ve net görünür konması, marka renklerinin yumuşak bir ipucu
+("palette inspired by …"). `logo: true` (varsayılan, referans alan modellerde) gerçek logo PNG'sini
 (`deploy/oracle/brand/logo.png` lacivert yazılı, `logo-dark.png` beyaz yazılı; imaja kopyalanır)
-`image_references` olarak verir ve `logo_konum` köşesine (alt-sag, alt-sol, ust-sag, ust-sol)
-koymasını ister; `logo_zemin` (koyu/acik) hangi dosyanın verileceğini seçer. Logo Higgsfield'e bir
+`image_references` olarak verir; yerini model seçer, `logo_konum` (alt-sag, alt-sol, ust-sag,
+ust-sol) yalnızca verilirse köşe ister; `logo_zemin` (koyu/acik) hangi dosyanın verileceğini seçer.
+`secenek: 2` aynı brifi iki farklı stil yönüyle (`stiller`, yoksa geçit seçer) iki ayrı iş olarak
+gönderir; ikisi birlikte tüm sınırlara sayılır ve onay kartı "2 görsel · yaklaşık 3 kredi" der. Logo Higgsfield'e bir
 kez `media_upload` ile yüklenir, media id `studio.db` → `assets` tablosunda saklanır (dosya değişince
 ya da `studio.logoMediaMaxDays`, varsayılan 7 gün sonra yeniden yüklenir). Modelin logosu bozuk
 çıkarsa `add_logo` gerçek logoyu görsel genişliğinin ~%12'si kadar, kenarlardan %5 içeride ekler;
