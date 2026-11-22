@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { basename, extname, join, resolve, sep } from 'node:path';
 import { DEFAULT_IMAGE_MODEL, DEFAULT_IMAGE_RESOLUTION, IMAGE_MODELS, MUSIC_MODEL, SPEECH_MODEL, UNKNOWN_PERSON, personBucket } from './config.js';
 import { answerExcerpt, parseCredits, parseJob, parseJobIds, parseMediaId, parseUpload, rawAnswer } from './higgsfield.js';
@@ -362,26 +362,61 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
 
     /**
      * The real path of a picture the user sent, or a refusal naming the cause. Strict: the path as
-     * given must be inside one of settings.referenceDirs (nothing outside is even looked at), its
-     * realpath must still be inside one (no symlink out), it must be a regular file with a PNG/JPEG/
-     * WebP extension whose first bytes are that same image type, and the studio must be able to open it.
+     * given must be inside one of settings.referenceDirs, its realpath must still be inside one (no
+     * symlink out), it must be a regular file with a PNG/JPEG/WebP extension whose first bytes are
+     * that same image type, and the studio must be able to open it. A path outside the allowed dirs
+     * (Hermes' native-vision copy under cache/documents/native-inputs/…) is never opened itself: only
+     * its basename, if it is a plain image file name, is looked up directly inside each allowed dir
+     * (no recursion), and a match there passes the same checks. Every refusal is logged with the
+     * input path and a reason code.
      */
     function userImagePath(value) {
+        const input = String(value);
+        try {
+            return checkUserImage(input);
+        } catch (error) {
+            if (error instanceof Refusal) log('warn', 'studio user image refused', input, error.reasonCode ?? 'unknown');
+            throw error;
+        }
+    }
+
+    const USER_IMAGE_NAME = /^[A-Za-z0-9_.-]{1,128}\.(jpe?g|png|webp)$/i;
+
+    function checkUserImage(input) {
+        const fail = (message, code) => {
+            const error = new Refusal(message);
+            error.reasonCode = code;
+            throw error;
+        };
         const inside = (path, root) => path.startsWith(root.endsWith(sep) ? root : root + sep);
-        const given = resolve(String(value));
+        let given = resolve(input);
         const roots = settings.referenceDirs.map((dir) => resolve(dir));
-        if (!roots.some((root) => inside(given, root))) refuse(MESSAGES.referenceOutside);
+        if (!roots.some((root) => inside(given, root))) {
+            // Fallback: the same file name directly inside an allowed dir (e.g. the WhatsApp media copy).
+            const name = basename(input);
+            if (!USER_IMAGE_NAME.test(name) || name.includes('..') || /[\\/]/.test(name)) fail(MESSAGES.referenceOutside, 'outside');
+            const found = roots.map((root) => join(root, name)).find((candidate) => {
+                try {
+                    lstatSync(candidate);
+                    return true;
+                } catch {
+                    return false;
+                }
+            });
+            if (!found) fail(MESSAGES.referenceOutside, 'outside-basename-not-found');
+            given = found;
+        }
         const name = basename(given);
         const cause = (error) => {
-            if (error?.code === 'EACCES' || error?.code === 'EPERM') return MESSAGES.referenceDenied(name);
-            if (error?.code === 'ELOOP') return MESSAGES.referenceOutside;
-            return MESSAGES.referenceMissing(name);
+            if (error?.code === 'EACCES' || error?.code === 'EPERM') return [MESSAGES.referenceDenied(name), 'denied'];
+            if (error?.code === 'ELOOP') return [MESSAGES.referenceOutside, 'symlink-loop'];
+            return [MESSAGES.referenceMissing(name), 'missing'];
         };
         let real;
         try {
             real = realpathSync(given);
         } catch (error) {
-            refuse(cause(error));
+            fail(...cause(error));
         }
         const realRoots = roots.flatMap((root) => {
             try {
@@ -390,23 +425,23 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
                 return [];
             }
         });
-        if (!realRoots.some((root) => inside(real, root))) refuse(MESSAGES.referenceOutside);
+        if (!realRoots.some((root) => inside(real, root))) fail(MESSAGES.referenceOutside, 'symlink-outside');
         const ext = extname(real).slice(1).toLowerCase();
-        if (!REFERENCE_EXT.has(ext)) refuse(MESSAGES.referenceType(ext ? `.${ext}` : 'uzantısız dosya'));
+        if (!REFERENCE_EXT.has(ext)) fail(MESSAGES.referenceType(ext ? `.${ext}` : 'uzantısız dosya'), 'extension');
         const header = Buffer.alloc(16);
         let fd;
         try {
             fd = openSync(real, 'r');
-            if (!fstatSync(fd).isFile()) refuse(MESSAGES.referenceType('dosya değil'));
+            if (!fstatSync(fd).isFile()) fail(MESSAGES.referenceType('dosya değil'), 'not-file');
             readSync(fd, header, 0, header.length, 0);
         } catch (error) {
             if (error instanceof Refusal) throw error;
-            refuse(cause(error));
+            fail(...cause(error));
         } finally {
             if (fd !== undefined) closeSync(fd);
         }
         const sniffed = imageMime(header);
-        if (sniffed !== MIME_BY_EXT[ext]) refuse(MESSAGES.referenceType(sniffed ? `.${ext} uzantılı ${sniffed}` : `.${ext} uzantılı ama görsel değil`));
+        if (sniffed !== MIME_BY_EXT[ext]) fail(MESSAGES.referenceType(sniffed ? `.${ext} uzantılı ${sniffed}` : `.${ext} uzantılı ama görsel değil`), 'magic-bytes');
         return real;
     }
 
@@ -632,7 +667,17 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             let medias = null;
             if (references.length) {
                 medias = [];
-                for (const reference of references) medias.push({ value: await resolveReference(reference), role: 'image_references' });
+                for (const reference of references) {
+                    let value;
+                    try {
+                        value = await resolveReference(reference);
+                    } catch (error) {
+                        // A reference that cannot be used (a user picture refused, an unknown gen_…): recorded like the other refusals.
+                        if (error instanceof Refusal) refuseAttempt(attempt, error.userMessage);
+                        throw error;
+                    }
+                    medias.push({ value, role: 'image_references' });
+                }
             }
             const all = variants.map((variant) => ({ ...variant, params: { ...variant.params, ...(medias ? { medias } : {}) } }));
             const params = all[0].params;
@@ -1141,7 +1186,12 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         } else {
             const value = String(args.kaynak_gorsel).trim();
             if (!value.startsWith('/')) refuseAttempt(attempt, MESSAGES.editSource);
-            source = userImagePath(value);
+            try {
+                source = userImagePath(value);
+            } catch (error) {
+                if (error instanceof Refusal) refuseAttempt(attempt, error.userMessage);
+                throw error;
+            }
             let size = null;
             try {
                 size = imageSize(readFileSync(source));

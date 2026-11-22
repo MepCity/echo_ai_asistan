@@ -144,7 +144,7 @@ function fakeTryPost({ posts = ['post-1'] } = {}) {
  * `logoCached` (default): the logo media ids are already in studio.db, as after the first poster, so
  * most tests see no logo upload. `compositor`: add_logo's (createLogoCompositor with a fake runner).
  */
-function setup({ studio = {}, start = Date.parse('2026-11-20T09:00:00Z'), higgsfield = fakeHiggsfield(), fetchImpl = downloadFetch(), trypost = fakeTryPost(), notify = null, logoCached = true, compositor = null } = {}) {
+function setup({ studio = {}, start = Date.parse('2026-11-20T09:00:00Z'), higgsfield = fakeHiggsfield(), fetchImpl = downloadFetch(), trypost = fakeTryPost(), notify = null, logoCached = true, compositor = null, logs = null } = {}) {
     const dataDir = tempDir();
     const config = echoConfig(dataDir);
     const settings = normalizeStudio({ waitSliceSec: 1, ...studio }, config, { STUDIO_PREVIEW_DIR: join(dataDir, 'hermes-preview'), STUDIO_BRAND_KIT: join(dataDir, 'brand-kit.md') });
@@ -155,7 +155,7 @@ function setup({ studio = {}, start = Date.parse('2026-11-20T09:00:00Z'), higgsf
             store.setAsset(`logo:${variant}`, CACHED_LOGO, createHash('sha256').update(readFileSync(join(settings.logoDir, `${variant}.png`))).digest('hex'));
         }
     }
-    const gateway = createStudioGateway({ settings, store, higgsfield, trypost, fetchImpl, sleep: async (ms) => (clock.now += ms), notify, compositor });
+    const gateway = createStudioGateway({ settings, store, higgsfield, trypost, fetchImpl, sleep: async (ms) => (clock.now += ms), notify, compositor, ...(logs ? { log: (...parts) => logs.push(parts.join(' ')) } : {}) });
     return { gateway, store, settings, higgsfield, trypost, clock, dataDir };
 }
 
@@ -1303,7 +1303,8 @@ describe('studio: edit_image (gpt_image_2_6 image-to-image)', () => {
             const outside = join(root, 'secret');
             mkdirSync(outside);
             writeFileSync(join(outside, 'auth.png'), PNG);
-            return { ...setup({ studio: { referenceDirs: [media, images] } }), media, outside };
+            const logs = [];
+            return { ...setup({ studio: { referenceDirs: [media, images] }, logs }), media, outside, root, logs };
         }
 
         it('accepts the exact path Hermes passes (a JPEG under the media folder) and uploads it', async () => {
@@ -1317,6 +1318,58 @@ describe('studio: edit_image (gpt_image_2_6 image-to-image)', () => {
             clock.now += 10 * 60_000;
             const again = await call(gateway, 'generate_image', { prompt: 'A poster like this one', reference_image: join(media, '1234567890123456.jpg') });
             assert.equal(again.isError, false, again.text);
+        });
+
+        it('accepts Hermes\' native-inputs copy by its basename found in the media folder, and uploads the media file', async () => {
+            const { gateway, higgsfield, media, root, clock } = mediaSetup();
+            const native = join(root, 'cache', 'documents', 'native-inputs', '014c1f45f15a703a535656b547ba4a275c192c750c579911db7032ad596db292');
+            mkdirSync(native, { recursive: true });
+            writeFileSync(join(native, '1828819611765119.jpg'), PNG); // a different file there: never read
+            writeFileSync(join(media, '1828819611765119.jpg'), JPEG);
+            const result = await call(gateway, 'edit_image', { kaynak_gorsel: join(native, '1828819611765119.jpg'), talimat: 'metni değiştir' });
+            assert.equal(result.isError, false, result.text);
+            assert.equal(higgsfield.calls[0].name, 'media_upload');
+            assert.deepEqual(higgsfield.calls[0].args, { filename: '1828819611765119.jpg', content_type: 'image/jpeg' }, 'the media JPEG, not the PNG in native-inputs');
+            assert.equal(higgsfield.generated()[0].args.params.aspect_ratio, '4:5');
+            clock.now += 10 * 60_000;
+            const again = await call(gateway, 'generate_image', { prompt: 'A poster like this one', reference_image: join(native, '1828819611765119.jpg') });
+            assert.equal(again.isError, false, again.text);
+        });
+
+        it('refuses a basename that is not directly in an allowed folder, or is not a plain image name', async () => {
+            const { gateway, higgsfield, media, root } = mediaSetup();
+            mkdirSync(join(media, 'sub'));
+            writeFileSync(join(media, 'sub', 'deep.jpg'), JPEG);
+            writeFileSync(join(media, '..jpg'), JPEG);
+            writeFileSync(join(media, 'note.txt'), 'x');
+            const native = join(root, 'cache', 'documents', 'native-inputs', 'abc');
+            for (const path of [join(native, 'nothere.jpg'), join(native, 'deep.jpg'), join(native, '..jpg'), join(native, '..'), `${native}/sub/../..`, join(native, 'note.txt'), `${native}/`]) {
+                assert.equal((await call(gateway, 'edit_image', { kaynak_gorsel: path, talimat: 'x' })).text, MESSAGES.referenceOutside, path);
+            }
+            assert.equal(higgsfield.calls.length, 0);
+        });
+
+        it('logs and records every refused user picture (edit_image and reference_image)', async () => {
+            const { gateway, store, higgsfield, outside, logs } = mediaSetup();
+            const refused = join(outside, 'auth.png');
+            assert.equal((await call(gateway, 'edit_image', { kaynak_gorsel: refused, talimat: 'x', ozet: 'Foto düzenleme' })).text, MESSAGES.referenceOutside);
+            const line = logs.find((entry) => entry.includes('studio user image refused'));
+            assert.ok(line, logs.join('\n'));
+            assert.match(line, /^warn /);
+            assert.ok(line.includes(refused), 'the refused input path is logged');
+            assert.match(line, / outside-basename-not-found$/, 'with a reason code');
+            await call(gateway, 'edit_image', { kaynak_gorsel: '/etc/passwd', talimat: 'x' });
+            assert.match(logs.at(-1), /\/etc\/passwd outside$/);
+            const row = store.recent().filter((item) => item.tool === 'edit_image').find((item) => item.summary === 'Foto düzenleme');
+            assert.equal(row.status, 'refused');
+            assert.equal(row.reason, MESSAGES.referenceOutside);
+            assert.equal(row.summary, 'Foto düzenleme');
+            assert.equal((await call(gateway, 'generate_image', { prompt: 'A poster like this', reference_image: join(outside, 'nothere.jpg') })).text, MESSAGES.referenceOutside);
+            assert.ok(logs.some((entry) => entry.includes('nothere.jpg') && entry.endsWith('outside-basename-not-found')), logs.join('\n'));
+            const [ref] = store.recent().filter((item) => item.tool === 'generate_image');
+            assert.equal(ref.status, 'refused');
+            assert.equal(ref.reason, MESSAGES.referenceOutside);
+            assert.equal(higgsfield.generated().length, 0);
         });
 
         it('refuses a path outside the allowed folders without looking at it', async () => {
