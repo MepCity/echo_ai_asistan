@@ -70,5 +70,19 @@ class SpeechToText(unittest.TestCase):
         self.assertFalse({"tts", "voice", "transcription", "stt"} & set(configure.DISABLED_TOOLSETS))
 
 
+class SelfImprovementNotices(unittest.TestCase):
+    def test_fresh_install_hides_review_notices_but_keeps_the_review(self):
+        config = run()
+        self.assertEqual(config["display"]["memory_notifications"], "off")
+        self.assertNotIn("auxiliary", config)
+        self.assertNotIn("skills", config)
+        self.assertNotIn("memory", config)
+
+    def test_user_choice_is_kept(self):
+        for choice in ("on", "verbose", True):
+            config = run({"display": {"memory_notifications": choice, "language": "tr"}})
+            self.assertEqual(config["display"]["memory_notifications"], choice)
+
+
 if __name__ == "__main__":
     unittest.main()

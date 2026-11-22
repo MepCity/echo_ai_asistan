@@ -195,6 +195,12 @@ def main(path):
     display = config.get("display") if isinstance(config.get("display"), dict) else {}
     if display.get("language") in (None, "", "en"):
         display["language"] = "tr"
+    # No "💾 Kendini geliştirme incelemesi: 'x' skill'i oluşturuldu / yamalandı" (or "💾 Memory
+    # updated") messages to WhatsApp users. They come from Hermes' background self-improvement review
+    # (agent/background_review.py); "off" only hides the notice, the review keeps running (it is
+    # switched by auxiliary.background_review.enabled, skills.creation_nudge_interval and
+    # memory.nudge_interval). The gateway reads this global key, not display.platforms.<p>.
+    display.setdefault("memory_notifications", "off")
     config["display"] = display
 
     # Voice messages: only what is missing is filled in, so a provider, model or setting the user
