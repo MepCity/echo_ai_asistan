@@ -220,6 +220,43 @@ yer yoksa E2.1.Micro; varsayılan boot disk; load balancer yok). HTTPS, Caddy ve
 
 Loglar: `cd /opt/echo/app/deploy/oracle && docker compose --env-file /opt/echo/.env logs -f echo`
 
+### WhatsApp şablonları v2 (Marketing'e alınanların yerine)
+
+Meta `onay_bekliyor`, `yeni_etkilesim`, `yeni_etkilesim_bilgi` ve
+`etkilesim_ozeti_bilgi`'yi MARKETING olarak onayladı; onaylı bir şablonun
+kategorisi değiştirilemiyor. `create-templates.sh` bu yüzden aynı değişkenler ve
+aynı buton sırasıyla, bildirim gibi yazılmış yeni şablonlar da oluşturur:
+`onay_talebi`, `etkilesim_bildirimi`, `etkilesim_bildirimi_bilgi`,
+`etkilesim_sayisi_bilgi` (hepsi UTILITY olarak gönderilir).
+
+1. Oluştur: `bash /opt/echo/app/deploy/oracle/create-templates.sh` (var olanları atlar).
+2. Onayı bekle, durumu kontrol et: `bash /opt/echo/app/deploy/oracle/create-templates.sh --status`.
+3. Yalnızca `APPROVED UTILITY` olanlar için `/opt/echo/config.json`'da ilgili projenin
+   `templates` anahtarını değiştir, sonra `update.sh` çalıştır. Dördü de UTILITY onaylanırsa:
+
+```json
+"templates": {
+  "language": "tr",
+  "approval": "onay_talebi",
+  "approvalImage": "onay_bekliyor_gorsel",
+  "approvalVideo": "onay_bekliyor_video",
+  "feedback": "gorus_istegi",
+  "inbox": "etkilesim_bildirimi",
+  "inboxDigest": "etkilesim_ozeti",
+  "inboxReadOnly": "etkilesim_bildirimi_bilgi",
+  "inboxDigestReadOnly": "etkilesim_sayisi_bilgi"
+}
+```
+
+`approvalImage` / `approvalVideo`, `approval` değişince varsayılan adların
+`onay_talebi_gorsel` / `onay_talebi_video` olmaması için yazıldı (eskiden de bu
+adlara bakılıyordu). Bu medya şablonları yoksa (`--status` "yok" der) ikisini
+`null` yap; Echo görselli gönderilerde de metin şablonunu kullanır.
+
+Eski şablonlar silinmez, yedek olarak kalır: geri dönmek için ilgili anahtarı eski
+adına (`onay_bekliyor`, `yeni_etkilesim`, `yeni_etkilesim_bilgi`,
+`etkilesim_ozeti_bilgi`) çevirmek yeter. Koddaki varsayılan adlar değişmedi.
+
 ### Hermes asistanı (aynı numarada sohbet eden yapay zeka)
 
 **Nasıl çalışır:** Meta yine yalnızca Echo'yu çağırır. Echo onay/görüş isteklerini ve

@@ -9,6 +9,17 @@
 # {{3}} channel, {{4}} time, {{5}} excerpt. Social inbox (src/projects/trypost-inbox.js):
 # yeni_etkilesim {{1}} platform, {{2}} kind (yorum/mesaj), {{3}} "@author: text";
 # etkilesim_ozeti {{1}} count, {{2}} channels. Button order matches Echo's buttons.
+#
+# v2 (onay_talebi, etkilesim_bildirimi, etkilesim_bildirimi_bilgi,
+# etkilesim_sayisi_bilgi): Meta approved onay_bekliyor, yeni_etkilesim,
+# yeni_etkilesim_bilgi and etkilesim_ozeti_bilgi as MARKETING, and an approved
+# template's category cannot change. The v2 ones have the same variables and
+# buttons, worded as account notifications (who asked for what, why you get
+# it, which reply is expected) with neutral examples. The old ones stay as they
+# are; switch with config.json "templates" once the new ones are APPROVED UTILITY.
+# No allow_category_change: since 9 Apr 2025 Meta ignores it and approves a
+# template it sees as marketing as MARKETING instead of rejecting it
+# (developers.facebook.com/documentation/business-messaging/whatsapp/templates/template-categorization).
 set -euo pipefail
 
 ENV_FILE=/opt/echo/.env
@@ -41,6 +52,9 @@ status() {   # name -> "STATUS" or empty
 EXAMPLES='["Marmara AI Sosyal","Yasir","Instagram · marmaraai","20 Kas 2026 18:00","Yapay zeka atölyemiz cuma 18:00’de!"]'
 INBOX_EXAMPLES='["Instagram","yorum","@ali: Etkinlik ne zaman?"]'
 DIGEST_EXAMPLES='["7","Instagram (4), X (3)"]'
+# Neutral examples for the v2 templates (no event or promotional wording).
+EXAMPLES_V2='["Marmara AI Sosyal","Yasir","Instagram · marmaraai","25 Kas 2026 18:00","Haftalık toplantı notlarının özeti"]'
+INBOX_EXAMPLES_V2='["Instagram","yorum","@ali: Toplantı saati değişti mi?"]'
 
 create() {   # name body examples_json button...
   local name=$1 body=$2 examples=$3 current payload response buttons
@@ -71,9 +85,23 @@ if [ "${1:-}" != "--status" ]; then
     "$INBOX_EXAMPLES" "Okundu"
   create etkilesim_ozeti_bilgi $'📥 Sosyal medya hesaplarında {{1}} yeni etkileşim var.\nKanallar: {{2}}\n\nAyrıntılar TryPost panelinde.' \
     "$DIGEST_EXAMPLES" "Hepsi okundu"
+  # v2: same variables and button order as onay_bekliyor, yeni_etkilesim, yeni_etkilesim_bilgi, etkilesim_ozeti_bilgi.
+  create onay_talebi $'📝 {{2}}, {{1}} projesinde hazırladığı bir gönderi için senin yayın onayını istiyor.\nKanal: {{3}}\nPlanlanan yayın zamanı: {{4}}\n\nGönderi metni:\n"{{5}}"\n\nBu isteği gönderinin onaylayıcısı olduğun için alıyorsun. Onaylamak, düzeltme istemek ya da yorum yazmak için aşağıdaki butonları kullanabilir veya bu mesaja yanıt yazabilirsin.' \
+    "$EXAMPLES_V2" "Onayla" "Düzeltme iste" "Yorum yaz"
+  create etkilesim_bildirimi $'📥 Ekibinin yönettiği {{1}} hesabına yeni bir {{2}} geldi.\n\nGelen içerik:\n"{{3}}"\n\nBu bildirimi hesabın gelen kutusunu yöneten ekipte olduğun için alıyorsun. Cevaplamak, cevabı Hermes\'e bırakmak ya da okundu olarak işaretlemek için aşağıdaki butonları kullanabilirsin.' \
+    "$INBOX_EXAMPLES_V2" "Cevapla" "Hermes'e bırak" "Okundu"
+  create etkilesim_bildirimi_bilgi $'📥 Ekibinin yönettiği {{1}} hesabına yeni bir {{2}} geldi.\n\nGelen içerik:\n"{{3}}"\n\nBu bilgilendirmeyi hesabın gelen kutusunu takip eden ekipte olduğun için alıyorsun. İnceledikten sonra okundu olarak işaretlemek için aşağıdaki butonu kullanabilirsin.' \
+    "$INBOX_EXAMPLES_V2" "Okundu"
+  create etkilesim_sayisi_bilgi $'📥 Ekibinin yönettiği sosyal medya hesaplarına {{1}} yeni yorum ve mesaj geldi.\nHesaplara göre dağılım: {{2}}\n\nBu bilgilendirmeyi hesapların gelen kutusunu takip eden ekipte olduğun için alıyorsun. İnceledikten sonra hepsini okundu olarak işaretlemek için aşağıdaki butonu kullanabilirsin.' \
+    "$DIGEST_EXAMPLES" "Hepsi okundu"
   echo
 fi
 echo "Status (APPROVED = ready to use; review usually takes minutes to a few hours):"
-for name in onay_bekliyor gorus_istegi yeni_etkilesim etkilesim_ozeti yeni_etkilesim_bilgi etkilesim_ozeti_bilgi; do
-  echo "  $name: $(status "$name" || true)"
-done
+show() { local s; s=$(status "$1" || true); echo "  $1: ${s:-yok / not found}"; }
+echo " v1:"; for name in onay_bekliyor gorus_istegi yeni_etkilesim etkilesim_ozeti yeni_etkilesim_bilgi etkilesim_ozeti_bilgi; do show "$name"; done
+echo " v2 (switch in config.json only to the ones APPROVED UTILITY):"
+for name in onay_talebi etkilesim_bildirimi etkilesim_bildirimi_bilgi etkilesim_sayisi_bilgi; do show "$name"; done
+# Echo uses "<approval>_gorsel" / "_video" (and the same for feedback) for posts with media unless
+# config.json sets approvalImage / approvalVideo / feedbackImage / feedbackVideo; this script does not create them.
+echo " media variants Echo looks up by default:"
+for name in onay_bekliyor_gorsel onay_bekliyor_video gorus_istegi_gorsel gorus_istegi_video; do show "$name"; done
