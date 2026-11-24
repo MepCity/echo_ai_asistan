@@ -57,6 +57,14 @@ import { readFileSync } from 'node:fs';
  * (approvals by role, notes, "Okundu") and are told they cannot use the
  * assistant. Hermes' WHATSAPP_CLOUD_ALLOWED_USERS should list the same people. Without it, or with
  * "enabled": false, Echo answers such messages with its help text.
+ *
+ * `assistant.trypostProject` (optional): the TryPost project whose token the
+ * assistant's TryPost MCP uses (default: the media bridge's project, else the
+ * only TryPost project). Every message forwarded for a member of it with a
+ * TryPost user id (members[].userId, a UUID) ends with a line
+ * "[TryPost kullanıcı: <userId>]", so the assistant can credit what it does
+ * to that person (add-design-tool's on_behalf_of_user_id). Nothing is added
+ * for anyone else.
  */
 export function loadConfig(env = process.env) {
     const raw = env.ECHO_CONFIG_JSON ?? (env.ECHO_CONFIG ? readFileSync(env.ECHO_CONFIG, 'utf8') : null);
@@ -122,7 +130,7 @@ export function normalizeConfig(config) {
         },
         people,
         projects,
-        assistant: normalizeAssistant(config.assistant, config.whatsapp, people, projects),
+        assistant: normalizeAssistant(config.assistant, config.whatsapp, people, projects, mediaBridgeProject(projects)),
         mediaBridge: mediaBridgeProject(projects),
         // Read by the studio gateway only (src/studio/config.js); Echo itself ignores it.
         studio: config.studio ?? null,
@@ -207,7 +215,23 @@ function assistantPeople(assistant, people, projects) {
     return [...new Set(assistant.allowedPeople)];
 }
 
-function normalizeAssistant(assistant, whatsapp, people = [], projects = []) {
+/**
+ * The TryPost project whose token the assistant uses (its TryPost MCP):
+ * `assistant.trypostProject`, else the media bridge's project, else the only
+ * TryPost project. Its members' `userId`s are the senders' TryPost user ids.
+ */
+function assistantTryPostProject(assistant, projects, mediaBridge) {
+    if (assistant.trypostProject !== undefined && assistant.trypostProject !== null) {
+        const project = projects.find((item) => item.id === assistant.trypostProject);
+        if (!project || project.type !== 'trypost') throw new Error(`Config: assistant.trypostProject must name a trypost project (${assistant.trypostProject})`);
+        return project.id;
+    }
+    if (mediaBridge) return mediaBridge;
+    const trypost = projects.filter((project) => project.type === 'trypost');
+    return trypost.length === 1 ? trypost[0].id : null;
+}
+
+function normalizeAssistant(assistant, whatsapp, people = [], projects = [], mediaBridge = null) {
     if (!assistant || assistant.enabled === false || !assistant.url) return null;
     let url;
     try {
@@ -221,5 +245,6 @@ function normalizeAssistant(assistant, whatsapp, people = [], projects = []) {
         appSecret: assistant.appSecret ?? whatsapp.appSecret,
         timeoutMs: Number(assistant.timeoutMs ?? 20_000),
         allowedPeople: assistantPeople(assistant, people, projects),
+        trypostProject: assistantTryPostProject(assistant, projects, mediaBridge),
     };
 }

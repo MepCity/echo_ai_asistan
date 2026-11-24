@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { after, beforeEach, describe, it } from 'node:test';
 import { normalizeConfig } from '../src/config.js';
-import { addressName, createAssistant } from '../src/assistant.js';
+import { addressName, createAssistant, userNote, withUserNote } from '../src/assistant.js';
 import { createEcho } from '../src/core.js';
 import { createStore, openDatabase } from '../src/db.js';
 import { createTryPostProject, fingerprint, sameVersion, versionTag } from '../src/projects/trypost.js';
@@ -2841,5 +2841,96 @@ describe('assistant access: only allowed people reach Hermes', () => {
         assert.equal(hermes.accepted.length, 0);
         assert.equal(notices().length, 1);
         assert.equal(t.store.inbox('wm1').status, 'done');
+    });
+});
+
+describe('TryPost user note: Hermes learns the sender\'s TryPost user id', () => {
+    let t;
+    let hermes;
+    const YASIR_ID = '0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b';
+    const AYSE_ID = '0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c';
+    const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]);
+    const members = [
+        { person: 'yasir', userId: YASIR_ID, roles: ['reviewer', 'approver'] },
+        // An unset or unresolved value is never passed on.
+        { person: 'ayse', userId: '<TryPost user id>', roles: ['reviewer', 'approver'] },
+        { person: 'mehmet', userId: 'u-mehmet', roles: ['reviewer'] },
+    ];
+    const value = (index) => hermes.accepted[index].entry[0].changes[0].value;
+
+    after(() => hermes?.close());
+    beforeEach(async () => {
+        await hermes?.close();
+        hermes = await fakeHermes();
+        t = setup({ assistant: { url: hermes.url, enabled: true }, projectExtra: { members } });
+    });
+
+    it('ends a forwarded text with "[TryPost kullanıcı: <uuid>]" from the sender\'s member entry', async () => {
+        await t.user.say(PHONES.yasir, 'Bunu depoya ekle', null, 'm1');
+        assert.equal(t.config.assistant.trypostProject, 'marmara');
+        assert.deepEqual(value(0).messages[0].text, { body: `Bunu depoya ekle\n\n[TryPost kullanıcı: ${YASIR_ID}]` });
+    });
+
+    it('adds nothing when the sender has no valid TryPost user id, and leaves commands as typed', async () => {
+        await t.user.say(PHONES.ayse, 'selam', null, 'm1');
+        await t.user.say(PHONES.yasir, '/new', null, 'm2');
+        assert.deepEqual(value(0).messages[0].text, { body: 'selam' });
+        assert.deepEqual(value(1).messages[0].text, { body: '/new' });
+        assert.ok(!JSON.stringify(hermes.accepted).includes('TryPost kullanıcı'));
+    });
+
+    it('puts the note right below the media note of a bridged image', async () => {
+        fakeMedia(t, { 'img-1': { bytes: JPEG, mime: 'image/jpeg' } });
+        const raw = { from: PHONES.yasir, id: 'wamid.img', timestamp: '1762862400', type: 'image', image: { id: 'img-1', mime_type: 'image/jpeg', caption: 'depoya ekle' } };
+        await t.echo.handleWebhook({ messages: [{ id: 'wamid.img', from: PHONES.yasir, type: 'image', text: null, raw }], statuses: [] });
+        await t.echo.settled();
+        const [upload] = t.trypost.uploads;
+        assert.equal(value(0).messages[0].image.caption, `depoya ekle\n\n[TryPost medya: upload_token=${upload.token}, tür=image]\n[TryPost kullanıcı: ${YASIR_ID}]`);
+    });
+
+    it('takes the id from the assistant\'s TryPost project only', async () => {
+        const config = (assistant, projects) => normalizeConfig({
+            whatsapp: { phoneNumberId: '1', accessToken: 't', appSecret: 's', verifyToken: 'v' },
+            people: [{ id: 'yasir', name: 'Yasir', phone: PHONES.yasir }],
+            projects,
+            assistant: { url: 'http://hermes:8090/whatsapp/webhook', ...assistant },
+        });
+        const trypost = (id, extra = {}) => ({ id, type: 'trypost', members: [{ person: 'yasir', userId: id === 'a' ? YASIR_ID : AYSE_ID }], ...extra });
+        assert.equal(config({}, [trypost('a', { mediaBridge: false })]).assistant.trypostProject, 'a');
+        assert.equal(config({}, [trypost('a'), trypost('b', { mediaBridge: true })]).assistant.trypostProject, 'b');
+        assert.equal(config({}, [trypost('a'), trypost('b')]).assistant.trypostProject, null);
+        assert.equal(config({ trypostProject: 'a' }, [trypost('a'), trypost('b', { mediaBridge: true })]).assistant.trypostProject, 'a');
+        assert.throws(() => config({ trypostProject: 'x' }, [trypost('a')]), /assistant.trypostProject/);
+
+        // Two projects, the assistant's is "b": its member entry gives the id, not "a"'s.
+        const two = config({ trypostProject: 'b', url: hermes.url, appSecret: 'app-secret', allowedPeople: ['yasir'] }, [trypost('a'), trypost('b')]);
+        const echo = createEcho({ config: two, store: createStore(openDatabase(':memory:')), whatsapp: fakeWhatsApp() });
+        await echo.handleWebhook({ messages: [{ id: 'm1', from: PHONES.yasir, type: 'text', text: 'selam' }], statuses: [] });
+        assert.equal(value(0).messages[0].text.body, `selam\n\n[TryPost kullanıcı: ${AYSE_ID}]`);
+    });
+
+    it('notes only texts and captions, never changing the message it was given', () => {
+        const note = userNote(` ${YASIR_ID.toUpperCase()} `);
+        assert.equal(note, `[TryPost kullanıcı: ${YASIR_ID}]`);
+        assert.equal(userNote(null), null);
+        assert.equal(userNote(''), null);
+        assert.equal(userNote('${YASIR_TRYPOST_USER_ID}'), null);
+
+        const text = { type: 'text', text: { body: 'selam' } };
+        assert.deepEqual(withUserNote(text, note), { type: 'text', text: { body: `selam\n\n${note}` } });
+        assert.deepEqual(text, { type: 'text', text: { body: 'selam' } });
+        assert.deepEqual(withUserNote({ type: 'video', video: { id: 'v' } }, note), { type: 'video', video: { id: 'v', caption: note } });
+        assert.deepEqual(withUserNote({ type: 'document', document: { id: 'd', caption: 'sunum' } }, note), { type: 'document', document: { id: 'd', caption: `sunum\n\n${note}` } });
+        const audio = { type: 'audio', audio: { id: 'a' } };
+        assert.equal(withUserNote(audio, note), audio);
+        const button = { type: 'interactive', interactive: { type: 'button_reply', button_reply: { id: 'x', title: 'Onayla' } } };
+        assert.equal(withUserNote(button, note), button);
+        assert.equal(withUserNote(text, null), text);
+
+        const assistant = createAssistant({ url: 'http://x', appSecret: 's', timeoutMs: 1000 }, { phoneNumberId: '1', trypostUserId: (person) => (person?.id === 'yasir' ? YASIR_ID : null) });
+        const body = (person) => assistant.messageBody({ id: 'm1', from: PHONES.yasir, type: 'text', text: 'selam' }, person).entry[0].changes[0].value.messages[0].text.body;
+        assert.equal(body({ id: 'yasir', name: 'Yasir', phone: PHONES.yasir }), `selam\n\n[TryPost kullanıcı: ${YASIR_ID}]`);
+        assert.equal(body({ id: 'ayse', name: 'Ayşe', phone: PHONES.ayse }), 'selam');
+        assert.equal(body(null), 'selam');
     });
 });

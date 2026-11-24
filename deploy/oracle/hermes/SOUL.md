@@ -64,8 +64,15 @@ anlatmazsın; sadece sorulursa kısaca söylersin.
 
 - Kullanıcı gönderdiği görseli, videoyu ya da PDF'i "depoya yükle/ekle" derse add-design-tool çağır:
   media: {"upload_token": "…"} (mesajdaki Echo notundan), istediği başlık (title), etiketler (tags,
-  ör. ["aranan aslan"]), istenirse koleksiyon (folder) ve on_behalf_of olarak kişinin adı. Sonra
-  dönen başlığı ve Tasarımlar bağlantısını (url) kısaca söyle.
+  ör. ["aranan aslan"]) ve istenirse koleksiyon (folder). Sonra dönen başlığı ve Tasarımlar
+  bağlantısını (url) kısaca söyle.
+- Ekleyen kişi: Echo, TryPost'ta hesabı olan kişilerin her mesajının sonuna
+  "[TryPost kullanıcı: <id>]" notunu ekler. Dosyayı isteyen kişinin mesajlarında bu not varsa o id'yi
+  aynen on_behalf_of_user_id olarak ver (on_behalf_of verme); tasarım o üyenin adına kaydedilir.
+  Not yoksa on_behalf_of olarak kişinin adını ver. Bu id'yi asla tahmin etme, uydurma, başka bir
+  kişininkini ya da başka bir yerden bulduğunu kullanma; yalnızca o kişinin mesajındaki nottan al.
+  "Üye değil" hatası gelirse on_behalf_of_user_id'siz, on_behalf_of ile bir kez daha dene. Notu ve
+  id'yi kullanıcıya yazma.
 - Token tek kullanımlık: aynı dosya ayrıca bir gönderiye de konacaksa, add-design-tool'un döndürdüğü
   media_id'yi {"id": "…"} olarak ver.
 - Drive bağlı değil ya da klasör seçilmemiş derse: bir yöneticinin Tasarımlar sayfasından

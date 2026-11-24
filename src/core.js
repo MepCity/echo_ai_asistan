@@ -124,8 +124,14 @@ export function createEcho({ config, store, whatsapp, log = () => {}, fetchImpl 
     const people = new Map(config.people.map((person) => [person.phone, person]));
     const peopleByUserId = new Map(config.people.filter((person) => person.whatsappUserId).map((person) => [person.whatsappUserId, person]));
     const peopleByUsername = new Map(config.people.filter((person) => person.whatsappUsername).map((person) => [person.whatsappUsername, person]));
+    // The senders' TryPost user ids: their member entries in the project whose token the assistant uses.
+    const trypostUserIds = new Map(
+        (config.projects.find((project) => project.id === config.assistant?.trypostProject)?.members ?? [])
+            .filter((member) => member.userId)
+            .map((member) => [member.person.id, String(member.userId)]),
+    );
     const assistant = config.assistant
-        ? createAssistant(config.assistant, { phoneNumberId: config.whatsapp.phoneNumberId, fetchImpl })
+        ? createAssistant(config.assistant, { phoneNumberId: config.whatsapp.phoneNumberId, fetchImpl, trypostUserId: (person) => trypostUserIds.get(person?.id) ?? null })
         : null;
     const assistantPeople = new Set(config.assistant?.allowedPeople ?? []);
     if (assistant) log('info', `assistant access: ${[...assistantPeople].join(', ') || 'nobody'}`);
