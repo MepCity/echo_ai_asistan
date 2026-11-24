@@ -251,6 +251,20 @@ def _move_slot(args):
     return [head("📅", "Gönderi kuyrukta başka zamana taşınacak", when(args.get("slot_at")) if args.get("slot_at") else "")]
 
 
+def _add_design(args):
+    """Designs library upload. The media reference (upload token or id) is never shown."""
+    tags = args.get("tags")
+    tags = [clean(tag, 40) for tag in tags] if isinstance(tags, (list, tuple)) else []
+    tags = ", ".join(tag for tag in tags if tag)
+    media = args.get("media") if isinstance(args.get("media"), dict) else {}
+    return [head("📁", "Tasarımlar'a dosya eklenecek"),
+            f"Başlık: {quoted(args.get('title'), 100)}" if args.get("title") else "",
+            f"Etiketler: {clean(tags, 150)}" if tags else "",
+            f"Koleksiyon: {clean(args.get('folder'), 80)}" if clean(args.get("folder"), 80) else "",
+            "Dosya: WhatsApp'tan gönderilen dosya" if media.get("upload_token") else "",
+            f"Ekleyen: {clean(args.get('on_behalf_of'), 60)}" if clean(args.get("on_behalf_of"), 60) else ""]
+
+
 def _repurpose(phrase):
     return lambda args: [head("🔄", f"Otomatik yeniden paylaşım {phrase}")]
 
@@ -302,6 +316,7 @@ TRYPOST = {
     "move-post-to-slot-tool": _move_slot,
     "reorder-queue-tool": _simple("📅", "Kuyruktaki gönderilerin sırası değişecek"),
     "create-pinterest-board-tool": _named("📌", "Pinterest panosu oluşturulacak"),
+    "add-design-tool": _add_design,
 }
 
 

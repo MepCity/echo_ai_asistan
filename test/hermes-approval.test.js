@@ -40,6 +40,7 @@ const TRYPOST_WRITE_TOOLS = [
     'disable-repurpose-tool', 'pause-repurpose-tool', 'resume-repurpose-tool', 'update-repurpose-tool', 'create-signature-tool',
     'delete-signature-tool', 'update-signature-tool', 'copy-posting-schedule-tool', 'create-pinterest-board-tool',
     'generate-posting-schedule-tool', 'move-post-to-slot-tool', 'reorder-queue-tool', 'update-posting-schedule-tool',
+    'add-design-tool',
 ];
 
 describe('approval card: studio tools', { skip }, () => {
@@ -145,6 +146,20 @@ describe('approval card: TryPost tools', { skip }, () => {
     it('reply-to-inbox-item-tool shows the reply itself, not ids', () => {
         const body = one('trypost', 'reply-to-inbox-item-tool', { item_id: '9b2c0f6e-uuid', text: 'Teşekkürler, cumartesi görüşürüz!', request_id: 'r-1' });
         assert.equal(body, '💬 Yorum ya da mesaja cevap gidecek (hemen gönderilir)\nCevap: “Teşekkürler, cumartesi görüşürüz!”');
+    });
+
+    it('add-design-tool: title, tags, collection and who adds it; never the media token or id', () => {
+        const bodies = render([
+            { server: 'trypost', tool: 'add-design-tool', args: { media: { upload_token: 'secret-token' }, title: 'Sarıyer’de Aranan Aslan', tags: ['aranan aslan', 'sarıyer'], on_behalf_of: 'Yasir' } },
+            { server: 'trypost', tool: 'add-design-tool', args: { media: { id: 'media_123456' }, title: 'Atölye afişi', tags: [], folder: 'Afişler' } },
+            { server: 'trypost', tool: 'add-design-tool', args: { media: 'x', tags: 'not-a-list' } },
+        ]);
+        assert.deepEqual(bodies, [
+            "📁 Tasarımlar'a dosya eklenecek\nBaşlık: “Sarıyer’de Aranan Aslan”\nEtiketler: aranan aslan, sarıyer\nDosya: WhatsApp'tan gönderilen dosya\nEkleyen: Yasir",
+            "📁 Tasarımlar'a dosya eklenecek\nBaşlık: “Atölye afişi”\nKoleksiyon: Afişler",
+            "📁 Tasarımlar'a dosya eklenecek",
+        ]);
+        for (const body of bodies) assert.ok(!body.includes('secret-token') && !body.includes('media_123456'));
     });
 
     it('every TryPost write tool has its own Turkish phrase', () => {

@@ -198,7 +198,8 @@ FULL_ARGS = {
     "prompt": "poster", "platform": "instagram", "ozet": "Atölye afişi ✳️", "baslik": "Yapay Zeka ☀️",
     "reference_image": "/opt/data/platforms/whatsapp_cloud/media/abc.jpg", "talimat": "metni düzelt",
     "kaynak_gorsel": "/opt/data/platforms/whatsapp_cloud/media/abc.jpg", "konum": "alt-sag", "kind": "speech",
-    "yuksek_cozunurluk": True, "secenek": 2,
+    "yuksek_cozunurluk": True, "secenek": 2, "tags": ["aranan ❤️ aslan", "sarıyer"], "folder": "Afişler ✳️",
+    "on_behalf_of": "Yasir",
 }
 HINT = {"aspect_ratio": "4:5", "credits": 1.25, "resolution": "2k", "count": 2}
 
@@ -235,6 +236,14 @@ class NoEscapeInCardTest(unittest.TestCase):
                         {"credits": 1.25})
         self.assertEqual(hermes_display(body), "🪄 Görsel düzenlenecek · yaklaşık 1.25 kredi\n"
                                                "Değişiklik: “metni düzelt”\nKaynak: gönderdiğin görsel")
+
+    def test_add_design_card_as_whatsapp_shows_it(self):
+        body = R.render("trypost", "add-design-tool", {"media": {"upload_token": "tok_secret"}, "title": "Sarıyer’de Aranan Aslan",
+                                                       "tags": ["aranan aslan", "sarıyer"], "on_behalf_of": "Yasir"})
+        self.assertEqual(hermes_display(body), "📁 Tasarımlar'a dosya eklenecek\nBaşlık: “Sarıyer’de Aranan Aslan”\n"
+                                               "Etiketler: aranan aslan, sarıyer\nDosya: WhatsApp'tan gönderilen dosya\n"
+                                               "Ekleyen: Yasir")
+        self.assertNotIn("tok_secret", body)
 
     def test_renderer_source_has_no_selector_or_escaped_emoji(self):
         source = (HERE.parent / "deploy/oracle/hermes/plugins/echo_onay_tr/render.py").read_text(encoding="utf-8")
