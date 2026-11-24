@@ -265,6 +265,29 @@ def _add_design(args):
             f"Ekleyen: {clean(args.get('on_behalf_of'), 60)}" if clean(args.get("on_behalf_of"), 60) else ""]
 
 
+def _rename_design(args):
+    """A design's TryPost title (the Drive file keeps its name). current_title is checked by TryPost
+    (the call fails when the design shows another title), so "old → new" is the real change."""
+    current = clean(args.get("current_title"), 80) if isinstance(args.get("current_title"), str) else ""
+    title = args.get("title") if isinstance(args.get("title"), str) else None
+    lines = []
+    if title is not None and not clean(title, 80):
+        lines.append(head("📝", "Tasarımın başlığı Drive'daki dosya adına dönecek"))
+        if current:
+            lines.append(f"Şu anki başlık: {quoted(current, 80)}")
+    elif title is not None:
+        new = quoted(title, 80)
+        lines.append(head("📝", "Tasarımın başlığı değişecek", f"{quoted(current, 80)} → {new}" if current else ""))
+        if not current:
+            lines.append(f"Yeni başlık: {new}")
+    else:
+        lines.append(head("📝", "Tasarımın başlığı değişecek"))
+    if clean(args.get("design_id"), 64):
+        lines.append(f"Tasarım: {short_id(args.get('design_id'))}")
+    lines.append("Drive'daki dosya adı değişmez")
+    return lines
+
+
 def _repurpose(phrase):
     return lambda args: [head("🔄", f"Otomatik yeniden paylaşım {phrase}")]
 
@@ -317,6 +340,7 @@ TRYPOST = {
     "reorder-queue-tool": _simple("📅", "Kuyruktaki gönderilerin sırası değişecek"),
     "create-pinterest-board-tool": _named("📌", "Pinterest panosu oluşturulacak"),
     "add-design-tool": _add_design,
+    "rename-design-tool": _rename_design,
 }
 
 

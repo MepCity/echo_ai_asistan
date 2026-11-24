@@ -199,7 +199,7 @@ FULL_ARGS = {
     "reference_image": "/opt/data/platforms/whatsapp_cloud/media/abc.jpg", "talimat": "metni düzelt",
     "kaynak_gorsel": "/opt/data/platforms/whatsapp_cloud/media/abc.jpg", "konum": "alt-sag", "kind": "speech",
     "yuksek_cozunurluk": True, "secenek": 2, "tags": ["aranan ❤️ aslan", "sarıyer"], "folder": "Afişler ✳️",
-    "on_behalf_of": "Yasir",
+    "on_behalf_of": "Yasir", "current_title": "Eski afiş ❤️", "design_id": "9b2c0f6e-1a2b-4c3d-8e9f-0a1b2c3d4e5f",
 }
 HINT = {"aspect_ratio": "4:5", "credits": 1.25, "resolution": "2k", "count": 2}
 
@@ -244,6 +244,19 @@ class NoEscapeInCardTest(unittest.TestCase):
                                                "Etiketler: aranan aslan, sarıyer\nDosya: WhatsApp'tan gönderilen dosya\n"
                                                "Ekleyen: Yasir")
         self.assertNotIn("tok_secret", body)
+
+    def test_rename_design_card_as_whatsapp_shows_it(self):
+        design = "9b2c0f6e-1a2b-4c3d-8e9f-0a1b2c3d4e5f"
+        body = R.render("trypost", "rename-design-tool", {"design_id": design, "title": "Sarıyer’de Aranan Aslan",
+                                                          "current_title": "IMG_2041",
+                                                          "on_behalf_of_user_id": "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"})
+        self.assertEqual(hermes_display(body), "📝 Tasarımın başlığı değişecek · “IMG_2041” → “Sarıyer’de Aranan Aslan”\n"
+                                               "Tasarım: …3d4e5f\nDrive'daki dosya adı değişmez")
+        self.assertNotIn("0199a1b2", body)
+
+        body = R.render("trypost", "rename-design-tool", {"design_id": design, "title": "", "current_title": "Bahar afişi"})
+        self.assertEqual(hermes_display(body), "📝 Tasarımın başlığı Drive'daki dosya adına dönecek\n"
+                                               "Şu anki başlık: “Bahar afişi”\nTasarım: …3d4e5f\nDrive'daki dosya adı değişmez")
 
     def test_renderer_source_has_no_selector_or_escaped_emoji(self):
         source = (HERE.parent / "deploy/oracle/hermes/plugins/echo_onay_tr/render.py").read_text(encoding="utf-8")

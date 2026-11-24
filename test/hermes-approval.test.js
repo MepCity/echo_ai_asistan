@@ -40,7 +40,7 @@ const TRYPOST_WRITE_TOOLS = [
     'disable-repurpose-tool', 'pause-repurpose-tool', 'resume-repurpose-tool', 'update-repurpose-tool', 'create-signature-tool',
     'delete-signature-tool', 'update-signature-tool', 'copy-posting-schedule-tool', 'create-pinterest-board-tool',
     'generate-posting-schedule-tool', 'move-post-to-slot-tool', 'reorder-queue-tool', 'update-posting-schedule-tool',
-    'add-design-tool',
+    'add-design-tool', 'rename-design-tool',
 ];
 
 describe('approval card: studio tools', { skip }, () => {
@@ -160,6 +160,23 @@ describe('approval card: TryPost tools', { skip }, () => {
             "📁 Tasarımlar'a dosya eklenecek",
         ]);
         for (const body of bodies) assert.ok(!body.includes('secret-token') && !body.includes('media_123456'));
+    });
+
+    it('rename-design-tool: old and new title, a short design id, the Drive name stays; never the member id', () => {
+        const design = '9b2c0f6e-1a2b-4c3d-8e9f-0a1b2c3d4e5f';
+        const bodies = render([
+            { server: 'trypost', tool: 'rename-design-tool', args: { design_id: design, title: 'Sarıyer’de Aranan Aslan', current_title: 'IMG_2041', on_behalf_of_user_id: '0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b' } },
+            { server: 'trypost', tool: 'rename-design-tool', args: { design_id: design, title: 'Atölye afişi' } },
+            { server: 'trypost', tool: 'rename-design-tool', args: { design_id: design, title: '  ', current_title: 'Bahar afişi' } },
+            { server: 'trypost', tool: 'rename-design-tool', args: { title: ['x'] } },
+        ]);
+        assert.deepEqual(bodies, [
+            "📝 Tasarımın başlığı değişecek · “IMG_2041” → “Sarıyer’de Aranan Aslan”\nTasarım: …3d4e5f\nDrive'daki dosya adı değişmez",
+            "📝 Tasarımın başlığı değişecek\nYeni başlık: “Atölye afişi”\nTasarım: …3d4e5f\nDrive'daki dosya adı değişmez",
+            "📝 Tasarımın başlığı Drive'daki dosya adına dönecek\nŞu anki başlık: “Bahar afişi”\nTasarım: …3d4e5f\nDrive'daki dosya adı değişmez",
+            "📝 Tasarımın başlığı değişecek\nDrive'daki dosya adı değişmez",
+        ]);
+        for (const body of bodies) assert.ok(!body.includes('0199a1b2'));
     });
 
     it('every TryPost write tool has its own Turkish phrase', () => {
