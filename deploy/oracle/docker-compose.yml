@@ -76,6 +76,11 @@ services:
     profiles: ["hermes"]
     image: echo:local
     command: ["node", "--no-warnings", "src/studio/index.js"]
+    # The image's HEALTHCHECK probes Echo's :8080; the studio listens on :8091.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8091/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 3s
     depends_on:
       - echo
     env_file: /opt/echo/.env
