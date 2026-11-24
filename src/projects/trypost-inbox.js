@@ -9,6 +9,8 @@ const NO_PERMISSION = 'Bu etkileşime cevap verme yetkin yok.';
 const REPLIER_ACTIONS = new Set(['ib_reply', 'ib_hermes', 'ib_all_hermes', 'ib_send', 'ib_edit', 'ib_cancel']);
 // Interactive message bodies take 1024 characters: a longer draft is shown in a message of its own first.
 const CONFIRM_LIMIT = 1000;
+// The request_id prefix of every reply Echo sends (replyRequestId); TryPost's `via: echo` comes from it.
+const ECHO_REQUEST_PREFIX = 'echo-ib-';
 
 // Turkish suffixes: the locative after a clock time ("01:06’da": by how the last number is said) and the genitive.
 const ONES_LOCATIVE = ['da', 'de', 'de', 'te', 'te', 'te', 'da', 'de', 'de', 'da'];
@@ -30,7 +32,7 @@ export function genitive(word) {
  * the same key, and TryPost answers a repeat with the same result.
  */
 export function replyRequestId(projectId, waMessageId) {
-    return `echo-ib-${createHash('sha256').update(`${projectId}\u0000${waMessageId}`).digest('hex').slice(0, 32)}`;
+    return `${ECHO_REQUEST_PREFIX}${createHash('sha256').update(`${projectId}\u0000${waMessageId}`).digest('hex').slice(0, 32)}`;
 }
 
 /**
@@ -59,7 +61,14 @@ export function replyRequestId(projectId, waMessageId) {
  * from TryPost first, and a reply already sent from anywhere (Echo, Hermes,
  * the panel) is shown ("Not: Yasir 01:06’da cevap verdi: …") and turns
  * "Gönder" into "Yine de gönder". Once a reply is `sent`, the others who got
- * the item's notification are told, inside their 24-hour window only.
+ * the item's notification are told, inside their 24-hour window only
+ * (announceReply). A reply sent through Echo is told by sent(); one sent by
+ * Hermes or from the panel comes as TryPost's `inbox.reply_sent` webhook
+ * (handleReplySent), with the member it is credited to (`sent_by`, matched to
+ * a person by members[].userId) and `via`. Both paths key the announcement by
+ * the reply's request_id, so a reply is told once whichever comes first; a
+ * webhook for a reply Echo made (an `echo-ib-` request_id) is told for the
+ * person who pressed "Gönder" on that draft, never for TryPost's API user.
  *
  * TryPost checks again at send time, under a lock: "Yine de gönder" carries
  * the shown reply's id as `acknowledged_reply_id`; a reply the person did not
@@ -69,7 +78,7 @@ export function replyRequestId(projectId, waMessageId) {
  * `reply_in_progress` (the draft moves to a "Tekrar dene" message, same
  * request_id, since TryPost stored nothing).
  */
-export function createInbox({ project, api, names, timeZone, platformName, decisionState, recipients, canReply }) {
+export function createInbox({ project, api, names, timeZone, platformName, decisionState, recipients, canReply, memberByUserId = () => null }) {
     const settings = project.inbox ?? { enabled: false };
     const windowMs = (settings.digestWindowSec ?? 120) * 1000;
     const threshold = settings.digestThreshold ?? 5;
@@ -447,25 +456,28 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
         echo.store.applyDecision(row.id, person.phone);
         echo.store.socialReplied(project.id, item.id, person.name);
         echo.reply(person, `✅ Cevabın gönderildi (${label(item)}, ${who(item)}).`, messageId, project.id, row.id, `${project.id}:inbox-sent:${row.id}:${person.phone}`);
-        notifyOthers(echo, person, row);
+        announceReply(echo, item, { replierName: person.name, replierPhone: person.phone, text: row.message.draft, replyKey: replyKeyOf(row) });
     }
+
+    /** One key per reply, shared by sent() and the `inbox.reply_sent` webhook: the draft's request_id. */
+    const replyKeyOf = (row) => String(row.message.requestId ?? `outbox-${row.id}`);
 
     /**
      * Tells everyone else who was notified of the item that it was answered, as a reply to their
-     * notification. Only inside their 24-hour window (no template is paid for this); replies made
-     * through Hermes or the panel are not seen here (the next "Cevapla" shows them).
+     * notification. Only inside their 24-hour window (no template is paid for this). `replierPhone`
+     * (null: nobody) is left out. Keyed by `replyKey` per person, so the same reply told again (by
+     * the other path, or a retried webhook) queues nothing.
      */
-    function notifyOthers(echo, person, row) {
-        const item = row.message.item;
+    function announceReply(echo, item, { replierName, replierPhone = null, text, replyKey }) {
         const notified = new Map(echo.store.itemNotified(project.id, item.id).map((entry) => [entry.recipient, entry.wa_message_id]));
         // Sent in a digest: everyone who gets the inbox saw it there.
         if (echo.store.socialItem(project.id, item.id)?.state === 'digested') {
             for (const member of recipients()) if (!notified.has(member.person.phone)) notified.set(member.person.phone, null);
         }
         const author = who(item) === 'Biri' ? 'birinin' : genitive(who(item));
-        const text = `✅ ${person.name}, ${author} ${accusative(item)} cevapladı: “${excerpt(row.message.draft, 300)}”`;
+        const body = `✅ ${replierName}, ${author} ${accusative(item)} cevapladı: “${excerpt(text, 300)}”`;
         for (const [phone, waId] of notified) {
-            if (phone === person.phone) continue;
+            if (replierPhone && phone === replierPhone) continue;
             const other = echo.personByPhone(phone);
             if (!other) continue;
             echo.enqueue({
@@ -473,10 +485,54 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
                 itemId: String(item.id),
                 kind: 'inbox_note',
                 person: other,
-                message: { text, item, ...(waId ? { replyTo: waId } : {}), onlyInWindow: true },
-                dedupeKey: `${project.id}:inbox-replied:${row.id}:${phone}`,
+                message: { text: body, item, ...(waId ? { replyTo: waId } : {}), onlyInWindow: true },
+                dedupeKey: `${project.id}:inbox-replied:${replyKey}:${phone}`,
             });
         }
+    }
+
+    /**
+     * TryPost's `inbox.reply_sent`: a reply went out (Echo, Hermes or the panel). A reply Echo made
+     * is told for the person whose draft it was (sent() tells it too, under the same key; whichever
+     * comes first queues the messages). Any other reply is told for the member TryPost credits
+     * (`sent_by`, matched by members[].userId and left out of the recipients), else by the name
+     * TryPost gives and nobody left out; an agent's reply reads "<name> (Hermes ile)".
+     */
+    function handleReplySent(event, echo) {
+        const data = event.data ?? {};
+        const reply = data.reply ?? {};
+        const store = echo.store;
+        if (!data.item?.id || !(reply.request_id || reply.id)) {
+            echo.log('warn', `inbox.reply_sent of ${project.id} without an item or reply id`);
+            return;
+        }
+        const item = store.socialItem(project.id, data.item.id)?.item ?? slim(data.item);
+        const requestId = reply.request_id ? String(reply.request_id) : null;
+        const replyKey = requestId ?? `reply-${reply.id}`;
+        if ((requestId && requestId.startsWith(ECHO_REQUEST_PREFIX)) || data.via === 'echo') {
+            const draft = requestId ? store.itemReplyDrafts(project.id, item.id).findLast((entry) => entry.requestId === requestId) : null;
+            const person = draft ? echo.personByPhone(draft.phone) : null;
+            if (!person) {
+                echo.log('info', `inbox.reply_sent of ${project.id}: Echo reply ${requestId ?? reply.id} has no draft here, left to sent()`);
+                return;
+            }
+            store.transaction(() => {
+                store.socialReplied(project.id, item.id, person.name);
+                announceReply(echo, item, { replierName: person.name, replierPhone: person.phone, text: reply.text ?? draft.draft, replyKey });
+            });
+            return;
+        }
+        const member = data.sent_by?.id ? memberByUserId(String(data.sent_by.id)) : null;
+        const name = member?.person.name ?? (String(data.sent_by?.name ?? '').trim() || 'Biri');
+        store.transaction(() => {
+            store.socialReplied(project.id, item.id, name);
+            announceReply(echo, item, {
+                replierName: data.via === 'agent' ? `${name} (Hermes ile)` : name,
+                replierPhone: member?.person.phone ?? null,
+                text: reply.text,
+                replyKey,
+            });
+        });
     }
 
     /** TryPost could not send it: the draft is closed (its request_id would replay the failure); "Düzenle" starts a new one. */
@@ -548,6 +604,15 @@ export function createInbox({ project, api, names, timeZone, platformName, decis
 
     return {
         enabled: Boolean(settings.enabled),
+
+        /** TryPost's `inbox.reply_sent` (see handleReplySent). */
+        async handleReplySent(event, echo) {
+            if (!settings.enabled) {
+                echo.log('info', `inbox of ${project.id} is off, reply ignored`);
+                return;
+            }
+            handleReplySent(event, echo);
+        },
 
         async handleEvent(event, echo) {
             const item = event.data?.item;

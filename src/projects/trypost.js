@@ -603,6 +603,7 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
         decisionState,
         recipients: () => (project.inbox?.recipients ? members.filter((member) => project.inbox.recipients.includes(member.person.id)) : members),
         canReply: (person) => Boolean(project.inbox?.repliers?.includes(person.id)),
+        memberByUserId,
     });
 
     const explain = (error) => {
@@ -626,6 +627,7 @@ export function createTryPostProject(project, { fetchImpl = globalThis.fetch, ti
 
         async handleEvent(event, echo) {
             if (event.type === 'inbox.item_received') return inbox.handleEvent(event, echo);
+            if (event.type === 'inbox.reply_sent') return inbox.handleReplySent(event, echo);
             const post = event.data ?? {};
             const eventKey = `${project.id}:${event.id ?? `${event.type}:${post.id}:${fingerprint(post)}`}`;
 

@@ -2934,3 +2934,146 @@ describe('TryPost user note: Hermes learns the sender\'s TryPost user id', () =>
         assert.equal(body(null), 'selam');
     });
 });
+
+describe('social inbox: replies sent from anywhere (inbox.reply_sent)', () => {
+    let t;
+    beforeEach(async () => {
+        t = setup(); // Yasir and Ayşe may reply, Mehmet only gets the notification
+        for (const phone of [PHONES.yasir, PHONES.ayse, PHONES.mehmet]) await t.user.hello(phone);
+        await receiveItem(t, inboxItem());
+    });
+    const notificationOf = (phone) => t.whatsapp.to(phone).find((m) => /📥/.test(bodyOf(m)));
+    const confirmOf = (phone) => t.whatsapp.to(phone).filter((m) => /Şu cevabı göndereyim mi/.test(bodyOf(m))).at(-1);
+    const answeredNotes = (phone) => t.whatsapp.to(phone).filter((m) => /^✅ .* cevapladı/.test(bodyOf(m)));
+    /** TryPost's inbox.reply_sent, as InboxReplyEvents sends it. */
+    const replySent = ({ id = 'r9', text = 'Panelden cevap', requestId = `req-${id}`, sentBy = null, via = 'panel', item = inboxItem() } = {}) =>
+        t.echo.handleProjectEvent('marmara', {
+            id: `evt-${id}`,
+            type: 'inbox.reply_sent',
+            data: {
+                workspace: { id: 'w1', name: 'Marmara AI' },
+                item,
+                reply: { id, text, sent_at: '2026-11-11T12:00:00+00:00', request_id: requestId },
+                sent_by: sentBy,
+                via,
+            },
+        });
+    const yasirReplies = async (text = 'Cuma 18:00’de!') => {
+        await t.user.say(PHONES.yasir, text, notificationOf(PHONES.yasir).id);
+        await t.user.tap(PHONES.yasir, idsOf(confirmOf(PHONES.yasir))[0]);
+        return replyCalls(t).at(-1).body.request_id;
+    };
+
+    it('tells the others once about a panel reply, leaving out the member who replied', async () => {
+        await replySent({ sentBy: { id: 'u-ayse', name: 'Ayşe Yılmaz' } });
+        await replySent({ sentBy: { id: 'u-ayse', name: 'Ayşe Yılmaz' } }); // TryPost retried the webhook
+
+        for (const phone of [PHONES.yasir, PHONES.mehmet]) {
+            const notes = answeredNotes(phone);
+            assert.equal(notes.length, 1);
+            // The person's name from Echo's config, as a reply to their notification.
+            assert.equal(bodyOf(notes[0]), '✅ Ayşe, @ali’nin Instagram yorumunu cevapladı: “Panelden cevap”');
+            assert.equal(notes[0].context.message_id, notificationOf(phone).id);
+        }
+        assert.equal(answeredNotes(PHONES.ayse).length, 0);
+    });
+
+    it('names the member Hermes replied for, "(Hermes ile)"', async () => {
+        await replySent({ text: 'Cuma 18:00’de görüşürüz.', sentBy: { id: 'u-ayse', name: 'Ayşe Yılmaz' }, via: 'agent' });
+        assert.equal(bodyOf(answeredNotes(PHONES.yasir)[0]), '✅ Ayşe (Hermes ile), @ali’nin Instagram yorumunu cevapladı: “Cuma 18:00’de görüşürüz.”');
+        assert.equal(answeredNotes(PHONES.mehmet).length, 1);
+        assert.equal(answeredNotes(PHONES.ayse).length, 0);
+    });
+
+    it('still tells everyone, by TryPost\'s name, when the replier is not in the config', async () => {
+        await replySent({ sentBy: { id: 'u-zeynep', name: 'Zeynep' } });
+        for (const phone of [PHONES.yasir, PHONES.ayse, PHONES.mehmet]) {
+            assert.deepEqual(answeredNotes(phone).map(bodyOf), ['✅ Zeynep, @ali’nin Instagram yorumunu cevapladı: “Panelden cevap”']);
+        }
+    });
+
+    it('skips people outside their 24-hour window, as for replies through Echo', async () => {
+        t = setup();
+        await t.user.hello(PHONES.yasir);
+        await t.user.hello(PHONES.mehmet); // Ayşe has not written: her window is closed
+        await receiveItem(t, inboxItem());
+        await replySent({ sentBy: { id: 'u-yasir', name: 'Yasir' } });
+        assert.equal(answeredNotes(PHONES.mehmet).length, 1);
+        assert.equal(answeredNotes(PHONES.yasir).length, 0);
+        assert.equal(t.whatsapp.to(PHONES.ayse).length, 1); // only the notification template
+    });
+
+    it('shows the reply on a later "Cevapla" even when TryPost cannot be reached', async () => {
+        await replySent({ sentBy: { id: 'u-ayse', name: 'Ayşe Yılmaz' }, via: 'agent' });
+        t.trypost.setDown(true);
+        await t.user.say(PHONES.yasir, 'Bir cevap daha', notificationOf(PHONES.yasir).id);
+        assert.match(bodyOf(confirmOf(PHONES.yasir)), /\nNot: Ayşe 15:00’te cevap verdi\./);
+    });
+
+    it('tells an Echo reply once when sent() comes first and the webhook after it', async () => {
+        const requestId = await yasirReplies();
+        // TryPost credits Echo's API key user; Echo knows whose draft it was.
+        await replySent({ id: 'r1', text: 'Cuma 18:00’de!', requestId, sentBy: { id: 'u-admin', name: 'Admin' }, via: 'echo' });
+        for (const phone of [PHONES.ayse, PHONES.mehmet]) {
+            assert.deepEqual(answeredNotes(phone).map(bodyOf), ['✅ Yasir, @ali’nin Instagram yorumunu cevapladı: “Cuma 18:00’de!”']);
+        }
+        assert.equal(answeredNotes(PHONES.yasir).length, 0);
+    });
+
+    it('tells an Echo reply once when the webhook comes before sent()', async () => {
+        t.trypost.replyStatuses.push('sending');
+        const requestId = await yasirReplies();
+        assert.equal(answeredNotes(PHONES.mehmet).length, 0); // not sent yet
+
+        await replySent({ id: 'r1', text: 'Cuma 18:00’de!', requestId, sentBy: { id: 'u-admin', name: 'Admin' }, via: 'echo' });
+        assert.deepEqual(answeredNotes(PHONES.mehmet).map(bodyOf), ['✅ Yasir, @ali’nin Instagram yorumunu cevapladı: “Cuma 18:00’de!”']);
+        assert.equal(answeredNotes(PHONES.ayse).length, 1);
+        assert.equal(answeredNotes(PHONES.yasir).length, 0);
+
+        // Echo's re-check now sees it sent: Yasir is told, the others are not told again.
+        t.trypost.replies[0].status = 'sent';
+        await later(t, 31_000);
+        assert.match(bodyOf(t.whatsapp.last(PHONES.yasir)), /^✅ Cevabın gönderildi/);
+        assert.equal(answeredNotes(PHONES.mehmet).length, 1);
+        assert.equal(answeredNotes(PHONES.ayse).length, 1);
+    });
+
+    it('leaves an Echo reply it has no draft for to sent() instead of naming TryPost\'s API user', async () => {
+        await replySent({ requestId: 'echo-ib-0123456789abcdef0123456789abcdef', sentBy: { id: 'u-admin', name: 'Admin' }, via: 'echo' });
+        for (const phone of [PHONES.yasir, PHONES.ayse, PHONES.mehmet]) assert.equal(answeredNotes(phone).length, 0);
+    });
+
+    it('ignores the event while the inbox is off', async () => {
+        t = setup({ projectExtra: { inbox: { enabled: false } } });
+        await t.user.hello(PHONES.yasir);
+        await replySent({ sentBy: { id: 'u-ayse', name: 'Ayşe' } });
+        assert.equal(answeredNotes(PHONES.yasir).length, 0);
+    });
+});
+
+describe('social inbox: "Hermes’e bırak" tells Hermes who asked', () => {
+    let hermes;
+    after(() => hermes?.close());
+
+    it('ends the handoff with the presser\'s "[TryPost kullanıcı: <uuid>]" note, for on_behalf_of_user_id', async () => {
+        hermes = await fakeHermes();
+        const YASIR_ID = '0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b';
+        const t = setup({
+            assistant: { url: hermes.url, enabled: true },
+            projectExtra: {
+                members: [
+                    { person: 'yasir', userId: YASIR_ID, roles: ['reviewer', 'approver'] },
+                    { person: 'ayse', userId: 'u-ayse', roles: ['reviewer', 'approver'] },
+                    { person: 'mehmet', userId: 'u-mehmet', roles: ['reviewer'] },
+                ],
+            },
+        });
+        await t.user.hello(PHONES.yasir);
+        await receiveItem(t, inboxItem());
+        const notification = t.whatsapp.to(PHONES.yasir).find((m) => /📥/.test(bodyOf(m)));
+        await t.user.tap(PHONES.yasir, idsOf(notification)[1], 'tap-h');
+        const forwarded = hermes.messages().find((message) => message.id === 'tap-h.inbox');
+        assert.match(forwarded.text.body, /^\[Echo · Gelen kutusu\] /);
+        assert.match(forwarded.text.body, /inbox_item_id: i1\n\n\[TryPost kullanıcı: 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\]$/);
+    });
+});

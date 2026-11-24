@@ -479,9 +479,12 @@ export function createStore(db, now = () => Date.now()) {
         /** Replies to an item sent through Echo: the draft and who sent it, oldest first. */
         itemSentDrafts: (project, itemId) =>
             statements.itemSentDrafts.all(project, String(itemId)).map((row) => ({ phone: row.phone, draft: JSON.parse(row.message_json).draft ?? '', at: row.decided_at })),
-        /** Replies to an item sent or being sent through Echo ("Gönder" pressed): the draft and who sent it, oldest first. */
+        /** Replies to an item sent or being sent through Echo ("Gönder" pressed): the draft, its request_id and who sent it, oldest first. */
         itemReplyDrafts: (project, itemId) =>
-            statements.itemReplyDrafts.all(project, String(itemId)).map((row) => ({ phone: row.phone, draft: JSON.parse(row.message_json).draft ?? '', at: row.decided_at })),
+            statements.itemReplyDrafts.all(project, String(itemId)).map((row) => {
+                const message = JSON.parse(row.message_json);
+                return { phone: row.phone, draft: message.draft ?? '', requestId: message.requestId ?? null, at: row.decided_at };
+            }),
         /** Remembers to re-check a reply TryPost had not sent yet (kept as it is when already waiting). */
         checkReply: (outboxId, phone, project, delayMs) => statements.checkReply.run(outboxId, phone, project, now() + delayMs, now()),
         replyChecksDue: (project, limit = 20) => statements.replyChecksDue.all(project, now(), limit),

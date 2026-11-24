@@ -43,6 +43,7 @@ Meta ──▶ Echo /whatsapp ──▶ Echo's own flows (TryPost approvals, not
 | `post.feedback_requested`  | the people chosen in "Görüş iste"                     | Uygun · Revize gerekli (+note) · Yorum          |
 | `post.approved` / `rejected` | the requester and other approvers, only inside the 24h window | –                                   |
 | `inbox.item_received`      | project members (social inbox, see below)             | Cevapla (+text → Gönder/Düzenle/İptal) · Hermes'e bırak · Okundu |
+| `inbox.reply_sent`         | the others who got that item, only inside the 24h window | –                                            |
 
 Every answer becomes a note on the post. A reply to a message whose content has
 changed since is not applied; Echo sends the new version instead. A failed
@@ -95,7 +96,25 @@ Hermes'e bırak · Okundu**.
   TryPost's `author.name`.
 - **Hermes'e bırak** forwards "[Echo · Gelen kutusu] Bu yoruma cevap taslağı
   hazırla…" with the item summary and `inbox_item_id` to Hermes, which drafts and
-  confirms with the TryPost MCP inbox tools.
+  confirms with the TryPost MCP inbox tools. Like every forwarded text it ends
+  with the presser's "[TryPost kullanıcı: <uuid>]" note, which Hermes passes as
+  `on_behalf_of_user_id` to `reply-to-inbox-item-tool`, so TryPost credits the
+  reply to that member.
+- A reply that went out is told once to the others who got the item ("✅ Ayşe,
+  @ali’nin Instagram yorumunu cevapladı: “…”", as a reply to their notification,
+  only inside their 24h window). Through Echo, right after `sent`; from Hermes or
+  the panel, on TryPost's `inbox.reply_sent` (`data` = `{workspace, item, reply:
+  {id, text, sent_at, request_id}, sent_by: {id, name}|null, via:
+  echo|agent|panel|api}`). `sent_by.id` is matched to a person by
+  `members[].userId` (that person is left out and named as in the config), else
+  TryPost's name is used and nobody is left out; `via: agent` reads "Ayşe (Hermes
+  ile)". Both paths key the message by the reply's `request_id`, so it is sent
+  once whichever comes first; for a reply Echo made (`echo-ib-` request id) the
+  webhook names the person whose draft it was (TryPost only knows Echo's API key
+  user), and does nothing if Echo has no such draft. The item is marked as
+  answered by that person, so a later "Cevapla" shows the note even when TryPost
+  cannot be reached. In TryPost (Settings > Webhooks) Echo's webhook must
+  subscribe to `inbox.reply_sent` as well as `inbox.item_received`.
 - **Okundu** → `POST /api/inbox/items/{id}/read`.
 
 ## Contract with TryPost

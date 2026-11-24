@@ -127,5 +127,8 @@ cat <<EOF
 
  TryPost webhook URL:
    https://$ECHO_HOST/projects/marmara/webhook
+   Events: post.approval_requested, post.feedback_requested,
+           post.approved, post.rejected, inbox.item_received,
+           inbox.reply_sent
 ================================================================
 EOF
