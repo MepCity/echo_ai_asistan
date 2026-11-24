@@ -382,6 +382,31 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
 
     const USER_IMAGE_NAME = /^[A-Za-z0-9_.-]{1,128}\.(jpe?g|png|webp)$/i;
 
+    /**
+     * A file name the studio itself writes for an image: `${id}${suffix}.${ext}` (exposeToHermes; the
+     * original in originalsDir is `${id}.${ext}`), the id being newId(): gen_ + the time in base 36
+     * + 6 hex characters, the suffix '', -preview, -final-preview, -original or -final, the
+     * extension one download() or add_logo writes for an image. Anchored, no path separators.
+     */
+    const STUDIO_FILE_NAME = /^(gen_[0-9a-z]{8,9}[0-9a-f]{6})(?:-preview|-final-preview|-original|-final)?\.(?:png|jpg|webp|gif)$/;
+
+    /**
+     * The studio's own generation behind a picture the user sent back (a forwarded preview, or the
+     * document get_original_file sent): only the file NAME is looked at, the path is never opened.
+     * The row, when it is a completed image with a job id and its stored file; else null and the
+     * caller goes on as before. Not scoped by requester: any studio generation, like generation_id.
+     */
+    function studioGenerationOf(value) {
+        const input = String(value ?? '').trim();
+        if (!input || input.includes('://')) return null;
+        const match = STUDIO_FILE_NAME.exec(basename(input));
+        if (!match) return null;
+        const row = store.get(match[1]);
+        if (!row || row.kind !== 'image' || row.status !== 'completed' || !row.job_id || !row.file || !existsSync(row.file)) return null;
+        log('info', 'studio user image is a studio generation', input, row.id);
+        return row;
+    }
+
     function checkUserImage(input) {
         const fail = (message, code) => {
             const error = new Refusal(message);
@@ -456,6 +481,9 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             if (row.final_file && existsSync(row.final_file)) return uploadReferenceFile(row.final_file);
             return row.job_id;
         }
+        // A picture the studio made, sent back by the user: that generation, not the file.
+        const own = studioGenerationOf(value);
+        if (own) return resolveReference(own.id);
         if (value.startsWith('/')) return uploadReferenceFile(userImagePath(value));
         let url;
         try {
@@ -794,8 +822,10 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
             const model = tool === 'edit_image' ? EDIT_MODEL : settings.imageModels.includes(args.model) ? args.model : DEFAULT_IMAGE_MODEL;
             const resolution = ['1k', '2k', '4k'].includes(args.resolution) ? args.resolution : args.yuksek_cozunurluk === true ? '2k' : DEFAULT_IMAGE_RESOLUTION;
             let sourceAspect = null;
-            if (tool === 'edit_image' && typeof args.generation_id === 'string') {
-                const source = store.get(args.generation_id);
+            // The source's ratio: generation_id, or a studio-made picture sent back (gen_…-preview.png).
+            const sourceId = tool !== 'edit_image' ? null : typeof args.generation_id === 'string' ? args.generation_id : typeof args.kaynak_gorsel === 'string' ? studioGenerationOf(args.kaynak_gorsel)?.id : null;
+            if (sourceId) {
+                const source = store.get(sourceId);
                 sourceAspect = source?.params ? JSON.parse(source.params).aspect_ratio ?? null : null;
             }
             const aspect = (args.platform && settings.platformAspectRatios[args.platform]) || (typeof args.aspect_ratio === 'string' ? args.aspect_ratio : sourceAspect ?? '1:1');
@@ -950,7 +980,7 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
                 type: 'object',
                 properties: {
                     generation_id: { type: 'string', description: 'Düzenlenecek önceki üretim (gen_…).' },
-                    kaynak_gorsel: { type: 'string', description: 'generation_id yerine: kullanıcının gönderdiği görselin yolu: Hermes’in mesajda verdiği yol, aynen (WhatsApp’tan gelen görsel: /opt/data/platforms/whatsapp_cloud/media/…; "[Image attached at: …]" ya da "image_url: …" içindeki yol).' },
+                    kaynak_gorsel: { type: 'string', description: 'generation_id yerine: kullanıcının gönderdiği görselin yolu: Hermes’in mesajda verdiği yol, aynen (WhatsApp’tan gelen görsel: /opt/data/platforms/whatsapp_cloud/media/…; "[Image attached at: …]" ya da "image_url: …" içindeki yol). Kullanıcı stüdyonun ürettiği bir görseli geri gönderirse (dosya adı gen_…), o üretim otomatik olarak tanınır.' },
                     talimat: { type: 'string', maxLength: 2000, description: 'Ne değişecek (ör. "başlığı \'Yapay Zeka Atölyesi\' yap", "arka planı lacivert yap", "sağ alttaki logoyu düzelt"). Yeni yazı varsa aynen ve Türkçe karakterleriyle yaz.' },
                     logo: { type: 'boolean', description: 'Gerçek kulüp logosu referans olarak verilsin mi. Varsayılan: kaynak üretimde logo varsa true. Logo düzeltilecekse true.' },
                     logo_konum: { type: 'string', enum: LOGO_CORNERS, description: 'İsteğe bağlı köşe (varsayılan kaynak üretimdeki; o da yoksa logo yerinde kalır ya da model seçer).' },
@@ -1170,6 +1200,9 @@ export function createStudioGateway({ settings, store, higgsfield, auth = null, 
         if (!talimat) refuseAttempt(attempt, 'Düzenleme talimatı boş; neyin değişeceğini yaz.');
         if (talimat.length > 2000) refuseAttempt(attempt, 'Talimat çok uzun (en fazla 2000 karakter).');
         if (Boolean(args.generation_id) === Boolean(args.kaynak_gorsel)) refuseAttempt(attempt, MESSAGES.editSource);
+        // A picture the studio made, sent back by the user (gen_…-preview.png): edited as that generation_id.
+        const own = args.kaynak_gorsel ? studioGenerationOf(args.kaynak_gorsel) : null;
+        if (own) args = { ...args, generation_id: own.id, kaynak_gorsel: undefined };
 
         let source;
         let aspect = null;

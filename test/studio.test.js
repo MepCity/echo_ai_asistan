@@ -1428,6 +1428,68 @@ describe('studio: edit_image (gpt_image_2_6 image-to-image)', () => {
             assert.equal(higgsfield.calls.length, 0);
         });
 
+        it('a studio preview sent back (native-inputs/<hash>/gen_…-preview.png) is edited as that generation, by anyone, without reading the file', async () => {
+            const { gateway, higgsfield, store, settings, root, clock, logs } = mediaSetup();
+            const made = await image(gateway, { platform: 'story', requested_by: 'ferhat' });
+            const id = made.text.match(/generation_id: (gen_\w+)/)[1];
+            const preview = made.text.match(/^MEDIA:(.+)$/m)[1];
+            assert.equal(preview, join(settings.hermesPreviewDir, `${id}-preview.png`));
+            const native = join(root, 'cache', 'documents', 'native-inputs', 'ab12cd34ef56');
+            mkdirSync(native, { recursive: true });
+            const sentBack = join(native, `${id}-preview.png`);
+            writeFileSync(sentBack, 'not even an image: never read');
+            const hint = gateway.approvalHint('edit_image', { kaynak_gorsel: sentBack, talimat: 'x' });
+            assert.equal(hint.aspect_ratio, '9:16', 'the source ratio, from the stored generation');
+            clock.now += 10 * 60_000;
+            const before = higgsfield.calls.length;
+            const result = await call(gateway, 'edit_image', { kaynak_gorsel: sentBack, talimat: 'Ton biraz daha beyaz olsun', requested_by: 'yasir' });
+            assert.equal(result.isError, false, result.text);
+            assert.ok(!higgsfield.calls.slice(before).some((entry) => entry.name === 'media_upload'), 'nothing uploaded: the stored original (job id) is the source');
+            const edit = higgsfield.generated().at(-1).args.params;
+            assert.equal(edit.medias[0].value, JOB);
+            assert.equal(edit.aspect_ratio, '9:16');
+            const editId = result.text.match(/generation_id: (gen_\w+)/)[1];
+            assert.equal(JSON.parse(store.get(editId).params).edit.source, id, 'recorded exactly like generation_id');
+            assert.equal(store.get(editId).requested_by, 'yasir', 'charged to the person who asked for the edit');
+            assert.ok(logs.some((entry) => entry.includes('studio user image is a studio generation') && entry.endsWith(id)), logs.join('\n'));
+        });
+
+        it('reference_image: the original document (gen_…-original.png) and the bare stored name name that generation too', async () => {
+            const { gateway, higgsfield, root, clock } = mediaSetup();
+            const id = (await image(gateway)).text.match(/generation_id: (gen_\w+)/)[1];
+            for (const name of [`${id}-original.png`, `${id}.png`, `${id}-final-preview.png`]) {
+                clock.now += 10 * 60_000;
+                const before = higgsfield.calls.length;
+                const result = await call(gateway, 'generate_image', { prompt: 'A poster like this one', logo: false, reference_image: join(root, 'cache', 'documents', 'native-inputs', 'x', name) });
+                assert.equal(result.isError, false, `${name}: ${result.text}`);
+                assert.ok(!higgsfield.calls.slice(before).some((entry) => entry.name === 'media_upload'), name);
+                assert.deepEqual(higgsfield.generated().at(-1).args.params.medias, [{ value: JOB, role: 'image_references' }], name);
+            }
+        });
+
+        it('falls back to the usual checks for an unknown, unfinished or fileless generation and for names that are not exactly the studio\'s', async () => {
+            const { gateway, higgsfield, store, media, root, clock } = mediaSetup();
+            const id = (await image(gateway)).text.match(/generation_id: (gen_\w+)/)[1];
+            const native = join(root, 'cache', 'documents', 'native-inputs', 'h');
+            store.insert({ id: 'gen_mwugfff408fa84', day: '2026-11-20', month: '2026-11', tool: 'generate_image', kind: 'image', estimated: 1, status: 'failed', requestedBy: 'yasir' });
+            const names = ['gen_mwugfff400000a-preview.png', 'gen_mwugfff408fa84-preview.png', `${id}-preview (1).png`, `${id.toUpperCase()}-preview.png`, `x${id}-preview.png`, `${id}-thumb.png`, `${id}-preview.png.jpg`, `${id}-preview.txt`];
+            const before = higgsfield.calls.length;
+            for (const name of names) {
+                assert.equal((await call(gateway, 'edit_image', { kaynak_gorsel: join(native, name), talimat: 'x' })).text, MESSAGES.referenceOutside, name);
+            }
+            // The stored file gone: no longer recognised.
+            rmSync(store.get(id).file);
+            assert.equal((await call(gateway, 'edit_image', { kaynak_gorsel: join(native, `${id}-preview.png`), talimat: 'x' })).text, MESSAGES.referenceOutside);
+            assert.equal(higgsfield.calls.length, before, 'nothing sent');
+            // Unknown id but the same name directly in the media folder: the existing basename fallback still works.
+            const unknown = 'gen_mwugfff400000a-preview.png';
+            writeFileSync(join(media, unknown), PNG);
+            clock.now += 10 * 60_000;
+            const result = await call(gateway, 'edit_image', { kaynak_gorsel: join(native, unknown), talimat: 'x' });
+            assert.equal(result.isError, false, result.text);
+            assert.equal(higgsfield.calls[before].name, 'media_upload');
+        });
+
         it('the compose file mounts the media folder read-only at the same path and allows it', () => {
             const compose = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'deploy/oracle/docker-compose.yml'), 'utf8');
             assert.match(compose, /^\s+- \/opt\/hermes\/data\/platforms\/whatsapp_cloud\/media:\/opt\/data\/platforms\/whatsapp_cloud\/media:ro$/m);
