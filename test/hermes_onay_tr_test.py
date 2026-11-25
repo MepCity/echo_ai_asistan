@@ -258,6 +258,24 @@ class NoEscapeInCardTest(unittest.TestCase):
         self.assertEqual(hermes_display(body), "📝 Tasarımın başlığı Drive'daki dosya adına dönecek\n"
                                                "Şu anki başlık: “Bahar afişi”\nTasarım: …3d4e5f\nDrive'daki dosya adı değişmez")
 
+    def test_linkedin_company_mention_reads_as_a_name(self):
+        text = ("Teşekkürler @[Akbank](https://www.linkedin.com/company/akbank/) ve "
+                "@[Marmara AI](urn:li:organization:123), @[Türk Telekom](linkedin.com/company/turk-telekom)")
+        body = R.render("trypost", "create-post-tool", {"content": text, "content_type": "linkedin_page_post"})
+        self.assertEqual(hermes_display(body), "📝 TryPost'ta taslak oluşturulacak · LinkedIn\n"
+                                               "Metin: “Teşekkürler Akbank (LinkedIn etiketi) ve Marmara AI (LinkedIn etiketi), "
+                                               "Türk Telekom (LinkedIn etiketi)”")
+        self.assertNotIn("linkedin.com/company", body)
+
+        body = R.render("trypost", "create-posts-tool", {"content": "Bkz. @[Akbank](linkedin.com/company/akbank)",
+                                                         "destinations": [{"content_type": "linkedin_page_post"}]})
+        self.assertIn("Metin: “Bkz. Akbank (LinkedIn etiketi)”", body)
+        body = R.render("trypost", "update-post-tool", {"post_id": "p", "content": "@[Akbank](urn:li:organization:1)"})
+        self.assertIn("Yeni metin: “Akbank (LinkedIn etiketi)”", body)
+        # Anything that is not a LinkedIn company link stays as written.
+        body = R.render("trypost", "create-post-tool", {"content": "@[Ali](https://example.com) @ali"})
+        self.assertIn("Metin: “@[Ali](https://example.com) @ali”", body)
+
     def test_renderer_source_has_no_selector_or_escaped_emoji(self):
         source = (HERE.parent / "deploy/oracle/hermes/plugins/echo_onay_tr/render.py").read_text(encoding="utf-8")
         self.assertNotRegex(source, "[\ufe00-\ufe0f\u200d]")

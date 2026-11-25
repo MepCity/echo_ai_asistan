@@ -74,6 +74,21 @@ def clean(value, limit=TEXT_EXCERPT):
     return text
 
 
+# A LinkedIn company mention in a post's text (TryPost's Marmara fork turns it into a real mention on
+# LinkedIn and into the plain name elsewhere): "@[Akbank](https://www.linkedin.com/company/akbank)", also
+# without the scheme or as "urn:li:organization:123". The card shows "Akbank (LinkedIn etiketi)".
+LINKEDIN_MENTION = re.compile(
+    r"@\[([^\]\r\n]{1,100})\]\((?:urn:li:organization:\d+"
+    r"|(?:https?://)?(?:[a-z]{2,3}\.|www\.)?linkedin\.com/company/[^\s/?#()\[\]]+/?)\)", re.I)
+
+
+def post_text(value):
+    """A post's text with its LinkedIn company mentions readable; anything else unchanged."""
+    if not isinstance(value, str) or "@[" not in value:
+        return value
+    return LINKEDIN_MENTION.sub(lambda match: f"{match.group(1).strip()} (LinkedIn etiketi)", value)
+
+
 def quoted(value, limit=TEXT_EXCERPT):
     text = clean(value, limit)
     return f"“{text}”" if text else "(boş)"
@@ -149,7 +164,7 @@ def _create_post(args):
     platform = platform_of(args.get("content_type"))
     first = head("🚀" if "HEMEN" in verb else "📅", f"Gönderi {verb}", platform, detail) if verb \
         else head("📝", "TryPost'ta taslak oluşturulacak", platform)
-    return [first, f"Metin: {quoted(args.get('content'))}", _media_line(args)]
+    return [first, f"Metin: {quoted(post_text(args.get('content')))}", _media_line(args)]
 
 
 def _create_posts(args):
@@ -166,14 +181,14 @@ def _create_posts(args):
     text = args.get("content")
     if not text and destinations:
         text = destinations[0].get("content")
-    return [first, f"Metin: {quoted(text)}", _media_line(args)]
+    return [first, f"Metin: {quoted(post_text(text))}", _media_line(args)]
 
 
 def _update_post(args):
     verb, detail = _schedule(args)
     lines = [head("📝", "TryPost'taki gönderi düzenlenecek", platform_of(args.get("content_type")))]
     if "content" in args:
-        lines.append(f"Yeni metin: {quoted(args.get('content'))}")
+        lines.append(f"Yeni metin: {quoted(post_text(args.get('content')))}")
     if verb:
         lines.append(f"Durum: {join(verb, detail)}")
     if count(args.get("label_ids")):
@@ -398,7 +413,7 @@ def _attach_to_trypost(args, hint):
     else:
         lines = [head("📝", "Üretilen görselle TryPost'ta yeni taslak oluşturulacak")]
         if args.get("content"):
-            lines.append(f"Metin: {quoted(args.get('content'))}")
+            lines.append(f"Metin: {quoted(post_text(args.get('content')))}")
     lines.insert(1, _konu(args))
     return lines
 
